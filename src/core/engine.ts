@@ -24,7 +24,7 @@
 
 import { JsonRpcProvider, Wallet } from "ethers";
 import { ChainProfile } from "./chains";
-import { CorrectedClock, ClockSync, syncClock } from "./clock";
+import { CorrectedClock, ClockSync, syncClock, driftGuard } from "./clock";
 import {
   BlastOutcome,
   Endpoint,
@@ -38,6 +38,17 @@ import {
 } from "./blast";
 import { MintPlan, fetchMintStats, planWarnings } from "./seadrop";
 import { labelFor } from "./rpc";
+import { DryRunReport, DryRunWallet, SimVerdict } from "./dryrun";
+import {
+  RunState,
+  clearState,
+  defaultStatePath,
+  newRunId,
+  newRunState,
+  recordIntent,
+  recordOutcome,
+  writeState,
+} from "./runstate";
 import { FirePlan, formatRemaining, planFire, waitUntil } from "./timing";
 import {
   BalanceReport,
@@ -68,9 +79,16 @@ export type EngineEvent =
       position: number;
       success: boolean;
       gasUsed: bigint;
+      /** Why it reverted, when the node would say. Absent on success. */
+      reason?: string;
     }
-  | { type: "receiptTimeout"; index: number; txHash: string }
+  // `cancelled` distinguishes "we stopped looking" from "it did not land in
+  // time". Both leave the operator with a hash to check, which is why this is one
+  // event and not two — but only one of them means the run was still healthy.
+  | { type: "receiptTimeout"; index: number; txHash: string; cancelled?: boolean }
   | { type: "warning"; message: string }
+  /** A dry run finished. No transaction was broadcast; the report says what would have been. */
+  | { type: "dryRun"; report: DryRunReport }
   | { type: "done"; minted: number; failed: number };
 
 export interface EngineOptions {
@@ -93,6 +111,21 @@ export interface EngineOptions {
   clockRounds?: number;
   receiptTimeoutMs?: number;
   signal?: AbortSignal;
+  /** Do every check and sign every transaction, then stop without broadcasting. */
+  dryRun?: boolean;
+  /**
+   * Refuse to fire when the clock offset could not be measured to within this.
+   *
+   * Undefined means no guard, which is the right default for an operator at a
+   * terminal who can see the measured offset and decide. A daemon passes a real
+   * value, because nobody is there to make that call.
+   */
+  driftLimitMs?: number;
+  /** Crash-safety journal path. null disables the journal entirely. */
+  statePath?: string | null;
+  runId?: string;
+  /** What the operator called this drop, for the journal. */
+  target?: string;
 }
 
 export interface EngineResult {
@@ -107,6 +140,7 @@ export interface EngineResult {
 interface SignedBundle {
   wallet: LoadedWallet;
   prepared: PreparedTx;
+  nonce: number;
 }
 
 function throwIfAborted(signal: AbortSignal | undefined): void {
@@ -126,13 +160,19 @@ function throwIfAborted(signal: AbortSignal | undefined): void {
  * be treated as a reason to abort. That is why `requireSimulation` is opt-in and
  * why the stage-open state is checked alongside.
  */
+interface SimResult {
+  verdict: SimVerdict;
+  error?: string;
+}
+
 async function simulate(
   provider: JsonRpcProvider,
   plan: MintPlan,
   wallets: LoadedWallet[],
   emit: (event: EngineEvent) => void,
-): Promise<{ ok: boolean; failures: number }> {
+): Promise<{ ok: boolean; failures: number; verdicts: Map<number, SimResult> }> {
   let failures = 0;
+  const verdicts = new Map<number, SimResult>();
   await Promise.all(
     wallets.map(async (wallet) => {
       try {
@@ -142,10 +182,12 @@ async function simulate(
           data: plan.data,
           value: plan.value,
         });
+        verdicts.set(wallet.index, { verdict: "passed" });
         emit({ type: "simulation", ok: true, index: wallet.index, address: wallet.address });
       } catch (err: unknown) {
         failures++;
         const raw = err instanceof Error ? err.message : String(err);
+        verdicts.set(wallet.index, { verdict: "reverted", error: describeRevert(raw) });
         emit({
           type: "simulation",
           ok: false,
@@ -156,7 +198,7 @@ async function simulate(
       }
     }),
   );
-  return { ok: failures === 0, failures };
+  return { ok: failures === 0, failures, verdicts };
 }
 
 /**
@@ -208,9 +250,12 @@ export function describeRevert(raw: string): string {
   // Ethers/RPC providers often wrap custom-error data inside the message.
   // Keep the original text available, but extract useful standard reasons first.
   const standard = [
-    /execution reverted:?\\s*([^"\\n]{3,200})/i,
-    /reverted:?\\s*([^"\\n]{3,200})/i,
-    /reason[:=]\\s*([^"\\n]{3,200})/i,
+    // The optional opening quote matters: ethers reports `reason="Stage not
+    // active"`, and a class excluding `"` cannot begin on one. Without it the
+    // single most common shape fell straight through to "no reason given".
+    /execution reverted:?\s*"?([^"\n]{3,200})/i,
+    /reverted:?\s*"?([^"\n]{3,200})/i,
+    /reason[:=]\s*"?([^"\n]{3,200})/i,
   ];
 
   for (const pattern of standard) {
@@ -231,7 +276,7 @@ export function describeRevert(raw: string): string {
         const lengthPos = offset * 2;
         const length = Number.parseInt(data.slice(lengthPos, lengthPos + 64), 16);
         const reasonHex = data.slice(lengthPos + 64, lengthPos + 64 + length * 2);
-        const reason = Buffer.from(reasonHex, "hex").toString("utf8").replace(/\\0+$/g, "").trim();
+        const reason = Buffer.from(reasonHex, "hex").toString("utf8").replace(/\0+$/g, "").trim();
         if (reason) return `Reverted: ${reason}`;
       }
     } catch {
@@ -266,13 +311,56 @@ export function describeRevert(raw: string): string {
       return `Reverted: wallet mint cap exceeded — total would be ${total}, allowed ${allowed}`;
     }
 
-    // Other custom errors do not carry a human-readable string unless we know their ABI.
-    const custom = /0x[0-9a-fA-F]{8,}/.exec(text)?.[0];
-    if (custom) {
-      return `Reverted: custom error (${custom.slice(0, 10)}…)`;
+  // Other custom errors do not carry a human-readable string unless we know their
+  // ABI. Only a plausible revert payload may be reported as one: ABI-encoded revert
+  // data is a 4-byte selector followed by whole 32-byte words, so its hex body is
+  // 8 + 64n characters long. An address (40) and a transaction hash (64) both fail
+  // that test, which is exactly the point — error messages are full of both, and
+  // reporting the contract address as "custom error (0x1234abcd…)" is a fabricated
+  // diagnosis of a revert that may have had a real reason elsewhere.
+  for (const match of text.matchAll(/0x([0-9a-fA-F]+)/g)) {
+    const body = match[1] ?? "";
+    if (body.length >= 8 && (body.length - 8) % 64 === 0) {
+      return `Reverted: custom error (0x${body.slice(0, 8)}…)`;
     }
+  }
 
   return "Reverted (no reason given).";
+}
+
+/**
+ * A receipt with status 0 says the transaction failed and nothing about why — the
+ * reason is not in the receipt at all. Replaying the same call against the block
+ * it failed in makes the node produce the revert data, which `describeRevert` can
+ * then name. This is the difference between "REVERTED" and "REVERTED: stage not
+ * active", and it is the whole question the operator has at that moment.
+ *
+ * Off the hot path by construction: it runs after the mint is decided. It never
+ * throws — a diagnosis that cannot be obtained is reported as its absence, never
+ * as a failure of the run.
+ */
+async function revertReasonFor(
+  provider: JsonRpcProvider,
+  plan: MintPlan,
+  wallet: LoadedWallet,
+  block: number,
+): Promise<string | undefined> {
+  try {
+    await provider.call({
+      from: wallet.address,
+      to: plan.to,
+      data: plan.data,
+      value: plan.value,
+      blockTag: block,
+    });
+    // Replayed cleanly: the failure depended on state this block no longer has —
+    // someone else took the last token in the same block, typically. Claiming a
+    // reason here would be inventing one.
+    return undefined;
+  } catch (err: unknown) {
+    const described = describeRevert(err instanceof Error ? err.message : String(err));
+    return described === "Reverted (no reason given)." ? undefined : described;
+  }
 }
 
 export async function runMint(
@@ -290,7 +378,17 @@ export async function runMint(
     signal,
     skipSimulation = false,
     requireSimulation = false,
+    dryRun = false,
   } = opts;
+
+  // Collected rather than thrown on, so one dry run surfaces every problem.
+  // A live run still aborts at the first: see the module header in dryrun.ts.
+  const refusals: string[] = [];
+  const skippedWallets: { address: string; reason: string }[] = [];
+  const refuse = (detail: string): void => {
+    if (!dryRun) throw new Error(`Refusing to broadcast: ${detail}`);
+    refusals.push(detail);
+  };
 
   if (wallets.length === 0) throw new Error("No wallets loaded — nothing to mint with.");
   if (blastUrls.length === 0) throw new Error("No RPC endpoints available to broadcast to.");
@@ -314,7 +412,7 @@ export async function runMint(
 
     const required = requiredBalance(plan.value, gas);
     const [, clockSync, nonces, balances] = await Promise.all([
-      warmConnections(blastUrls),
+      warmConnections(blastUrls, signal ? { signal } : {}),
       syncClock(readUrls, chain.blockTimeSec, { rounds: opts.clockRounds ?? 3 }),
       fetchNonces(provider, wallets),
       checkBalances(provider, wallets, required),
@@ -323,9 +421,33 @@ export async function runMint(
 
     clock.applySync(clockSync);
     emit({ type: "clock", sync: clockSync });
+
+    // ── Clock drift guard ──────────────────────────────────────────────────
+    //
+    // Evaluated always, enforced only when a limit was given. An operator at a
+    // terminal can read the measured offset and decide for themselves; an
+    // unattended daemon passes a limit because nobody is there to make that call.
+    //
+    // The guard keys on uncertainty rather than offset: a measured offset is
+    // corrected for, and measuring it is the entire reason syncClock exists.
+    const drift = driftGuard(clockSync, opts.driftLimitMs ?? Number.POSITIVE_INFINITY);
+    if (!drift.ok) {
+      // Warned about either way. The difference an unattended run makes is that
+      // it also stops; the operator at a terminal is told and left to judge.
+      emit({ type: "warning", message: drift.detail });
+      if (opts.driftLimitMs !== undefined) refuse(drift.detail);
+    }
     emit({ type: "balances", reports: balances, required, symbol: chain.nativeSymbol });
 
     const fundedWallets = wallets.filter((w) => balances[w.index]?.sufficient !== false);
+    for (const w of wallets) {
+      if (balances[w.index]?.sufficient === false) {
+        skippedWallets.push({
+          address: w.address,
+          reason: `underfunded — needs ${formatEth(required, chain.nativeSymbol)}`,
+        });
+      }
+    }
     if (fundedWallets.length === 0) {
       throw new Error(
         `Every wallet is short of ${formatEth(required, chain.nativeSymbol)} (value + gasLimit × maxFeePerGas) — nothing can be broadcast.`,
@@ -347,18 +469,26 @@ export async function runMint(
       );
       throwIfAborted(signal);
 
+      for (const w of fundedWallets) {
+        if (!eligibleWallets.includes(w)) {
+          skippedWallets.push({ address: w.address, reason: "per-wallet mint cap already reached" });
+        }
+      }
+
       if (eligibleWallets.length === 0) {
         throw new Error("No funded wallet remains eligible for the requested mint — nothing can be broadcast.");
       }
 
     // ── Simulation ─────────────────────────────────────────────────────────
+    const simVerdicts = new Map<number, SimResult>();
     if (!skipSimulation) {
       emit({ type: "phase", name: "simulate" });
       const result = await simulate(provider, plan, eligibleWallets, emit);
       throwIfAborted(signal);
+      for (const [index, verdict] of result.verdicts) simVerdicts.set(index, verdict);
       if (!result.ok && requireSimulation) {
-        throw new Error(
-          `${result.failures} wallet simulation(s) reverted and --require-simulation is set — nothing was sent.`,
+        refuse(
+          `${result.failures} wallet simulation(s) reverted and --require-simulation is set.`,
         );
       }
     }
@@ -381,22 +511,107 @@ export async function runMint(
         type: 2,
         chainId: chain.chainId,
       });
-      bundles.push({ wallet, prepared: prepare(raw) });
+      bundles.push({ wallet, prepared: prepare(raw), nonce });
     }
     emit({ type: "signed", count: bundles.length, elapsedMs: performance.now() - signStart });
     throwIfAborted(signal);
+
+    // ── A dry run stops here ───────────────────────────────────────────────
+    //
+    // Everything above has run: balances, per-wallet cap, simulation, the drift
+    // guard, nonces, signing. The next section is the one that spends money, and
+    // skipping it is the only thing that makes this a dry run. That ordering is
+    // what makes a green dry run mean something.
+    if (dryRun) {
+      const report: DryRunReport = {
+        target: opts.target ?? plan.nftContract,
+        chainName: chain.name,
+        chainId: chain.chainId,
+        nativeSymbol: chain.nativeSymbol,
+        to: plan.to,
+        calldataBytes: (plan.data.length - 2) / 2,
+        valuePerWallet: plan.value,
+        gas,
+        fireAtMs,
+        nowMs: clock.now(),
+        drift,
+        wallets: bundles.map(
+          ({ wallet, prepared, nonce }): DryRunWallet => {
+            const sim = simVerdicts.get(wallet.index);
+            return {
+              index: wallet.index,
+              address: wallet.address,
+              nonce,
+              txHash: prepared.txHash,
+              rawBytes: (prepared.raw.length - 2) / 2,
+              simulation: sim?.verdict ?? "skipped",
+              ...(sim?.error ? { simulationError: sim.error } : {}),
+            };
+          },
+        ),
+        endpoints: endpoints.map((e) => e.label),
+        skipped: skippedWallets,
+        refusals,
+      };
+      emit({ type: "dryRun", report });
+      emit({ type: "done", minted: 0, failed: 0 });
+      return {
+        minted: 0,
+        failed: 0,
+        timingErrorMs: 0,
+        dispatchMs: 0,
+        clock: clockSync,
+        txHashes: [],
+      };
+    }
+
+    // ── Crash safety: intent is recorded before anything is broadcast ──────
+    //
+    // Written here rather than at dispatch. The hashes are already known — they
+    // are derived from the signed bytes — so the journal is on disk long before
+    // T-0 and costs nothing in the hot path.
+    //
+    // A restart that finds a hash with no outcome knows to look that transaction
+    // up rather than sign a competing one at the same nonce. Without this, "never
+    // sent" and "sent, then we died" are indistinguishable after a crash.
+    const statePath = opts.statePath === undefined ? defaultStatePath() : opts.statePath;
+    let state: RunState | null = null;
+    if (statePath !== null) {
+      state = newRunState({
+        runId: opts.runId ?? newRunId(Date.now()),
+        target: opts.target ?? plan.nftContract,
+        chainId: chain.chainId,
+        startedAtMs: Date.now(),
+        wallets: bundles.map(({ wallet, nonce }) => ({
+          index: wallet.index,
+          address: wallet.address,
+          nonce,
+        })),
+      });
+      for (const bundle of bundles) {
+        state = recordIntent(state, bundle.wallet.index, bundle.prepared.txHash);
+      }
+      journal(state, statePath, emit);
+    }
 
     // ── Wait for T-0 ───────────────────────────────────────────────────────
     let timingErrorMs = 0;
     if (fireAtMs !== null) {
       emit({ type: "phase", name: "wait", detail: formatRemaining(fireAtMs - clock.now()) });
-      timingErrorMs = await waitUntil(fireAtMs, clock, (progress) => {
-        emit({
-          type: "countdown",
-          remainingMs: progress.remainingMs,
-          text: `${formatRemaining(progress.remainingMs)} (${progress.phase})`,
-        });
-      });
+      timingErrorMs = await waitUntil(
+        fireAtMs,
+        clock,
+        (progress) => {
+          emit({
+            type: "countdown",
+            remainingMs: progress.remainingMs,
+            text: `${formatRemaining(progress.remainingMs)} (${progress.phase})`,
+          });
+        },
+        // Handed in, not merely checked afterwards: a countdown can be hours
+        // long, and a cancel noticed only at T-0 is not a cancel.
+        signal,
+      );
       throwIfAborted(signal);
     }
 
@@ -422,6 +637,22 @@ export async function runMint(
       })),
     );
 
+    if (state !== null && statePath !== null) {
+      let updated = state;
+      for (const { wallet, outcomes } of settled) {
+        const ok = wasAccepted(outcomes);
+        const firstError = outcomes.map((o) => o.error).find((e): e is string => !!e);
+        updated = recordOutcome(
+          updated,
+          wallet.index,
+          ok ? "accepted" : "rejected",
+          ok ? undefined : firstError,
+        );
+      }
+      state = updated;
+      journal(state, statePath, emit);
+    }
+
     const accepted: { wallet: LoadedWallet; txHash: string }[] = [];
     for (const { wallet, txHash, outcomes } of settled) {
       if (wasAccepted(outcomes)) {
@@ -441,6 +672,7 @@ export async function runMint(
     }
 
     if (accepted.length === 0) {
+      closeJournal(statePath);
       emit({ type: "done", minted: 0, failed: settled.length });
       return {
         minted: 0,
@@ -462,13 +694,22 @@ export async function runMint(
         const receipt = await waitForReceipt(txHash, readUrls, {
           timeoutMs: opts.receiptTimeoutMs ?? 90_000,
           pollMs: Math.max(200, (chain.blockTimeSec * 1000) / 4),
+          ...(signal ? { signal } : {}),
         });
         if (!receipt) {
-          emit({ type: "receiptTimeout", index: wallet.index, txHash });
+          emit({
+            type: "receiptTimeout",
+            index: wallet.index,
+            txHash,
+            ...(signal?.aborted === true ? { cancelled: true } : {}),
+          });
           return;
         }
         if (receipt.success) minted++;
         else failed++;
+        const reason = receipt.success
+          ? undefined
+          : await revertReasonFor(provider, plan, wallet, receipt.block);
         emit({
           type: "receipt",
           index: wallet.index,
@@ -477,10 +718,12 @@ export async function runMint(
           position: receipt.position,
           success: receipt.success,
           gasUsed: receipt.gasUsed,
+          reason,
         });
       }),
     );
 
+    closeJournal(statePath);
     emit({ type: "done", minted, failed });
     return {
       minted,
@@ -492,6 +735,38 @@ export async function runMint(
     };
   } finally {
     provider.destroy();
+  }
+}
+
+/**
+ * Persist the journal, never at the cost of the mint.
+ *
+ * A full disk or a read-only filesystem is a reason to lose crash safety. It is
+ * not a reason to lose the mint the operator is standing by for, so this warns
+ * and continues rather than throwing.
+ */
+function journal(state: RunState, file: string, emit: (event: EngineEvent) => void): void {
+  try {
+    writeState(state, file);
+  } catch (err: unknown) {
+    emit({
+      type: "warning",
+      message:
+        `Could not write the crash-safety journal to ${file}: ` +
+        `${err instanceof Error ? err.message : String(err)}. ` +
+        `The mint continues, but a restart mid-broadcast will not know what was sent.`,
+    });
+  }
+}
+
+/** Drop the journal once every outcome is known and nothing more will be sent. */
+function closeJournal(file: string | null): void {
+  if (file === null) return;
+  try {
+    clearState(file);
+  } catch {
+    // Leaving a stale journal behind is harmless: every wallet in it has an
+    // outcome, so a resume would skip all of them.
   }
 }
 

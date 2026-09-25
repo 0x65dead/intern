@@ -23,6 +23,15 @@ Documentation=https://github.com/your/intern
 After=network-online.target
 Wants=network-online.target
 
+# Never give up restarting. This belongs in [Unit] — systemd has read it here
+# since v229 and silently ignores it in [Service], where it sat until
+# `systemd-analyze verify` was actually run against this file. That mattered: the
+# default is 5 starts per 10s, and with RestartSec=2 a bot crash-looping on a
+# transient RPC failure would hit the limit in ten seconds and stay down for the
+# night — the exact outcome this line exists to prevent.
+StartLimitIntervalSec=0
+StartLimitBurst=0
+
 [Service]
 Type=simple
 User=root
@@ -41,11 +50,57 @@ ExecStart=/usr/bin/node dist/bot/index.js
 # purpose: a bad token or a second instance polling the same token exits non-zero
 # and will restart-loop visibly in the journal rather than fail silently.
 Restart=always
-RestartSec=5
+# Two seconds, not five. This is the gap between the bot dying and the bot being
+# back on the long-poll, and it is time the operator is unrepresented for. Short
+# enough to matter near T-0, long enough not to hammer Telegram's 401 on a token
+# that is genuinely wrong.
+RestartSec=2
 
-# Do not give up after the default five attempts. A drop can be hours out, and an
-# RPC provider having a bad ten minutes must not take the bot down for the night.
-StartLimitIntervalSec=0
+# ── Watchdog ────────────────────────────────────────────────────────────────
+#
+# Restart=always only catches a process that has exited. The failure that actually
+# loses a mint is quieter: the process is alive, the event loop turns, and the
+# Telegram poll has wedged behind a socket that will never answer. systemd cannot
+# see that from the outside, so the bot reports in.
+#
+# The bot pings every WatchdogSec/2 — but ONLY while its poll loop is completing
+# round trips (see src/bot/watchdog.ts). A wedged loop stops the pings, this
+# deadline expires, and systemd kills and restarts the process. That restart is
+# the recovery, which is why the whole thing is worth having.
+#
+# 90s: the poll's own timeout is 50s, so a healthy quiet chat can legitimately be
+# silent for most of a minute. Anything tighter restarts working bots.
+WatchdogSec=90
+
+# Required. The bot has no unix-datagram socket of its own — Node's dgram is
+# UDP-only — so it sends WATCHDOG=1 by spawning systemd-notify, and that is an
+# auxiliary process, not the main one. With the default NotifyAccess=none (Type is
+# not notify) every ping would be dropped and the bot would be killed every 90s.
+NotifyAccess=all
+
+# SIGKILL, not systemd's default SIGABRT — this one is a key-exposure fix, and it
+# was found by running it rather than by reading the docs.
+#
+# A watchdog kill with SIGABRT dumps core. On a stock Ubuntu box that dump goes to
+# apport, which writes ~50MB of raw process memory to /var/crash/ — and this
+# process holds PRIVATE_KEYS in that memory. Measured directly: a sentinel string
+# held in a variable was recovered from the resulting file twice. LimitCORE=0 does
+# NOT prevent this, because the kernel ignores RLIMIT_CORE when core_pattern is a
+# pipe, which it is whenever apport or systemd-coredump is installed.
+#
+# SIGKILL cannot be caught and never dumps core, so the keys stay in RAM and die
+# with the process. Verified: same stall, same restart, /var/crash/ empty.
+#
+# The cost is that KillSignal=SIGINT's graceful abort does not run on a watchdog
+# kill. That is the right trade — the watchdog only fires after the poll loop has
+# been unresponsive for WatchdogSec, so there is nothing graceful left to do, and
+# the crash-safety journal (src/core/runstate.ts) is what covers an interrupted
+# broadcast. The next start reports any unfinished run rather than resuming it.
+WatchdogSignal=SIGKILL
+
+# Belt and braces. Useless against a piped core_pattern, as above, but it is the
+# thing that works on a box with the plain kernel pattern and it costs nothing.
+LimitCORE=0
 
 StandardOutput=journal
 StandardError=journal

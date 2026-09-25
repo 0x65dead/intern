@@ -12,6 +12,16 @@
 
 import { ChainProfile } from "./chains";
 import {
+  FireContext,
+  MechanismEvidence,
+  MintMechanism,
+  NO_EVIDENCE,
+  PUBLIC_ONLY,
+  isFireable,
+  mechanismFor,
+  notFireableReason,
+} from "./capabilities";
+import {
   StageRow,
   StageTable,
   formatMintsLeft,
@@ -28,6 +38,7 @@ export const STAGE_COLUMNS = [
   "cap",
   "status",
   "mints left",
+  "eligibility",
   "source",
 ] as const;
 
@@ -38,7 +49,75 @@ export interface StageCells {
   cap: string;
   status: string;
   mintsLeft: string;
+  /**
+   * Either what we know about this wallet set's standing, or — when the stage
+   * cannot be fired at all — the reason, prefixed "not fireable:".
+   *
+   * Those two share a column on purpose. Eligibility is moot on a row intern
+   * cannot act on, and an empty cell there reads as "checking" rather than as
+   * "never". A row that silently showed neither would be the bug the capability
+   * matrix exists to prevent.
+   */
+  eligibility: string;
   source: string;
+}
+
+/**
+ * What the renderers know beyond the row itself.
+ *
+ * Optional throughout, and the defaults are the conservative ones: no allowlist
+ * minting, no evidence of a Merkle root or a local signer. A caller that has not
+ * been updated to pass context therefore sees the same table it saw before this
+ * column existed, rather than an optimistic one.
+ */
+export interface StageContext {
+  fire?: FireContext;
+  evidence?: MechanismEvidence;
+  /** Per-mechanism eligibility summary, already computed — see summariseEligibility. */
+  eligibility?: Partial<Record<MintMechanism, string>>;
+  /**
+   * Mechanisms whose eligibility check could not run at all.
+   *
+   * Their `eligibility` line states the cause, and it outranks the generic
+   * not-fireable reason. Without this the two cases collapse: a drop with no
+   * allow-list configured and a drop whose allow-list failed to load both render
+   * as "no loaded wallet has a proof", which is true of both and actionable for
+   * neither — it sends the operator to look at their wallets when the real fault
+   * is a mistyped path.
+   */
+  eligibilityUnavailable?: MintMechanism[];
+}
+
+/**
+ * The first sentence of a reason, for a cell that has one line to work with.
+ *
+ * Truncating mid-sentence would produce exactly the half-explanation this project
+ * is trying not to print, so the cut is at a sentence boundary and the full text
+ * stays available in CAPABILITY.md.
+ */
+export function firstSentence(text: string): string {
+  const match = /^(.*?[.!?])(\s|$)/s.exec(text.trim());
+  return (match?.[1] ?? text.trim()).replace(/\s+/g, " ");
+}
+
+function eligibilityCell(row: StageRow, ctx: StageContext): string {
+  const evidence = ctx.evidence ?? NO_EVIDENCE;
+  const fire = ctx.fire ?? PUBLIC_ONLY;
+  const mechanism = mechanismFor(row.kind, evidence);
+  const known = ctx.eligibility?.[mechanism];
+
+  if (!isFireable(mechanism, fire)) {
+    // A stated cause beats a derived one. Both are true; only one tells the
+    // operator what to change.
+    if (known !== undefined && (ctx.eligibilityUnavailable ?? []).includes(mechanism)) {
+      return `not fireable: ${known}`;
+    }
+    return `not fireable: ${firstSentence(notFireableReason(mechanism, fire))}`;
+  }
+  if (known) return known;
+  // A public stage has no eligibility question — saying so beats an em dash that
+  // could equally mean "not checked yet".
+  return mechanism === "public" ? "open to all" : "—";
 }
 
 /**
@@ -52,6 +131,7 @@ export function stageCells(
   row: StageRow,
   chain: ChainProfile,
   fmtTime: (ms: number) => string,
+  ctx: StageContext = {},
 ): StageCells {
   return {
     stage: kindLabel(row.kind) === row.label ? kindLabel(row.kind) : `${kindLabel(row.kind)} · ${row.label}`,
@@ -63,6 +143,7 @@ export function stageCells(
       row.mintsLeft === null || row.mintsTotal === null
         ? "—"
         : `${row.mintsLeft} / ${row.mintsTotal}`,
+    eligibility: eligibilityCell(row, ctx),
     source: row.source,
   };
 }
@@ -71,8 +152,9 @@ export function allStageCells(
   table: StageTable,
   chain: ChainProfile,
   fmtTime: (ms: number) => string,
+  ctx: StageContext = {},
 ): StageCells[] {
-  return table.rows.map((row) => stageCells(row, chain, fmtTime));
+  return table.rows.map((row) => stageCells(row, chain, fmtTime, ctx));
 }
 
 /**

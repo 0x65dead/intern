@@ -23,7 +23,7 @@
 
 import { ChainProfile, CHAINS } from "../core/chains";
 import { StageTable, actionableStage, formatClock, formatCoarse } from "../core/stages";
-import { allStageCells, stageSummaryLines } from "../core/stagetable";
+import { StageContext, allStageCells, stageSummaryLines } from "../core/stagetable";
 import { MintPlan } from "../core/seadrop";
 import { LoadedWallet, formatEth, weiToGwei } from "../core/wallets";
 import { shortAddress } from "../core/target";
@@ -42,6 +42,7 @@ export const PANEL_ACTIONS = [
   "chain",
   "qty",
   "send",
+  "dryrun",
   "fire",
   "refresh",
   "auto",
@@ -137,6 +138,18 @@ export function confirmKeyboard(): InlineButton[][] {
   ];
 }
 
+/**
+ * The dry-run button, offered wherever ✅ Send is.
+ *
+ * Deliberately on its own row and below Send rather than beside it: the two do
+ * very different things and a mis-tap in either direction is expensive — one
+ * spends money unexpectedly, the other fails to spend it when the operator meant
+ * to mint.
+ */
+export function dryRunButton(): InlineButton {
+  return { text: "🧪 Dry run", callback_data: encodeCallback("dryrun") };
+}
+
 /** The read-only panel footer: refresh plus the auto toggle. */
 export function refreshKeyboard(autoOn: boolean): InlineButton[][] {
   return [
@@ -207,6 +220,7 @@ export function renderStages(
   chain: ChainProfile,
   fmtTime: (ms: number) => string,
   nowMs: number,
+  ctx: StageContext = {},
 ): string {
   const lines = [bold("Stages")];
 
@@ -214,7 +228,7 @@ export function renderStages(
     lines.push("", esc("No stages are configured for this drop yet."));
   }
 
-  const cells = allStageCells(table, chain, fmtTime);
+  const cells = allStageCells(table, chain, fmtTime, ctx);
   for (const cell of cells) {
     lines.push("");
     lines.push(`${bold(cell.stage)}  ${esc(`[${cell.source}]`)}`);
@@ -223,9 +237,13 @@ export function renderStages(
     lines.push(esc(`cap:    ${cell.cap} per wallet`));
     lines.push(esc(`status: ${cell.status}`));
     lines.push(esc(`left:   ${cell.mintsLeft}`));
+    lines.push(esc(`can we: ${cell.eligibility}`));
   }
 
-  const summary = stageSummaryLines(actionableStage(table, nowMs), formatClock);
+  const summary = stageSummaryLines(
+    actionableStage(table, nowMs, ctx.fire, ctx.evidence),
+    formatClock,
+  );
   if (summary.length > 0) {
     lines.push("");
     for (const line of summary) lines.push(bold(line));

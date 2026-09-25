@@ -14,6 +14,7 @@
     "dev": "node --experimental-strip-types src/cli/index.ts",
     "typecheck": "tsc --noEmit",
     "test": "node --test dist-tests/tests/*.test.js",
+    "docs": "tsc && node dist/docs/write.js",
     "pretest": "tsc -p tsconfig.test.json"
   },
   "keywords": [

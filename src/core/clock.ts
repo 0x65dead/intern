@@ -206,3 +206,54 @@ export class CorrectedClock {
     if (sync.synced) this.offsetMs = sync.offsetMs;
   }
 }
+
+// ── The unattended drift guard ──────────────────────────────────────────────
+
+export interface DriftVerdict {
+  ok: boolean;
+  /** Always populated, for both verdicts — the log line says what was measured. */
+  detail: string;
+}
+
+/**
+ * Should an unattended run be allowed to fire?
+ *
+ * The metric is *uncertainty*, not offset, and the distinction matters enough to
+ * be explicit about. A local clock 400ms slow is harmless once measured: the
+ * correction is applied and T-0 is hit exactly. Measuring it is the whole reason
+ * syncClock exists. What is not harmless is not knowing where T-0 is to within
+ * the limit — that is `uncertaintyMs`, half the best round trip, and it is the
+ * number that bounds how late or early the transaction can land.
+ *
+ * So a large corrected offset passes, with the magnitude stated. A large
+ * uncertainty fails, and a failed sync fails hardest: with no measurement at all
+ * intern is firing against an unvalidated clock, which is a risk a person at a
+ * terminal can accept and an unattended daemon cannot.
+ */
+export function driftGuard(sync: ClockSync, limitMs: number): DriftVerdict {
+  if (!sync.synced) {
+    return {
+      ok: false,
+      detail:
+        "Clock offset could not be measured — every time source failed. An " +
+        "unattended run will not fire against an unvalidated clock; a run you are " +
+        "watching still can.",
+    };
+  }
+  if (sync.uncertaintyMs > limitMs) {
+    return {
+      ok: false,
+      detail:
+        `Clock uncertainty is ±${sync.uncertaintyMs}ms, beyond the ${limitMs}ms limit. ` +
+        `T-0 cannot be placed accurately enough to fire. Raise CLOCK_DRIFT_LIMIT_MS ` +
+        `to accept this, or use a closer time source.`,
+    };
+  }
+  const sign = sync.offsetMs >= 0 ? "+" : "";
+  return {
+    ok: true,
+    detail:
+      `Clock measured: offset ${sign}${sync.offsetMs}ms, uncertainty ±${sync.uncertaintyMs}ms ` +
+      `(limit ${limitMs}ms). The offset is corrected for, so its size is not itself a problem.`,
+  };
+}

@@ -25,7 +25,13 @@ import {
   statusIcon,
   statusText,
 } from "../src/core/stages";
-import { STAGE_COLUMNS, allStageCells, stageCells, stageSummaryLines } from "../src/core/stagetable";
+import {
+  STAGE_COLUMNS,
+  allStageCells,
+  firstSentence,
+  stageCells,
+  stageSummaryLines,
+} from "../src/core/stagetable";
 import { DropStage } from "../src/core/opensea";
 import { MintPlan, PublicDrop, SupplyInfo } from "../src/core/seadrop";
 import { ChainProfile, resolveChain } from "../src/core/chains";
@@ -346,9 +352,11 @@ describe("actionableStage", () => {
     assert.equal(actionableStage(table([later, soon]), NOW), soon);
   });
 
-  it("ignores non-public stages — they cannot be fired at", () => {
-    // An allowlist stage needs a server signature intern does not hold; offering it
-    // as the thing to mint would be offering a transaction that always reverts.
+  it("ignores non-public stages under the default context", () => {
+    // Selection is matrix-driven now, and the default context is ALLOWLIST_MINTING
+    // off — under which the only fireable mechanism is `public`. This assertion is
+    // what pins "flag off behaves exactly as it did before the matrix existed".
+    // With the flag on, a gated stage is selected instead; see capabilities.test.ts.
     const allow = apiStageRow(apiStage({ label: "GTD", startMs: NOW, endMs: NOW + HOUR }), NOW);
     assert.equal(actionableStage(table([allow]), NOW), undefined);
   });
@@ -453,7 +461,7 @@ describe("stage cells", () => {
     });
     const cells = allStageCells(table, CHAIN, () => "T");
     assert.equal(cells.length, table.rows.length);
-    assert.equal(STAGE_COLUMNS.length, 7);
+    assert.equal(STAGE_COLUMNS.length, 8);
     // Every column the header promises must exist on every row, or the CLI's
     // padded table and the bot's labelled lines fall out of step.
     for (const cell of cells) {
@@ -488,5 +496,139 @@ describe("stageSummaryLines", () => {
 
   it("returns nothing when there is no actionable stage", () => {
     assert.deepEqual(stageSummaryLines(undefined, formatClock), []);
+  });
+});
+
+describe("the eligibility column", () => {
+  const fmt = () => "T";
+
+  it("says a public stage is open to all rather than leaving a blank", () => {
+    // An em dash here would read as "not checked yet" on the one row where there
+    // is nothing to check.
+    const cells = stageCells(publicStageRow(drop(), supply(), NOW), CHAIN, fmt);
+    assert.equal(cells.eligibility, "open to all");
+  });
+
+  it("states why a gated row cannot be fired, under the default context", () => {
+    // Default context is ALLOWLIST_MINTING off. The row still appears — omitting
+    // it is the silent failure this column exists to prevent — and it carries the
+    // exact reason rather than an empty cell.
+    const row = apiStageRow(apiStage({ label: "GTD" }), NOW);
+    const cells = stageCells(row, CHAIN, fmt);
+    assert.match(cells.eligibility, /^not fireable: /);
+    assert.match(cells.eligibility, /ALLOWLIST_MINTING/);
+  });
+
+  it("names OpenSea when a signed stage is unlocked but keyless", () => {
+    const row = apiStageRow(apiStage({ label: "FCFS" }), NOW);
+    const cells = stageCells(row, CHAIN, fmt, {
+      fire: { allowlistMinting: true, openseaApiKey: false, merkleProof: false },
+    });
+    assert.match(cells.eligibility, /^not fireable: /);
+    assert.match(cells.eligibility, /OPENSEA_API_KEY/);
+  });
+
+  it("shows a computed verdict once the stage is fireable", () => {
+    const row = apiStageRow(apiStage({ label: "GTD" }), NOW);
+    const cells = stageCells(row, CHAIN, fmt, {
+      fire: { allowlistMinting: true, openseaApiKey: true, merkleProof: false },
+      eligibility: { "opensea-signed": "❔ unknown (OpenSea-gated)" },
+    });
+    assert.equal(cells.eligibility, "❔ unknown (OpenSea-gated)");
+  });
+
+  it("routes a Merkle row to the Merkle verdict, not the signed one", () => {
+    // Same "Allowlist" label, opposite capabilities. Keying the cell on the stage
+    // label rather than the mechanism would show an OpenSea caveat on a drop that
+    // needs no OpenSea at all.
+    const row = apiStageRow(apiStage({ label: "Allowlist" }), NOW);
+    const cells = stageCells(row, CHAIN, fmt, {
+      fire: { allowlistMinting: true, openseaApiKey: false, merkleProof: true },
+      evidence: { merkleRoot: true, localSigner: false },
+      eligibility: { "merkle-allowlist": "✅ all 2 eligible" },
+    });
+    assert.equal(cells.eligibility, "✅ all 2 eligible");
+  });
+
+  it("distinguishes a list that failed to load from no list at all", () => {
+    // The regression this exists for. Both cases leave merkleProof false, so both
+    // derive the same "no wallet has a proof" reason — which is true of both and
+    // fixable in only one. The operator with a mistyped path must be told about
+    // the path, not sent to audit their wallets.
+    const row = apiStageRow(apiStage({ label: "Allowlist" }), NOW);
+    const fire = { allowlistMinting: true, openseaApiKey: false, merkleProof: false };
+    const evidence = { merkleRoot: true, localSigner: false };
+
+    const noList = stageCells(row, CHAIN, fmt, { fire, evidence });
+    const badList = stageCells(row, CHAIN, fmt, {
+      fire,
+      evidence,
+      eligibility: { "merkle-allowlist": "allow-list unusable: Allow-list file not found: ./nope.json" },
+      eligibilityUnavailable: ["merkle-allowlist"],
+    });
+
+    assert.match(noList.eligibility, /no loaded wallet has a proof/i);
+    assert.match(badList.eligibility, /^not fireable: /);
+    assert.match(badList.eligibility, /nope\.json/);
+    assert.notEqual(noList.eligibility, badList.eligibility);
+  });
+
+  it("does not let the marker suppress a different mechanism's reason", () => {
+    // The marker is per-mechanism. A broken Merkle list must not rewrite the cell
+    // of an OpenSea-signed row, whose reason is a missing API key.
+    const row = apiStageRow(apiStage({ label: "GTD" }), NOW);
+    const cells = stageCells(row, CHAIN, fmt, {
+      fire: { allowlistMinting: true, openseaApiKey: false, merkleProof: false },
+      eligibility: { "merkle-allowlist": "allow-list unusable: nope" },
+      eligibilityUnavailable: ["merkle-allowlist"],
+    });
+    assert.match(cells.eligibility, /OPENSEA_API_KEY/);
+    assert.doesNotMatch(cells.eligibility, /unusable/);
+  });
+
+  it("ignores the marker when the stage is fireable anyway", () => {
+    // A local signer makes the stage fireable without any list. A stale marker
+    // must not turn a working row into a not-fireable one.
+    const row = apiStageRow(apiStage({ label: "Allowlist" }), NOW);
+    const cells = stageCells(row, CHAIN, fmt, {
+      fire: { allowlistMinting: true, openseaApiKey: false, merkleProof: false },
+      evidence: { merkleRoot: false, localSigner: true },
+      eligibility: { "local-signed": "✅ signer held locally" },
+      eligibilityUnavailable: ["merkle-allowlist"],
+    });
+    assert.equal(cells.eligibility, "✅ signer held locally");
+  });
+
+  it("fills every column on every row, eligibility included", () => {
+    const table = buildStageTable({
+      plan: plan(),
+      supply: supply(),
+      schedule: {
+        slug: "x",
+        chain: "ethereum",
+        contractAddress: "0x1",
+        stages: [apiStage({ label: "GTD" })],
+      },
+      nowMs: NOW,
+      hasApiKey: true,
+    });
+    for (const cell of allStageCells(table, CHAIN, fmt)) {
+      assert.ok(cell.eligibility.length > 0, "an empty eligibility cell is a silent omission");
+    }
+  });
+});
+
+describe("firstSentence", () => {
+  it("cuts at a sentence boundary, never mid-word", () => {
+    assert.equal(firstSentence("One thing. Another thing."), "One thing.");
+  });
+
+  it("returns the whole text when there is no boundary", () => {
+    assert.equal(firstSentence("No terminator here"), "No terminator here");
+  });
+
+  it("collapses the newlines a matrix reason contains", () => {
+    // Reasons are written as prose across several lines; a table cell is one line.
+    assert.equal(firstSentence("Wrapped\nover lines. Rest."), "Wrapped over lines.");
   });
 });

@@ -13,7 +13,8 @@
 
 import { JsonRpcProvider } from "ethers";
 import { ChainProfile, resolveChain } from "./chains";
-import { MintPlan, buildMintPlan } from "./seadrop";
+import { MintPlan, buildMintPlan, fetchAllowListRoot, fetchSigners } from "./seadrop";
+import { MechanismEvidence, NO_EVIDENCE } from "./capabilities";
 import { RpcPlan, planRpcs, resolveRpcsForChain, toRpcUrl } from "./rpc";
 import { Detection, detectChain, noCodeMessage } from "./detect";
 import { normalizeAddress, parseTarget } from "./target";
@@ -25,11 +26,15 @@ import {
   resolveCollection,
 } from "./opensea";
 import { StageTable, buildStageTable } from "./stages";
+import { StageContext, firstSentence } from "./stagetable";
+import { WalletEligibility, checkMerkleEligibility, summariseEligibility } from "./eligibility";
+import { loadAllowList } from "./allowlistsource";
 import {
   FeeSnapshot,
   GasSettings,
   gweiToWei,
   readFees,
+  redactKeys,
   suggestMaxFee,
   weiToGwei,
 } from "./wallets";
@@ -295,8 +300,35 @@ export interface PreparedRun {
   warnings: string[];
   /** Every stage of the drop, on-chain and API, in one table. */
   stages: StageTable;
+  /**
+   * What the contract itself says about how its gated stages are gated.
+   *
+   * Read here rather than guessed at the renderer, because the difference
+   * between "must ask OpenSea" and "can sign it here" is two contract calls and
+   * is otherwise unknowable. Both reads fail soft — most drops have neither a
+   * root nor a signer, and that is a fact about the drop, not an error.
+   */
+  evidence: MechanismEvidence;
+  /** The SeaDrop signers configured on the collection. Empty is the common case. */
+  signers: string[];
+  /** Per-wallet allow-list proof results, when ALLOWLIST_SOURCE is configured. */
+  eligibility: EligibilityReport;
   /** Set when the chain was probed rather than given. */
   detection?: Detection;
+}
+
+/**
+ * The result of asking "can these wallets mint this allow-list stage?".
+ *
+ * Three states, kept apart on purpose — see readEligibility. An empty `results`
+ * with a null `error` means the question was never asked.
+ */
+export interface EligibilityReport {
+  /** Where the list came from, for the operator to check it was the right one. */
+  origin: string | null;
+  results: WalletEligibility[];
+  /** Set when a list was configured but could not be used. */
+  error: string | null;
 }
 
 export interface PrepareOptions {
@@ -316,6 +348,17 @@ export interface PrepareOptions {
   nowMs?: number;
   /** Set false to skip chain probing for a bare address. */
   autoDetect?: boolean;
+  /**
+   * The addresses intern holds keys for, to decide whether a configured SeaDrop
+   * signer is one of ours. Only ever compared — never logged, never sent.
+   */
+  walletAddresses?: string[];
+  /**
+   * A local allow-list to prove those addresses against: a path, https:// or
+   * ipfs://. Unset means the eligibility question is left unanswered rather
+   * than answered "no".
+   */
+  allowlistSource?: string | null;
 }
 
 /**
@@ -393,6 +436,25 @@ export async function prepareRun(opts: PrepareOptions): Promise<PreparedRun> {
       apiError: scheduleResult.error,
     });
 
+    // A second round trip, but only one, and only after the variant is known —
+    // the getter lives at a different address for v1 than for v2. Both calls are
+    // independent, so they share the trip.
+    const { evidence, signers, root } = await readMechanismEvidence(
+      rpc.provider,
+      resolved.contract,
+      plan,
+      opts.walletAddresses ?? [],
+    );
+
+    const eligibility = await readEligibility({
+      provider: rpc.provider,
+      contract: resolved.contract,
+      plan,
+      root,
+      addresses: opts.walletAddresses ?? [],
+      source: opts.allowlistSource ?? null,
+    });
+
     return {
       chain: resolved.chain,
       contract: resolved.contract,
@@ -404,11 +466,96 @@ export async function prepareRun(opts: PrepareOptions): Promise<PreparedRun> {
       fees: gasDecision.fees,
       warnings,
       stages,
+      evidence,
+      signers,
+      eligibility,
       ...(resolved.detection ? { detection: resolved.detection } : {}),
     };
   } catch (err) {
     rpc.provider.destroy();
     throw err;
+  }
+}
+
+/**
+ * Ask the contract how its gated stages are actually gated.
+ *
+ * Returns no evidence rather than throwing on any failure. The absence of an
+ * allow-list root is indistinguishable, from outside, from a collection that
+ * does not implement the getter — and both mean the same thing for the table:
+ * there is no Merkle stage to be eligible for. Claiming otherwise from a failed
+ * read would be worse than claiming nothing.
+ */
+async function readMechanismEvidence(
+  provider: JsonRpcProvider,
+  contract: string,
+  plan: MintPlan | null,
+  walletAddresses: string[],
+): Promise<{ evidence: MechanismEvidence; signers: string[]; root: string | null }> {
+  if (plan === null) return { evidence: NO_EVIDENCE, signers: [], root: null };
+
+  const [root, signers] = await Promise.all([
+    fetchAllowListRoot(provider, contract, plan.variant),
+    fetchSigners(provider, contract, plan.variant),
+  ]);
+
+  // Case-insensitive because one side is checksummed by fetchSigners and the
+  // other is whatever the operator put in .env.
+  const ours = new Set(walletAddresses.map((a) => a.toLowerCase()));
+  return {
+    evidence: {
+      merkleRoot: root !== null,
+      localSigner: signers.some((s) => ours.has(s.toLowerCase())),
+    },
+    signers,
+    // Handed back rather than dropped: the eligibility check needs the same
+    // value, and re-reading it would be a second round trip for a number we
+    // are already holding.
+    root,
+  };
+}
+
+/**
+ * Prove the loaded wallets against the drop's allow-list, when one is given.
+ *
+ * Three outcomes, and they are deliberately distinguishable in the table. No
+ * source configured is not a verdict about any wallet — it means the operator
+ * never supplied the list, and the honest cell is "unknown", not "ineligible".
+ * A source that fails to load is a third thing again: the operator asked for a
+ * check that did not happen, and that must be visible rather than degrade into
+ * looking like the first case.
+ */
+async function readEligibility(opts: {
+  provider: JsonRpcProvider;
+  contract: string;
+  plan: MintPlan | null;
+  root: string | null;
+  addresses: string[];
+  source: string | null;
+}): Promise<EligibilityReport> {
+  const none: EligibilityReport = { origin: null, results: [], error: null };
+  if (opts.source === null || opts.source.trim() === "") return none;
+  if (opts.plan === null) return none;
+  if (opts.addresses.length === 0) {
+    return { origin: null, results: [], error: "No wallets are loaded, so there was nothing to check." };
+  }
+
+  try {
+    const list = await loadAllowList(opts.source);
+    const results = await checkMerkleEligibility({
+      provider: opts.provider,
+      nftContract: opts.contract,
+      variant: opts.plan.variant,
+      entries: list.entries,
+      addresses: opts.addresses,
+      root: opts.root,
+    });
+    return { origin: list.origin, results, error: null };
+  } catch (err: unknown) {
+    // Never fatal. A bad allow-list must not stop the operator seeing the rest
+    // of the drop — but it must not be silent either, so the reason travels to
+    // the table instead of into a swallowed catch.
+    return { origin: null, results: [], error: redactKeys(err instanceof Error ? err.message : String(err)) };
   }
 }
 
@@ -465,6 +612,10 @@ export async function refreshRun(
     apiError: scheduleResult.error,
   });
 
+  // evidence and signers ride through on the spread, deliberately. An allow-list
+  // root and a signer set are configured once at deploy time and do not move
+  // while a panel is open; re-reading them every refresh would spend two RPC
+  // calls on a timer for an answer that was already correct.
   return {
     ...run,
     plan,
@@ -473,6 +624,54 @@ export async function refreshRun(
     warnings,
     stages,
   };
+}
+
+/**
+ * Assemble what the stage table needs to say "can we fire this?" honestly.
+ *
+ * Every caller of printStages/renderStages goes through here, so the CLI and the
+ * bot cannot reach different verdicts about the same drop. Called with nothing
+ * configured it produces exactly the conservative defaults the table already
+ * used — which is the point: the honest answer with no evidence is "no", and
+ * this only ever narrows that by presenting evidence.
+ */
+export function stageContext(
+  run: Pick<PreparedRun, "evidence"> & Partial<Pick<PreparedRun, "eligibility">>,
+  opts: {
+    allowlistMinting: boolean;
+    openseaApiKey: boolean;
+  },
+): StageContext {
+  const report = run.eligibility ?? { origin: null, results: [], error: null };
+  const summary = eligibilitySummary(report);
+  return {
+    fire: {
+      allowlistMinting: opts.allowlistMinting,
+      openseaApiKey: opts.openseaApiKey,
+      // Derived, never asserted by the caller. A proof exists when a wallet was
+      // actually proven against the on-chain root — the one fact that turns a
+      // Merkle stage from unreachable into fireable.
+      merkleProof: report.results.some((r) => r.state === "eligible" && r.proof !== undefined),
+    },
+    evidence: run.evidence,
+    ...(summary ? { eligibility: { "merkle-allowlist": summary } } : {}),
+    // A configured list that did not load is not the same as no list, and the
+    // table must not let the two read alike.
+    ...(report.error !== null ? { eligibilityUnavailable: ["merkle-allowlist" as const] } : {}),
+  };
+}
+
+/**
+ * One line for the Merkle row's eligibility cell, or null to leave it alone.
+ *
+ * A load failure outranks the wallet verdicts: if the list never loaded there
+ * are no verdicts, and printing "unknown" would hide that the operator asked a
+ * question the run could not answer.
+ */
+export function eligibilitySummary(report: EligibilityReport): string | null {
+  if (report.error !== null) return `allow-list unusable: ${firstSentence(report.error)}`;
+  if (report.results.length === 0) return null;
+  return summariseEligibility(report.results);
 }
 
 /**

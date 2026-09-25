@@ -8,9 +8,16 @@
 //
 // Two rules keep that from losing information:
 //
-//   Terminal events (fired, receipt, rejected, done) flush immediately and are
-//   never dropped. Progress events (countdown, phase) are throttled and may be
-//   coalesced, because only the latest one matters.
+//   No event is ever dropped. The message is cumulative — every append stays in
+//   it — and `settle` guarantees the final state lands before the run is reported
+//   as finished. So "not flushed" means "shown a moment later", never "lost".
+//
+//   Only events that happen once per run are flushed immediately: T-0 dispatch,
+//   and that is all. Per-wallet events are not. The earlier version flushed every
+//   receipt, which on a sixty-wallet run is sixty forced edits inside a few
+//   seconds against a limit of roughly one per second — a rate limit earned at
+//   the exact moment the operator is reading the outcome, and nothing gained,
+//   because the line was already in the message either way.
 //
 //   The 50ms fine-timer and busy-spin phases are never sent at all. They exist to
 //   hit T-0 precisely; forwarding them would spend the rate limit during the exact
@@ -18,58 +25,19 @@
 
 import { ChainProfile, explorerTx } from "../core/chains";
 import { EngineEvent } from "../core/engine";
-import { MintPlan } from "../core/seadrop";
-import { RpcPlan, maskRpc } from "../core/rpc";
+import { dryRunLines, dryRunVerdict } from "../core/dryrun";
 import { formatEth, weiToGwei } from "../core/wallets";
-import { formatRemaining, formatUtc } from "../core/timing";
-import { shortAddress } from "../core/target";
-import { TelegramClient, bold, code, esc, link } from "./api";
+import { formatLocal, formatRemaining } from "../core/timing";
+import { TelegramClient, TelegramError, bold, code, esc, isMessageGone, link } from "./api";
+import {
+  WriteGate,
+  nextWriteDelay,
+  newWriteGate,
+  noteRateLimit,
+  planFinalWrite,
+} from "./refresh";
 
-export function formatPlan(plan: MintPlan, chain: ChainProfile, quantity: number): string {
-  const startMs = plan.drop.startTime * 1000;
-  const endMs = plan.drop.endTime * 1000;
-  const now = Date.now();
-  const live = now >= startMs && now < endMs;
 
-  const lines = [
-    bold("Drop"),
-    `chain: ${esc(chain.name)} (id ${chain.chainId})`,
-    `contract: ${code(shortAddress(plan.nftContract))}`,
-    `variant: ${esc(plan.variant === "v1-singleton" ? "SeaDrop v1 singleton" : "SeaDrop v2 (token contract)")}`,
-    `price: ${esc(formatEth(plan.drop.mintPrice, chain.nativeSymbol))} × ${quantity} = ${bold(formatEth(plan.value, chain.nativeSymbol))} per wallet`,
-    `per-wallet cap: ${plan.drop.maxTotalMintableByWallet > 0 ? plan.drop.maxTotalMintableByWallet : "unlimited"}`,
-  ];
-
-  if (plan.supply.maxSupply !== null && plan.supply.totalSupply !== null) {
-    lines.push(`supply: ${plan.supply.totalSupply}/${plan.supply.maxSupply} minted`);
-  }
-  lines.push(
-    live
-      ? `window: ${bold("open now")} until ${esc(formatUtc(endMs))}`
-      : `opens: ${esc(formatUtc(startMs))} — in ${esc(formatRemaining(startMs - now))}`,
-  );
-  lines.push(`\n${esc("Calldata built from on-chain state — no OpenSea key needed.")}`);
-  return lines.join("\n");
-}
-
-export function formatRpcPlan(plan: RpcPlan, chain: ChainProfile): string {
-  const lines = [bold("Endpoints")];
-  for (const health of plan.health) {
-    const dropped = plan.dropped.includes(health);
-    const mark = dropped ? "✗" : health.readable ? "✓" : "·";
-    const detail = dropped
-      ? `wrong chain (${health.chainId})`
-      : health.readable
-        ? `${health.latencyMs}ms`
-        : "send-only";
-    lines.push(`${mark} ${esc(health.label)} — ${esc(detail)}`);
-  }
-  lines.push(
-    `\n${esc(`chain ${chain.chainId} verified · broadcasting to ${plan.blast.length} endpoint(s)`)}`,
-  );
-  if (plan.read[0]) lines.push(esc(`reads: ${maskRpc(plan.read[0])}`));
-  return lines.join("\n");
-}
 
 export function formatGas(
   maxFeeWei: bigint,
@@ -94,21 +62,33 @@ export function formatGas(
  * write for events that must not wait. When the buffer outgrows Telegram's message
  * cap the oldest lines are dropped and a marker is left, so the tail — which is
  * where the outcome is — always survives.
+ *
+ * "Rate-limit aware" now means both halves of it. The interval keeps us under the
+ * limit; the `WriteGate` obeys Telegram when we go over anyway. It used to mean
+ * only the first, and the error handler below discarded the 429 that carried the
+ * retry_after — so exceeding the limit produced a 1.2s retry loop against a
+ * limiter that lengthens its answer each time.
+ *
+ * Time is injected, not read. Same reason as `refresh.ts`: a gate that reads the
+ * clock itself can only be tested by sleeping.
  */
 export class LiveMessage {
   private lines: string[] = [];
   private messageId: number | null = null;
-  private lastWrite = 0;
+  private gate: WriteGate = newWriteGate();
   private pending: NodeJS.Timeout | null = null;
   private writing: Promise<void> = Promise.resolve();
   private dropped = 0;
   /** Replaced on every update rather than appended — for countdowns. */
   private tail: string | null = null;
+  /** The last write's failure, or null if it landed. Read only by `settle`. */
+  private lastError: unknown = null;
 
   constructor(
     private readonly client: TelegramClient,
     private readonly chatId: number,
     private readonly header: string,
+    private readonly now: () => number,
     private readonly intervalMs = 1_200,
   ) {}
 
@@ -137,19 +117,27 @@ export class LiveMessage {
 
   private schedule(): void {
     if (this.pending) return;
-    const wait = Math.max(0, this.intervalMs - (Date.now() - this.lastWrite));
+    const wait = nextWriteDelay(this.gate, this.now(), this.intervalMs);
     this.pending = setTimeout(() => {
       this.pending = null;
       void this.write();
     }, wait);
   }
 
-  /** Write now, and wait for it. Used for events that must not be lost. */
+  /**
+   * Write now, and wait for it. Used for events that must not be lost.
+   *
+   * "Now" skips our own interval but still waits out a retry_after. A terminal
+   * event that jumps the queue into a 429 is not delivered promptly, it is
+   * dropped — and the whole point of flushing it is that it must not be.
+   */
   async flush(): Promise<void> {
     if (this.pending) {
       clearTimeout(this.pending);
       this.pending = null;
     }
+    const wait = nextWriteDelay(this.gate, this.now(), this.intervalMs, true);
+    if (wait > 0) await sleep(wait);
     await this.write();
   }
 
@@ -157,27 +145,70 @@ export class LiveMessage {
     // Serialize writes: two concurrent edits of the same message race, and the
     // loser's content is silently discarded.
     this.writing = this.writing.then(async () => {
-      this.lastWrite = Date.now();
+      const startedMs = this.now();
+      this.gate = { ...this.gate, lastWriteMs: startedMs };
       const text = this.render();
       try {
-        if (this.messageId === null) {
-          const sent = await this.client.sendMessage(this.chatId, text);
-          this.messageId = sent.message_id;
-        } else {
-          await this.client.editMessage(this.chatId, this.messageId, text);
+        await this.send(text);
+        this.lastError = null;
+      } catch (err: unknown) {
+        this.lastError = err;
+        // The one piece of information a 429 carries, previously thrown away.
+        if (err instanceof TelegramError) {
+          this.gate = noteRateLimit(this.gate, startedMs, err.retryAfterSec);
         }
-      } catch {
-        // A failed edit must never abort a mint. The next write carries the same
-        // content, so nothing is lost unless every write fails.
+        // A message the operator deleted can never be edited again, so every
+        // remaining write of the run would fail for a reason a fresh send fixes.
+        if (isMessageGone(err)) this.messageId = null;
+        // A failed progress write must never abort a mint, and costs nothing: the
+        // next write carries the whole message again. `settle` handles the final
+        // one, which is the only write whose loss the operator pays for.
       }
     });
     return this.writing;
   }
 
-  async settle(): Promise<void> {
-    await this.flush();
-    await this.writing;
+  private async send(text: string): Promise<void> {
+    if (this.messageId === null) {
+      const sent = await this.client.sendMessage(this.chatId, text);
+      this.messageId = sent.message_id;
+    } else {
+      await this.client.editMessage(this.chatId, this.messageId, text);
+    }
   }
+
+  /**
+   * Land the final state of the message, retrying inside a budget.
+   *
+   * Returns whether it landed. The caller needs to know: the per-wallet fired and
+   * receipt lines with their tx hashes exist nowhere except this message, and
+   * before this the loop above swallowed a 429 on the last write and reported the
+   * run as finished — leaving a stale countdown as the operator's final word on a
+   * mint that had already spent real money. Silence read as success.
+   *
+   * Bounded, because this runs while the global mint lock is still held.
+   */
+  async settle(): Promise<boolean> {
+    const startedMs = this.now();
+    for (let attempt = 1; ; attempt += 1) {
+      await this.flush();
+      await this.writing;
+      if (this.lastError === null) return true;
+      const plan = planFinalWrite(
+        attempt,
+        nextWriteDelay(this.gate, this.now(), this.intervalMs, true),
+        this.now() - startedMs,
+      );
+      if (plan.kind === "giveup") return false;
+      await sleep(plan.waitMs);
+    }
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
 }
 
 /**
@@ -191,9 +222,11 @@ export function createTelegramReporter(
   client: TelegramClient,
   chatId: number,
   chain: ChainProfile,
-): { handle: (event: EngineEvent) => void; settle: () => Promise<void> } {
-  const live = new LiveMessage(client, chatId, bold("Minting"));
+  now: () => number,
+): { handle: (event: EngineEvent) => void; settle: () => Promise<boolean> } {
+  const live = new LiveMessage(client, chatId, bold("Minting"), now);
   let lastCountdown = 0;
+  let dry = false;
 
   const handle = (event: EngineEvent): void => {
     switch (event.type) {
@@ -255,13 +288,15 @@ export function createTelegramReporter(
         // seconds. The last two seconds are where precision matters most, and
         // spending the rate limit there would be actively harmful.
         if (event.remainingMs < 3_000) break;
-        const now = Date.now();
-        if (now - lastCountdown < 3_000) break;
-        lastCountdown = now;
+        const at = now();
+        if (at - lastCountdown < 3_000) break;
+        lastCountdown = at;
         live.setTail(esc(`◷ ${formatRemaining(event.remainingMs)} until dispatch`));
         break;
       }
 
+      // The only forced write: once per run, and the instant the operator is
+      // waiting for. Everything after it is per-wallet and paced.
       case "fired":
         live.setTail(null);
         live.append(
@@ -283,22 +318,30 @@ export function createTelegramReporter(
         break;
 
       case "rejected":
+        // Per-wallet, so deliberately not flushed. See the header: the line is in
+        // the message the moment it is appended, and the next scheduled write
+        // carries it. Forcing one edit per wallet buys a 429, not promptness.
         live.append(esc(`✗ W${event.index} rejected by every endpoint — not broadcast`));
         for (const reason of event.reasons.slice(0, 3)) live.append(code(reason.slice(0, 200)));
         if (event.hint) live.append(esc(`→ ${event.hint}`));
-        void live.flush();
         break;
 
       case "receipt":
+        // Also per-wallet. Sixty of these land within a block or two of each other.
         live.append(
-          `${event.success ? bold("MINTED") : bold("REVERTED")} ${esc(`W${event.index} · block ${event.block} · gas ${event.gasUsed}`)}`,
+          `${event.success ? bold("MINTED") : bold("REVERTED")} ${esc(`W${event.index} · block ${event.block} · gas ${event.gasUsed}`)}` +
+            (event.reason ? `\n${esc(event.reason)}` : ""),
         );
-        void live.flush();
         break;
 
       case "receiptTimeout":
         live.append(
-          `${esc(`⚠ W${event.index} no receipt yet — `)}${link("check on the explorer", explorerTx(chain.chainId, event.txHash))}`,
+          `${esc(
+            event.cancelled === true
+              ? // Cancelling stopped the watching, not the transaction.
+                `⚠ W${event.index} stopped watching (cancelled) — already broadcast, may still mint: `
+              : `⚠ W${event.index} no receipt yet — `,
+          )}${link("check on the explorer", explorerTx(chain.chainId, event.txHash))}`,
         );
         break;
 
@@ -306,8 +349,28 @@ export function createTelegramReporter(
         live.append(esc(`⚠ ${event.message}`));
         break;
 
+      case "dryRun": {
+        dry = true;
+        live.setTail(null);
+        const verdict = dryRunVerdict(event.report);
+        // Sent as its own block rather than folded into the live message: this
+        // is the whole output of the command, and the live message is a
+        // scratchpad that keeps being overwritten.
+        live.append(
+          [
+            bold(verdict.wouldFire ? "🧪 Dry run — would fire" : "🧪 Dry run — would NOT fire"),
+            "",
+            esc(dryRunLines(event.report, formatLocal).join("\n")),
+          ].join("\n"),
+        );
+        break;
+      }
+
       case "done":
         live.setTail(null);
+        // A dry run ends with minted: 0, which is not "nothing minted" — it is
+        // "nothing was sent, as promised". The report above already said so.
+        if (dry) break;
         live.append(
           event.minted > 0
             ? bold(`✓ ${event.minted} wallet(s) minted`)

@@ -11,6 +11,7 @@ import { describe, it } from "node:test";
 import {
   MAIN_MENU,
   PANEL_ACTIONS,
+  dryRunButton,
   chainKeyboard,
   confirmKeyboard,
   encodeCallback,
@@ -22,9 +23,16 @@ import {
 import {
   AUTO_REFRESH_MS,
   EditGate,
+  FINAL_WRITE_ATTEMPTS,
+  FINAL_WRITE_BUDGET_MS,
   MANUAL_DEBOUNCE_MS,
   MIN_EDIT_GAP_MS,
+  MIN_FINAL_RETRY_MS,
   debouncedToast,
+  newWriteGate,
+  nextWriteDelay,
+  noteRateLimit,
+  planFinalWrite,
 } from "../src/bot/refresh";
 import { CHAINS } from "../src/core/chains";
 
@@ -258,5 +266,134 @@ describe("refresh constants", () => {
   it("keeps auto-refresh well clear of the per-chat edit limit", () => {
     assert.ok(AUTO_REFRESH_MS >= MIN_EDIT_GAP_MS * 2);
     assert.ok(MANUAL_DEBOUNCE_MS >= MIN_EDIT_GAP_MS);
+  });
+});
+
+describe("the dry-run button", () => {
+  it("asks for a dry run and nothing else", () => {
+    assert.deepEqual(parseCallback(dryRunButton().callback_data), {
+      action: "dryrun",
+      value: "",
+    });
+  });
+
+  it("cannot be confused with Send by its callback data", () => {
+    // The two buttons sit on the same panel and do opposite things. A shared
+    // prefix would make a truncated or mangled callback resolve to the wrong one.
+    assert.notEqual(dryRunButton().callback_data, encodeCallback("send"));
+    assert.ok(!dryRunButton().callback_data.startsWith("send"));
+  });
+
+  it("says what it does in the label", () => {
+    assert.match(dryRunButton().text, /dry run/i);
+  });
+});
+
+/**
+ * The gates above stop us earning a 429. This one governs what happens once we
+ * have earned one anyway — which the run painter previously handled by discarding
+ * the error, retry_after and all, and trying again 1.2 seconds later.
+ */
+describe("WriteGate — Telegram's own backoff", () => {
+  const NOW = 1_700_000_000_000;
+
+  it("lets the first write go out immediately", () => {
+    assert.equal(nextWriteDelay(newWriteGate(), NOW, 1_200), 0);
+  });
+
+  it("holds an ordinary write to the interval", () => {
+    const gate = { lastWriteMs: NOW, blockedUntilMs: 0 };
+    assert.equal(nextWriteDelay(gate, NOW + 200, 1_200), 1_000);
+  });
+
+  it("lets a forced write skip our own interval", () => {
+    const gate = { lastWriteMs: NOW, blockedUntilMs: 0 };
+    assert.equal(nextWriteDelay(gate, NOW + 200, 1_200, true), 0);
+  });
+
+  it("does NOT let a forced write skip a retry_after", () => {
+    // The whole point. Jumping the queue into a live rate limit does not deliver
+    // the message early, it loses it and lengthens the next retry_after.
+    const gate = noteRateLimit(newWriteGate(), NOW, 5);
+    assert.equal(nextWriteDelay(gate, NOW, 1_200, true), 5_000);
+    assert.equal(nextWriteDelay(gate, NOW + 4_000, 1_200, true), 1_000);
+    assert.equal(nextWriteDelay(gate, NOW + 5_000, 1_200, true), 0);
+  });
+
+  it("takes whichever wait is longer", () => {
+    const gate = noteRateLimit({ lastWriteMs: NOW, blockedUntilMs: 0 }, NOW, 1);
+    // interval 1200ms vs retry_after 1000ms
+    assert.equal(nextWriteDelay(gate, NOW, 1_200), 1_200);
+  });
+
+  it("rounds a fractional retry_after up", () => {
+    assert.equal(noteRateLimit(newWriteGate(), NOW, 1.2).blockedUntilMs, NOW + 2_000);
+  });
+
+  it("never shortens a block already in force", () => {
+    const long = noteRateLimit(newWriteGate(), NOW, 30);
+    assert.equal(noteRateLimit(long, NOW, 1).blockedUntilMs, long.blockedUntilMs);
+  });
+
+  it("ignores a missing or nonsensical retry_after", () => {
+    // A 429 without one still gets our own interval, which is what it got before.
+    for (const bad of [undefined, 0, -5, NaN, Infinity]) {
+      assert.equal(noteRateLimit(newWriteGate(), NOW, bad).blockedUntilMs, 0);
+    }
+  });
+
+  it("does not mutate the gate it is given", () => {
+    const gate = newWriteGate();
+    noteRateLimit(gate, NOW, 5);
+    assert.equal(gate.blockedUntilMs, 0);
+  });
+});
+
+/**
+ * The final write is the only one whose failure costs the operator something: the
+ * per-wallet lines and tx hashes exist nowhere else. It is also the one that runs
+ * while the global mint lock is still held, so the retry has to be bounded.
+ */
+describe("planFinalWrite", () => {
+  it("retries a first failure", () => {
+    assert.deepEqual(planFinalWrite(1, 0, 0), { kind: "retry", waitMs: MIN_FINAL_RETRY_MS });
+  });
+
+  it("waits out a retry_after when there is budget for it", () => {
+    assert.deepEqual(planFinalWrite(1, 5_000, 0), { kind: "retry", waitMs: 5_000 });
+  });
+
+  it("never retries a permanent error in a spin", () => {
+    // waitMs 0 with a parse error would otherwise loop as fast as the event loop
+    // allows until the attempt cap, four times in under a millisecond.
+    const plan = planFinalWrite(2, 0, 10);
+    assert.equal(plan.kind === "retry" && plan.waitMs >= MIN_FINAL_RETRY_MS, true);
+  });
+
+  it("gives up after the attempt cap", () => {
+    const plan = planFinalWrite(FINAL_WRITE_ATTEMPTS, 0, 0);
+    assert.equal(plan.kind, "giveup");
+    assert.match(plan.kind === "giveup" ? plan.reason : "", /attempts failed/);
+  });
+
+  it("gives up once the budget is spent", () => {
+    const plan = planFinalWrite(2, 0, FINAL_WRITE_BUDGET_MS);
+    assert.equal(plan.kind, "giveup");
+    assert.match(plan.kind === "giveup" ? plan.reason : "", /budget is spent/);
+  });
+
+  it("refuses a wait longer than the budget has left", () => {
+    // Telegram occasionally answers with minutes. Honouring that here would hold
+    // the mint lock for minutes after the mint finished.
+    const plan = planFinalWrite(1, 120_000, 0);
+    assert.equal(plan.kind, "giveup");
+    assert.match(plan.kind === "giveup" ? plan.reason : "", /longer than/);
+  });
+
+  it("states the reason it gave up, for the operator", () => {
+    // The caller turns this into a message. A silent give-up leaves a stale
+    // countdown reading as the outcome of a mint that spent real money.
+    const plan = planFinalWrite(FINAL_WRITE_ATTEMPTS, 0, 0);
+    assert.ok(plan.kind === "giveup" && plan.reason.length > 0);
   });
 });

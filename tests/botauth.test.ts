@@ -17,6 +17,8 @@
 
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import fs from "node:fs";
+import path from "node:path";
 import { SessionManager } from "../src/bot/session";
 import { InlineButton, TelegramClient, TgMessage, TgUpdate } from "../src/bot/api";
 import { Defaults } from "../src/util/env";
@@ -76,6 +78,13 @@ function defaults(): Defaults {
     telegramToken: "test-token",
     telegramAllowedIds: [ALLOWED, ALLOWED_GROUP],
     receiptTimeoutMs: 60_000,
+    allowlistMinting: false,
+    allowlistSource: null,
+    dryRun: false,
+    heartbeatMinutes: 30,
+    heartbeatChatId: null,
+    signaturePollMs: 250,
+    clockDriftLimitMs: 2_000,
   };
 }
 
@@ -241,5 +250,72 @@ describe("allowlist — empty", () => {
     await mgr.handleUpdate(message(ALLOWED, ALLOWED, "/start"));
     await mgr.handleUpdate(press(ALLOWED, ALLOWED, "mint"));
     assert.ok(!calls.some((c) => c.method === "sendMessage" || c.method === "editMessage"));
+  });
+});
+
+/**
+ * A button press gets exactly one answer, and whatever a handler wants to say
+ * reaches the operator.
+ *
+ * Telegram accepts one answerCallbackQuery per press and rejects the rest; the
+ * client swallows that rejection. So the pre-emptive empty acknowledgement was
+ * spending the press's one answer, and every alert raised afterwards — "Invalid
+ * quantity.", "Auto-refresh only applies to…", "Refresh failed: …" — was being
+ * sent into a rejection nobody saw. A button that works and says nothing is what
+ * gets reported as a bot that is broken.
+ */
+describe("button presses are answered once, and audibly", () => {
+  it("answers every press, so the client stops spinning", async () => {
+    const { mgr, calls } = manager();
+    await mgr.handleUpdate(press(ALLOWED, ALLOWED, "menu"));
+    assert.equal(calls.filter((c) => c.method === "answerCallback").length, 1);
+  });
+
+  it("never answers the same press twice", async () => {
+    // The second answer is rejected by Telegram, so whatever it carried is lost.
+    const { mgr, calls } = manager();
+    await mgr.handleUpdate(press(ALLOWED, ALLOWED, "qty:0"));
+    assert.equal(calls.filter((c) => c.method === "answerCallback").length, 1);
+  });
+
+  it("still delivers a refusal the press already used up its answer for", async () => {
+    // Degraded to a chat message rather than a toast — visible, which silence
+    // was not.
+    const { mgr, calls } = manager();
+    await mgr.handleUpdate(press(ALLOWED, ALLOWED, "qty:0"));
+    assert.ok(
+      calls.some((c) => c.method === "sendMessage" && (c.text ?? "").includes("Invalid quantity")),
+      `nothing said it was invalid: ${JSON.stringify(calls)}`,
+    );
+  });
+
+  it("does not answer an unauthorized press with an empty ack", async () => {
+    // The refusal is the answer, and it is an alert so it cannot be missed.
+    const { mgr, calls } = manager();
+    await mgr.handleUpdate(press(STRANGER, ALLOWED, "menu"));
+    const answers = calls.filter((c) => c.method === "answerCallback");
+    assert.equal(answers.length, 1);
+    assert.equal(answers[0]?.alert, true);
+    assert.match(answers[0]?.text ?? "", /Not authorized/);
+  });
+
+  it("answers a stale button from an older deployment", async () => {
+    const { mgr, calls } = manager();
+    await mgr.handleUpdate(press(ALLOWED, ALLOWED, "nosuchaction"));
+    const answers = calls.filter((c) => c.method === "answerCallback");
+    assert.equal(answers.length, 1);
+    assert.match(answers[0]?.text ?? "", /no longer valid/);
+  });
+
+  it("leaves refresh to answer its own press", async () => {
+    // Refresh is the one action whose outcome is worth a toast, so it must not be
+    // pre-answered — that is what silently ate "Refresh failed: …".
+    const SRC = fs.readFileSync(
+      path.resolve(__dirname, "..", "..", "src", "bot", "session.ts"),
+      "utf8",
+    );
+    assert.match(SRC, /parsed\.action !== "refresh"/);
+    assert.doesNotMatch(SRC, /answerCallback\(queryId \?\? "", `Refresh failed/);
+    assert.doesNotMatch(SRC, /answerCallback\(queryId, "Refreshing/);
   });
 });

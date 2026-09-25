@@ -36,6 +36,15 @@ import { MintPlan, PublicDrop, SupplyInfo } from "./seadrop";
  * for the remainder. They differ in price and window often enough to be worth
  * separate rows.
  */
+import {
+  FireContext,
+  MechanismEvidence,
+  NO_EVIDENCE,
+  PUBLIC_ONLY,
+  isFireable,
+  mechanismFor,
+} from "./capabilities";
+
 export type StageKind = "gtd" | "team" | "allowlist" | "fcfs" | "public" | "unknown";
 
 export const STAGE_ORDER: StageKind[] = ["team", "gtd", "allowlist", "fcfs", "public", "unknown"];
@@ -356,12 +365,40 @@ export function kindLabel(kind: StageKind): string {
   }
 }
 
-/** The stage that should be fired at: live public first, else next public. */
-export function actionableStage(table: StageTable, nowMs: number): StageRow | undefined {
-  const publicRows = table.rows.filter((r) => r.kind === "public");
-  const live = publicRows.find((r) => r.status === "live");
-  if (live) return live;
-  return publicRows
+/**
+ * The stage that should be fired at: the highest-priority stage intern can
+ * actually fire, live first, else the soonest one still to come.
+ *
+ * Selection is driven by the capability matrix rather than by a hardcoded
+ * `kind === "public"` test, so a stage is a candidate exactly when the code can
+ * fire it unattended. With the default context — ALLOWLIST_MINTING off — the
+ * only fireable mechanism is `public`, which reproduces the previous behaviour
+ * exactly; that equivalence is pinned by test.
+ *
+ * Gated stages outrank public when both are open, which is `STAGE_ORDER`'s
+ * existing order. An allowlist stage you are eligible for is the one worth
+ * taking: it is usually cheaper, usually capped, and the public stage is still
+ * there afterwards. Ties break on that same order so the choice is deterministic
+ * — an operator who re-runs and gets a different stage has no way to tell a
+ * schedule change from a coin flip.
+ */
+export function actionableStage(
+  table: StageTable,
+  nowMs: number,
+  ctx: FireContext = PUBLIC_ONLY,
+  evidence: MechanismEvidence = NO_EVIDENCE,
+): StageRow | undefined {
+  const fireable = table.rows.filter((row) =>
+    isFireable(mechanismFor(row.kind, evidence), ctx),
+  );
+
+  const byPriority = (a: StageRow, b: StageRow): number =>
+    STAGE_ORDER.indexOf(a.kind) - STAGE_ORDER.indexOf(b.kind);
+
+  const live = fireable.filter((r) => r.status === "live").sort(byPriority);
+  if (live[0]) return live[0];
+
+  return fireable
     .filter((r) => r.startMs > nowMs)
-    .sort((a, b) => a.startMs - b.startMs)[0];
+    .sort((a, b) => a.startMs - b.startMs || byPriority(a, b))[0];
 }

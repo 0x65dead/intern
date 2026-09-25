@@ -152,7 +152,7 @@ export async function runAllowlistMint(
     // Everything that can be done before the signature request is done now, so
     // the API round trip is the only thing left inside the race.
     const [, clockSync] = await Promise.all([
-      warmConnections(blastUrls),
+      warmConnections(blastUrls, opts.signal ? { signal: opts.signal } : {}),
       syncClock(readUrls, chain.blockTimeSec, { rounds: 2 }),
     ]);
     emit({ type: "clock", sync: clockSync });
@@ -240,9 +240,15 @@ export async function runAllowlistMint(
           const receipt = await waitForReceipt(txHash, readUrls, {
             timeoutMs: opts.receiptTimeoutMs ?? 90_000,
             pollMs: Math.max(200, (chain.blockTimeSec * 1000) / 4),
+            ...(opts.signal ? { signal: opts.signal } : {}),
           });
           if (!receipt) {
-            emit({ type: "receiptTimeout", index: wallet.index, txHash });
+            emit({
+              type: "receiptTimeout",
+              index: wallet.index,
+              txHash,
+              ...(opts.signal?.aborted === true ? { cancelled: true } : {}),
+            });
             return;
           }
           if (receipt.success) minted++;
@@ -280,5 +286,15 @@ export async function withNonces(
   wallets: LoadedWallet[],
 ): Promise<NoncedWallet[]> {
   const nonces = await fetchNonces(provider, wallets);
-  return wallets.map((wallet, i) => ({ ...wallet, nonce: nonces[i] ?? 0 }));
+  return wallets.map((wallet, i) => {
+    // Never default. A missing nonce defaulting to 0 does not fail — it signs a
+    // transaction with a nonce the wallet used long ago, which the network
+    // discards silently, so the mint is lost and the output says nothing went
+    // wrong. The engine throws on this exact condition; both paths must agree.
+    const nonce = nonces[i];
+    if (nonce === undefined) {
+      throw new Error(`Missing nonce for wallet ${wallet.index} (${wallet.address}).`);
+    }
+    return { ...wallet, nonce };
+  });
 }

@@ -12,6 +12,8 @@
 
 import { keccak256 } from "ethers";
 
+import { markPublicHash } from "./wallets";
+
 export interface Endpoint {
   url: string;
   label: string;
@@ -42,8 +44,12 @@ export interface PreparedTx {
  * well before T-0.
  */
 export function prepare(rawTx: string): PreparedTx {
+  // Derived from a transaction this process signed, so it is ours and public.
+  // Saying so here is what keeps it out of the key redactor, which cannot tell a
+  // hash from a key by shape and hides both otherwise.
+  const txHash = markPublicHash(keccak256(rawTx));
   return {
-    txHash: keccak256(rawTx),
+    txHash,
     body: JSON.stringify({
       jsonrpc: "2.0",
       method: "eth_sendRawTransaction",
@@ -185,10 +191,11 @@ export interface Receipt {
 export async function waitForReceipt(
   txHash: string,
   readUrls: string[],
-  opts: { timeoutMs?: number; pollMs?: number } = {},
+  opts: { timeoutMs?: number; pollMs?: number; signal?: AbortSignal } = {},
 ): Promise<Receipt | null> {
   const timeoutMs = opts.timeoutMs ?? 90_000;
   const pollMs = opts.pollMs ?? 400;
+  const signal = opts.signal;
   const deadline = Date.now() + timeoutMs;
   const urls = readUrls.length > 0 ? readUrls : [];
   if (urls.length === 0) return null;
@@ -200,7 +207,11 @@ export async function waitForReceipt(
     id: 1,
   });
 
-  while (Date.now() < deadline) {
+  // Cancelling stops the watching, not the transaction: these hashes are already
+  // in the mempool and are already journalled. Without this the operator's
+  // /cancel is acknowledged and then ignored for up to ninety seconds, which
+  // reads as a dead bot at the worst possible moment.
+  while (Date.now() < deadline && signal?.aborted !== true) {
     const replies = await Promise.allSettled(
       urls.map(async (url) => {
         const controller = new AbortController();
@@ -210,10 +221,14 @@ export async function waitForReceipt(
             method: "POST",
             headers: { "content-type": "application/json" },
             body,
-            signal: controller.signal,
+            signal:
+              signal === undefined
+                ? controller.signal
+                : AbortSignal.any([controller.signal, signal]),
           });
           const json = (await res.json()) as {
             result?: {
+              transactionHash?: string;
               blockNumber: string;
               transactionIndex: string;
               gasUsed: string;
@@ -231,17 +246,44 @@ export async function waitForReceipt(
     for (const reply of replies) {
       if (reply.status !== "fulfilled" || !reply.value) continue;
       const r = reply.value;
+
+      // First reply wins, so that reply must be about the transaction we asked
+      // about. Without this check a single endpoint — buggy, stale behind a
+      // reorg, or hostile — can hand back someone else's receipt and decide the
+      // strongest word this tool prints. "minted" means status 1 on *this* hash.
+      if (typeof r.transactionHash === "string" && r.transactionHash.toLowerCase() !== txHash.toLowerCase()) {
+        continue;
+      }
+
+      const block = parseInt(r.blockNumber, 16);
+      const position = parseInt(r.transactionIndex, 16);
+      if (!Number.isFinite(block) || !Number.isFinite(position)) continue;
+
       return {
-        block: parseInt(r.blockNumber, 16),
-        position: parseInt(r.transactionIndex, 16),
+        block,
+        position,
         gasUsed: BigInt(r.gasUsed),
         effectiveGasPrice: r.effectiveGasPrice ? BigInt(r.effectiveGasPrice) : null,
         success: r.status === "0x1",
       };
     }
-    await new Promise((resolve) => setTimeout(resolve, pollMs));
+    await sleepUnlessAborted(pollMs, signal);
   }
   return null;
+}
+
+/** Waits out the poll gap, but returns at once if the run is cancelled. */
+function sleepUnlessAborted(ms: number, signal: AbortSignal | undefined): Promise<void> {
+  if (signal?.aborted === true) return Promise.resolve();
+  return new Promise((resolve) => {
+    const timer = setTimeout(done, ms);
+    function done(): void {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", done);
+      resolve();
+    }
+    signal?.addEventListener("abort", done, { once: true });
+  });
 }
 
 /**
@@ -253,13 +295,25 @@ export async function waitForReceipt(
  * response. Undici keeps the socket pooled afterwards, which is what saves the
  * ~100-300ms TLS round trip at fire time.
  */
-export async function warmConnections(urls: string[]): Promise<void> {
+export const WARM_TIMEOUT_MS = 3_000;
+
+export async function warmConnections(
+  urls: string[],
+  opts: { timeoutMs?: number; signal?: AbortSignal } = {},
+): Promise<void> {
   const body = JSON.stringify({
     jsonrpc: "2.0",
     method: "eth_sendRawTransaction",
     params: ["0x00"],
     id: 1,
   });
+  // Bounded, because this is an optimisation and an optimisation must never be
+  // able to block the thing it optimises. An unbounded fetch inherits undici's
+  // ~300s header timeout, so a single endpoint that accepts the connection and
+  // then says nothing holds up the whole prepare phase — and the mint does not
+  // fire at all, to save a 200ms handshake. Past a few seconds the warm has lost
+  // its purpose anyway; every failure mode here is already swallowed.
+  const timeoutMs = opts.timeoutMs ?? WARM_TIMEOUT_MS;
   await Promise.allSettled(
     urls.map((url) =>
       fetch(url, {
@@ -267,6 +321,9 @@ export async function warmConnections(urls: string[]): Promise<void> {
         headers: { "content-type": "application/json" },
         body,
         keepalive: true,
+        signal: opts.signal
+          ? AbortSignal.any([AbortSignal.timeout(timeoutMs), opts.signal])
+          : AbortSignal.timeout(timeoutMs),
       })
         .then((res) => res.text())
         .catch(() => undefined),

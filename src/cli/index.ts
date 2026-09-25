@@ -14,7 +14,8 @@ import { CHAINS, explorerAddress, resolveChain } from "../core/chains";
 import { syncClock } from "../core/clock";
 import { planRpcs, resolveRpcsForChain, maskRpc, toRpcUrl } from "../core/rpc";
 import { planWarnings } from "../core/seadrop";
-import { runMint, resolveFireTime } from "../core/engine";
+import { EngineEvent, runMint, resolveFireTime } from "../core/engine";
+import { DryRunReport, dryRunVerdict } from "../core/dryrun";
 import { runAllowlistMint, withNonces } from "../core/allowlist";
 import {
   AmbiguousChainError,
@@ -23,7 +24,9 @@ import {
   closeRun,
   noDropMessage,
   prepareRun,
+  stageContext,
 } from "../core/prepare";
+import { StageContext } from "../core/stagetable";
 import { orderCandidates } from "../core/detect";
 import { shortAddress } from "../core/target";
 import { waitForPublicStage, waitForScheduledStage } from "../core/watcher";
@@ -48,6 +51,7 @@ import {
   confirmFire,
 } from "./wizard";
 
+import { writeOut, writeErr } from "../util/out";
 const VERSION = "1.0.0";
 
 /** Ctrl+C must never leave a run half-fired without saying so. */
@@ -57,7 +61,7 @@ function installSignalHandlers(controller: AbortController): void {
     if (interrupted) process.exit(130); // second Ctrl+C: leave immediately
     interrupted = true;
     controller.abort();
-    process.stdout.write(
+    writeOut(
       c.yellow("\n  Interrupted. Nothing further will be sent; in-flight transactions continue.\n"),
     );
   };
@@ -71,19 +75,19 @@ async function main(): Promise<void> {
     args = parseArgs(process.argv.slice(2));
   } catch (err: unknown) {
     if (err instanceof ArgError) {
-      process.stderr.write(`${c.red("✗")} ${err.message}\n`);
+      writeErr(`${c.red("✗")} ${err.message}\n`);
       process.exit(2);
     }
     throw err;
   }
 
   if (args.version) {
-    process.stdout.write(`intern ${VERSION}\n`);
+    writeOut(`intern ${VERSION}\n`);
     return;
   }
   if (args.help || args.command === "help" || args.command === null) {
-    if (!args.json) process.stdout.write(`${banner()}\n`);
-    process.stdout.write(HELP);
+    if (!args.json) writeOut(`${banner()}\n`);
+    writeOut(HELP);
     return;
   }
 
@@ -110,7 +114,7 @@ async function main(): Promise<void> {
     case "bot":
       return cmdBot();
     default:
-      process.stderr.write(`${c.red("✗")} Unknown command "${args.command}".\n`);
+      writeErr(`${c.red("✗")} Unknown command "${args.command}".\n`);
       process.exit(2);
   }
 }
@@ -127,6 +131,23 @@ async function main(): Promise<void> {
  * uses; a clear error naming the candidates and `--chain` when input is scripted,
  * because a pipe cannot choose and picking for it could mint on the wrong network.
  */
+/**
+ * The stage table's context, built the same way for every command.
+ *
+ * One function so `intern check` and `intern mint` cannot disagree about whether
+ * a stage is fireable — a check that says "yes" followed by a mint that refuses
+ * is the worst of both.
+ */
+function stageCtx(
+  run: PreparedRun,
+  defaults: ReturnType<typeof readDefaults>,
+): StageContext {
+  return stageContext(run, {
+    allowlistMinting: defaults.allowlistMinting,
+    openseaApiKey: defaults.openseaApiKey !== null,
+  });
+}
+
 async function prepareResolvingChain(opts: PrepareOptions): Promise<PreparedRun> {
   try {
     return await prepareRun(opts);
@@ -142,7 +163,7 @@ async function prepareResolvingChain(opts: PrepareOptions): Promise<PreparedRun>
       );
     }
 
-    process.stdout.write(
+    writeOut(
       warn(`${err.address} has contract code on ${candidates.length} chains — same address, different deployments.\n`),
     );
     const chainKey = await askChoice(
@@ -164,14 +185,14 @@ async function prepareResolvingChain(opts: PrepareOptions): Promise<PreparedRun>
 function cmdInit(): void {
   const result = writeEnvTemplate();
   if (!result.created) {
-    process.stdout.write(warn(`${result.path} already exists — left untouched.\n`));
+    writeOut(warn(`${result.path} already exists — left untouched.\n`));
     return;
   }
-  process.stdout.write(ok(`Wrote ${result.path} (mode 0600).\n`));
-  process.stdout.write(
+  writeOut(ok(`Wrote ${result.path} (mode 0600).\n`));
+  writeOut(
     info("Fill in a private RPC first — it is the single biggest speed factor.\n"),
   );
-  process.stdout.write(info("Add .env to .gitignore before committing anything.\n"));
+  writeOut(info("Add .env to .gitignore before committing anything.\n"));
 }
 
 // ── rpc ──────────────────────────────────────────────────────────────────────
@@ -183,14 +204,14 @@ async function cmdRpc(args: CliArgs, defaultChain: string): Promise<void> {
     .filter((url): url is string => url !== null);
   const resolved = resolveRpcsForChain(chain.key, manual);
 
-  process.stdout.write(heading(`Endpoints for ${chain.name}`) + "\n");
-  process.stdout.write(info(`${resolved.source}\n`));
-  process.stdout.write(info(`sampling each endpoint 5× and taking the median…\n`));
+  writeOut(heading(`Endpoints for ${chain.name}`) + "\n");
+  writeOut(info(`${resolved.source}\n`));
+  writeOut(info(`sampling each endpoint 5× and taking the median…\n`));
 
   const plan = await planRpcs(resolved.urls, chain.chainId, { samples: 5 });
 
   if (args.json) {
-    process.stdout.write(
+    writeOut(
       `${JSON.stringify(
         {
           chain: chain.key,
@@ -215,7 +236,7 @@ async function cmdRpc(args: CliArgs, defaultChain: string): Promise<void> {
 
   printRpcPlan(plan, chain);
   if (plan.read.length > 0) {
-    process.stdout.write(
+    writeOut(
       info(`fastest read endpoint: ${maskRpc(plan.read[0]!)} — reads will go here\n`),
     );
   }
@@ -227,12 +248,12 @@ async function cmdClock(args: CliArgs, defaultChain: string): Promise<void> {
   const chain = requireChain(args.chain ?? defaultChain);
   const resolved = resolveRpcsForChain(chain.key);
 
-  process.stdout.write(heading(`Clock check against ${chain.name}`) + "\n");
-  process.stdout.write(info("sampling HTTP Date headers and the chain head…\n"));
+  writeOut(heading(`Clock check against ${chain.name}`) + "\n");
+  writeOut(info("sampling HTTP Date headers and the chain head…\n"));
 
   const sync = await syncClock(resolved.urls, chain.blockTimeSec, { rounds: 4 });
   if (!sync.synced) {
-    process.stdout.write(warn("No endpoint answered — cannot measure the clock.\n"));
+    writeOut(warn("No endpoint answered — cannot measure the clock.\n"));
     process.exitCode = 1;
     return;
   }
@@ -246,13 +267,13 @@ async function cmdClock(args: CliArgs, defaultChain: string): Promise<void> {
       `${s.offsetMs >= 0 ? "+" : ""}${Math.round(s.offsetMs)}ms`,
       c.gray(`rtt ${s.rttMs}ms`),
     ]);
-  process.stdout.write(`${table(rows)}\n\n`);
+  writeOut(`${table(rows)}\n\n`);
 
   const sign = sync.offsetMs >= 0 ? "+" : "";
-  process.stdout.write(
+  writeOut(
     field("offset", `${sign}${sync.offsetMs}ms ${c.gray(`(±${sync.uncertaintyMs}ms)`)}`) + "\n",
   );
-  process.stdout.write(
+  writeOut(
     field(
       "meaning",
       Math.abs(sync.offsetMs) < 50
@@ -262,9 +283,9 @@ async function cmdClock(args: CliArgs, defaultChain: string): Promise<void> {
           : `local clock is ${-sync.offsetMs}ms FAST — uncorrected, mints would fire early and revert`,
     ) + "\n",
   );
-  process.stdout.write(ok("intern corrects for this automatically on every run.\n"));
+  writeOut(ok("intern corrects for this automatically on every run.\n"));
   if (Math.abs(sync.offsetMs) > 500) {
-    process.stdout.write(warn("Over 500ms out. Enable NTP: `timedatectl set-ntp true`.\n"));
+    writeOut(warn("Over 500ms out. Enable NTP: `timedatectl set-ntp true`.\n"));
   }
 }
 
@@ -274,46 +295,53 @@ async function cmdCheck(args: CliArgs, defaults: ReturnType<typeof readDefaults>
   const target = requireTarget(args);
   const quantity = args.quantity ?? defaults.quantity;
 
+  // Loaded before the prepare rather than at the balance check below, because the
+  // stage table needs to know whether a configured SeaDrop signer is one of ours
+  // — that is the difference between "must ask OpenSea" and "can sign it here".
+  const wallets = walletsFromEnv();
+
   const run = await prepareResolvingChain({
     target,
     chainKey: args.chain,
     quantity,
+    walletAddresses: wallets.map((w) => w.address),
+    allowlistSource: defaults.allowlistSource,
     manualRpcs: args.rpc ?? [],
     apiKey: defaults.openseaApiKey,
     maxFeeGwei: args.maxFeeGwei ?? defaults.maxFeeGwei,
     priorityGwei: args.priorityGwei ?? defaults.priorityGwei,
     gasLimit: args.gasLimit ?? defaults.gasLimit,
     defaultChain: defaults.chain,
-    onProgress: (message) => process.stdout.write(info(`${message}\n`)),
+    onProgress: (message) => writeOut(info(`${message}\n`)),
   });
 
   try {
-    for (const message of run.warnings) process.stdout.write(warn(`${message}\n`));
+    for (const message of run.warnings) writeOut(warn(`${message}\n`));
     printRpcPlan(run.rpc.plan, run.chain);
 
-    process.stdout.write(heading("Collection") + "\n");
-    if (run.collection) process.stdout.write(field("name", run.collection.name) + "\n");
-    process.stdout.write(field("contract", run.contract) + "\n");
-    process.stdout.write(field("explorer", explorerAddress(run.chain.chainId, run.contract)) + "\n");
+    writeOut(heading("Collection") + "\n");
+    if (run.collection) writeOut(field("name", run.collection.name) + "\n");
+    writeOut(field("contract", run.contract) + "\n");
+    writeOut(field("explorer", explorerAddress(run.chain.chainId, run.contract)) + "\n");
     if (run.detection) {
-      process.stdout.write(info(`chain determined by probing for contract code\n`));
+      writeOut(info(`chain determined by probing for contract code\n`));
     }
 
     // Every stage — on-chain public plus whatever OpenSea lists — in the same
     // seven columns the bot's 📊 Stages panel shows. Printed whether or not a
     // public drop exists, because "the public stage is not configured but an
     // allowlist opens in 2h" is exactly what the user needs to see.
-    printStages(run.stages, run.chain, Date.now());
+    printStages(run.stages, run.chain, Date.now(), stageCtx(run, defaults));
 
     if (!run.plan) {
-      process.stdout.write(`\n${warn(noDropMessage(run.contract, run.chain.name, defaults.openseaApiKey !== null))}\n`);
+      writeOut(`\n${warn(noDropMessage(run.contract, run.chain.name, defaults.openseaApiKey !== null))}\n`);
       process.exitCode = 1;
       return;
     }
 
     printPlan(run.plan, run.chain, quantity);
     for (const message of planWarnings(run.plan, Date.now())) {
-      process.stdout.write(warn(`${message}\n`));
+      writeOut(warn(`${message}\n`));
     }
     printGasSummary(
       run.gas.maxFeePerGas,
@@ -324,31 +352,30 @@ async function cmdCheck(args: CliArgs, defaults: ReturnType<typeof readDefaults>
 
     // Wallet eligibility, when there are wallets to check. `check` never signs, so
     // this is purely a read of what would happen.
-    const wallets = walletsFromEnv();
     if (wallets.length === 0) {
-      process.stdout.write(info("\nNo wallets in .env — skipping the balance check.\n"));
+      writeOut(info("\nNo wallets in .env — skipping the balance check.\n"));
     } else {
       const required = requiredBalance(run.plan.value, run.gas);
       const reports = await checkBalances(run.rpc.provider, wallets, required);
-      process.stdout.write(heading("Wallets") + "\n");
+      writeOut(heading("Wallets") + "\n");
       for (const report of reports) {
         const balance =
           report.balance === null ? c.gray("unreadable") : formatEth(report.balance, run.chain.nativeSymbol);
         const line = `[W${report.index}] ${report.address}  ${balance}`;
         if (report.balance !== null && report.balance < required) {
-          process.stdout.write(
+          writeOut(
             `  ${c.red("✗")} ${line}  ${c.red(`short ${formatEth(report.shortfall, run.chain.nativeSymbol)}`)}\n`,
           );
         } else {
-          process.stdout.write(ok(`${line}\n`));
+          writeOut(ok(`${line}\n`));
         }
       }
-      process.stdout.write(
+      writeOut(
         info(`each wallet needs ${formatEth(required, run.chain.nativeSymbol)} (value + gasLimit × maxFeePerGas)\n`),
       );
     }
 
-    process.stdout.write(
+    writeOut(
       `\n${ok(`Nothing was sent. To mint: ${c.bold(`intern mint ${target}${args.chain ? ` --chain ${args.chain}` : ""}`)}\n`)}`,
     );
   } finally {
@@ -374,25 +401,27 @@ async function cmdWatch(
     apiKey: defaults.openseaApiKey,
     gasLimit: args.gasLimit ?? defaults.gasLimit,
     defaultChain: defaults.chain,
-    onProgress: (message) => process.stdout.write(info(`${message}\n`)),
+    onProgress: (message) => writeOut(info(`${message}\n`)),
   });
 
   try {
-    process.stdout.write(heading(`Watching ${run.contract} on ${run.chain.name}`) + "\n");
-    process.stdout.write(info("Reads only — nothing will be sent. Ctrl+C to stop.\n"));
-    printStages(run.stages, run.chain, Date.now());
+    writeOut(heading(`Watching ${run.contract} on ${run.chain.name}`) + "\n");
+    writeOut(info("Reads only — nothing will be sent. Ctrl+C to stop.\n"));
+    // No wallets were loaded for a watch, so nothing can claim a local signer.
+    // The table says "no" for every gated row, which is the truth here.
+    printStages(run.stages, run.chain, Date.now(), stageCtx(run, defaults));
 
     const plan = await waitForPublicStage(run.rpc.provider, run.contract, quantity, {
       signal,
       onUpdate: (update) => {
         const stamp = c.gray(new Date().toLocaleTimeString());
         const mark = update.kind === "opened" ? c.green("✓") : update.kind === "rescheduled" ? c.yellow("⚠") : c.gray("·");
-        process.stdout.write(`  ${mark} ${stamp} ${update.message}\n`);
+        writeOut(`  ${mark} ${stamp} ${update.message}\n`);
       },
     });
 
     printPlan(plan, run.chain, quantity);
-    process.stdout.write(
+    writeOut(
       `\n${ok(`Stage is configured. To mint it: ${c.bold(`intern mint ${target} --chain ${run.chain.key}`)}\n`)}`,
     );
   } finally {
@@ -407,7 +436,15 @@ async function cmdMint(
   defaults: ReturnType<typeof readDefaults>,
   signal: AbortSignal,
 ): Promise<void> {
-  process.stdout.write(`${banner()}\n`);
+  writeOut(`${banner()}\n`);
+
+  // A dry run is a dry run whether it came from the verb, the flag, or .env.
+  const dryRun = args.dryRun || defaults.dryRun;
+  if (dryRun) {
+    writeOut(
+      info("DRY RUN — every check and every signature will run; nothing will be broadcast.\n"),
+    );
+  }
 
   // Interactive when anything essential is missing; scripted when it is all given.
   const envWallets = walletsFromEnv();
@@ -433,34 +470,36 @@ async function cmdMint(
     target: config.target,
     chainKey: config.chainKey,
     quantity: config.quantity,
+    walletAddresses: envWallets.map((w) => w.address),
+    allowlistSource: defaults.allowlistSource,
     manualRpcs: config.manualRpcs,
     apiKey: defaults.openseaApiKey,
     maxFeeGwei: args.maxFeeGwei ?? defaults.maxFeeGwei,
     priorityGwei: args.priorityGwei ?? defaults.priorityGwei,
     gasLimit: args.gasLimit ?? defaults.gasLimit,
     defaultChain: defaults.chain,
-    onProgress: (message) => process.stdout.write(info(`${message}\n`)),
+    onProgress: (message) => writeOut(info(`${message}\n`)),
   });
 
   try {
-    for (const message of run.warnings) process.stdout.write(warn(`${message}\n`));
+    for (const message of run.warnings) writeOut(warn(`${message}\n`));
     printRpcPlan(run.rpc.plan, run.chain);
-    printStages(run.stages, run.chain, Date.now());
+    printStages(run.stages, run.chain, Date.now(), stageCtx(run, defaults));
 
     // No drop configured. --watch waits for one; otherwise this is a dead end and
     // saying so precisely beats "not a SeaDrop collection".
     let plan = run.plan;
     if (!plan) {
       if (!args.watch) {
-        process.stdout.write(`\n${warn(noDropMessage(run.contract, run.chain.name, defaults.openseaApiKey !== null))}\n`);
-        process.stdout.write(info("Add --watch to wait for the stage to be configured.\n"));
+        writeOut(`\n${warn(noDropMessage(run.contract, run.chain.name, defaults.openseaApiKey !== null))}\n`);
+        writeOut(info("Add --watch to wait for the stage to be configured.\n"));
         process.exitCode = 1;
         return;
       }
-      process.stdout.write(heading("Waiting for the stage to be configured") + "\n");
+      writeOut(heading("Waiting for the stage to be configured") + "\n");
       plan = await waitForPublicStage(run.rpc.provider, run.contract, config.quantity, {
         signal,
-        onUpdate: (update) => process.stdout.write(info(`${update.message}\n`)),
+        onUpdate: (update) => writeOut(info(`${update.message}\n`)),
       });
       run.plan = plan;
     }
@@ -489,10 +528,10 @@ async function cmdMint(
     };
     printGasSummary(gas.maxFeePerGas, gas.maxPriorityFeePerGas, gas.gasLimit, run.fees.baseFeeWei);
 
-    if (!args.yes) {
+    if (!args.yes && !dryRun) {
       const confirmed = await confirmFire(run, execution, config.wallets, run.chain);
       if (!confirmed) {
-        process.stdout.write(ok("Cancelled. Nothing was sent.\n"));
+        writeOut(ok("Cancelled. Nothing was sent.\n"));
         return;
       }
     }
@@ -510,10 +549,15 @@ async function cmdMint(
       execution.leadMs,
     );
 
-    const report = createReporter({
+    const render = createReporter({
       chain: run.chain,
       addresses: config.wallets.map((w) => w.address),
     });
+    const captured: { report: DryRunReport | null } = { report: null };
+    const report = (event: EngineEvent): void => {
+      if (event.type === "dryRun") captured.report = event.report;
+      render(event);
+    };
 
     const result = await runMint(
       {
@@ -528,10 +572,25 @@ async function cmdMint(
         skipSimulation: args.skipSimulation,
         requireSimulation: args.requireSimulation,
         receiptTimeoutMs: defaults.receiptTimeoutMs,
+        dryRun,
+        // Advisory unless the operator configured a limit: they can read the
+        // measured offset and decide. The bot, with nobody watching, enforces one.
+        ...(defaults.clockDriftLimitMs !== null
+          ? { driftLimitMs: defaults.clockDriftLimitMs }
+          : {}),
+        target: config.target,
         signal,
       },
       report,
     );
+
+    if (dryRun) {
+      // Exit 1 when a live run would have refused, so `intern dryrun … && intern
+      // mint …` is a safe thing to write in a shell.
+      const verdict = captured.report ? dryRunVerdict(captured.report) : null;
+      if (!verdict?.wouldFire) process.exitCode = 1;
+      return;
+    }
 
     printRunSummary(result);
     if (result.minted === 0) process.exitCode = 1;
@@ -547,20 +606,20 @@ async function cmdAllowlist(
   defaults: ReturnType<typeof readDefaults>,
   signal: AbortSignal,
 ): Promise<void> {
-  process.stdout.write(`${banner()}\n`);
+  writeOut(`${banner()}\n`);
 
   if (!defaults.openseaApiKey) {
-    process.stderr.write(
+    writeErr(
       `${c.red("✗")} An allowlist mint needs OPENSEA_API_KEY: the signature is issued by OpenSea and cannot be produced locally.\n`,
     );
-    process.stderr.write(`  ${c.gray("Public stages need no key — use `intern mint`.")}\n`);
+    writeErr(`  ${c.gray("Public stages need no key — use `intern mint`.")}\n`);
     process.exit(2);
   }
   const apiKey = defaults.openseaApiKey;
 
   const wallets = walletsFromEnv();
   if (wallets.length === 0) {
-    process.stderr.write(`${c.red("✗")} No wallets in .env. Set PRIVATE_KEY or PRIVATE_KEYS.\n`);
+    writeErr(`${c.red("✗")} No wallets in .env. Set PRIVATE_KEY or PRIVATE_KEYS.\n`);
     process.exit(2);
   }
 
@@ -577,7 +636,7 @@ async function cmdAllowlist(
     priorityGwei: args.priorityGwei ?? defaults.priorityGwei,
     gasLimit: args.gasLimit ?? defaults.gasLimit,
     defaultChain: defaults.chain,
-    onProgress: (message) => process.stdout.write(info(`${message}\n`)),
+    onProgress: (message) => writeOut(info(`${message}\n`)),
   });
 
   try {
@@ -588,7 +647,7 @@ async function cmdAllowlist(
       );
     }
 
-    for (const message of run.warnings) process.stdout.write(warn(`${message}\n`));
+    for (const message of run.warnings) writeOut(warn(`${message}\n`));
     printRpcPlan(run.rpc.plan, run.chain);
     printGasSummary(
       run.gas.maxFeePerGas,
@@ -604,19 +663,19 @@ async function cmdAllowlist(
     if (!open) {
       const upcoming = nextStage(schedule, now);
       if (!upcoming) throw new Error("No stage is open and none is scheduled. Nothing was sent.");
-      process.stdout.write(
+      writeOut(
         heading(`Waiting for "${upcoming.label}" — opens in ${formatRemaining(upcoming.startMs - now)}`) + "\n",
       );
-      process.stdout.write(info(`${formatUtc(upcoming.startMs)} UTC\n`));
+      writeOut(info(`${formatUtc(upcoming.startMs)} UTC\n`));
       await waitForScheduledStage(slug, apiKey, {
         signal,
-        onUpdate: (update) => process.stdout.write(info(`${update.message}\n`)),
+        onUpdate: (update) => writeOut(info(`${update.message}\n`)),
       });
     } else {
-      process.stdout.write(ok(`"${open.label}" is open now.\n`));
+      writeOut(ok(`"${open.label}" is open now.\n`));
     }
 
-    process.stdout.write(
+    writeOut(
       info("Requesting signatures. OpenSea will not issue one before the stage opens, so this round trip is inside the race.\n"),
     );
 
@@ -667,26 +726,26 @@ function printRunSummary(result: {
   timingErrorMs: number;
   clock: { offsetMs: number; synced: boolean };
 }): void {
-  process.stdout.write(heading("Summary") + "\n");
-  process.stdout.write(field("dispatch", `${result.dispatchMs.toFixed(2)}ms to write every transaction`) + "\n");
+  writeOut(heading("Summary") + "\n");
+  writeOut(field("dispatch", `${result.dispatchMs.toFixed(2)}ms to write every transaction`) + "\n");
   if (result.timingErrorMs !== 0) {
-    process.stdout.write(
+    writeOut(
       field("timing", `${result.timingErrorMs > 0 ? "+" : ""}${result.timingErrorMs.toFixed(0)}ms from the target instant`) + "\n",
     );
   }
   if (result.clock.synced && Math.abs(result.clock.offsetMs) >= 50) {
-    process.stdout.write(
+    writeOut(
       field("clock", `corrected for a ${result.clock.offsetMs}ms local error`) + "\n",
     );
   }
-  process.stdout.write(field("minted", String(result.minted)) + "\n");
-  if (result.failed > 0) process.stdout.write(field("failed", String(result.failed)) + "\n");
+  writeOut(field("minted", String(result.minted)) + "\n");
+  if (result.failed > 0) writeOut(field("failed", String(result.failed)) + "\n");
 }
 
 function requireChain(key: string) {
   const chain = resolveChain(key);
   if (!chain) {
-    process.stderr.write(
+    writeErr(
       `${c.red("✗")} Unknown chain "${key}". Supported: ${CHAINS.map((entry) => entry.key).join(", ")}.\n`,
     );
     process.exit(2);
@@ -696,7 +755,7 @@ function requireChain(key: string) {
 
 function requireTarget(args: CliArgs): string {
   if (args.target && args.target.trim()) return args.target.trim();
-  process.stderr.write(
+  writeErr(
     `${c.red("✗")} No target given. Pass an OpenSea link, a collection slug, or a contract address.\n`,
   );
   process.exit(2);
@@ -706,9 +765,9 @@ main().catch((err: unknown) => {
   const message = err instanceof Error ? err.message : String(err);
   // redactKeys guards the one path where a key could reach a terminal: ethers
   // embeds the offending value in some of its own error messages.
-  process.stderr.write(`\n${c.red("✗")} ${redactKeys(message)}\n`);
+  writeErr(`\n${c.red("✗")} ${redactKeys(message)}\n`);
   if (process.env.INTERN_DEBUG && err instanceof Error && err.stack) {
-    process.stderr.write(c.gray(`${redactKeys(err.stack)}\n`));
+    writeErr(c.gray(`${redactKeys(err.stack)}\n`));
   }
   process.exit(1);
 });

@@ -21,13 +21,25 @@ export interface CliArgs {
   watch: boolean;
   skipSimulation: boolean;
   requireSimulation: boolean;
+  /** Do every check and sign every transaction, then stop without broadcasting. */
+  dryRun: boolean;
   json: boolean;
   help: boolean;
   version: boolean;
 }
 
-const KNOWN_COMMANDS = new Set([
+/**
+ * Every verb the CLI answers to.
+ *
+ * Exported so the docs can be checked against it: a command that exists but is
+ * documented nowhere is the same silent omission as a stage that cannot fire and
+ * is left out of the table. `dryrun` is the one that matters most — it is the
+ * only way to rehearse a mint without spending, and an operator who never learns
+ * it exists rehearses by minting.
+ */
+export const KNOWN_COMMANDS = new Set([
   "mint",
+  "dryrun",
   "allowlist",
   "check",
   "watch",
@@ -62,6 +74,7 @@ export function parseArgs(argv: string[]): CliArgs {
     watch: false,
     skipSimulation: false,
     requireSimulation: false,
+    dryRun: false,
     json: false,
     help: false,
     version: false,
@@ -188,6 +201,10 @@ export function parseArgs(argv: string[]): CliArgs {
       case "require-simulation":
         args.requireSimulation = true;
         break;
+      case "dry-run":
+      case "dryrun":
+        args.dryRun = true;
+        break;
       case "json":
         args.json = true;
         break;
@@ -214,6 +231,13 @@ export function parseArgs(argv: string[]): CliArgs {
     }
   }
 
+  if (args.command === "dryrun") {
+    // The verb and the flag are the same request, and collapsing them here means
+    // the mint path has exactly one notion of "do not broadcast".
+    args.command = "mint";
+    args.dryRun = true;
+  }
+
   if (args.now && args.at !== undefined) {
     throw new ArgError("--now and --at are mutually exclusive.");
   }
@@ -231,6 +255,7 @@ USAGE
 
 COMMANDS
   mint <target>       Snipe a public SeaDrop mint. Default when a target is given.
+  dryrun <target>     Every check, every signature, no broadcast. Spends nothing.
   allowlist <target>  Mint an allowlist / WL FCFS stage (needs OPENSEA_API_KEY).
   check <target>      Report drop state and wallet eligibility. Sends nothing.
   watch <target>      Wait for a stage to be configured, then report. Sends nothing.
@@ -255,8 +280,9 @@ OPTIONS
       --now                Fire as soon as everything is prepared.
       --lead-ms <n>        Fire n ms before the stage opens  (default: 0)
       --watch              Wait for the drop to be configured, then mint.
-      --require-simulation Abort if any wallet's dry run reverts.
-      --skip-simulation    Skip the dry run. Faster setup, no revert protection.
+      --require-simulation Abort if any wallet's simulation reverts.
+      --skip-simulation    Skip the eth_call check. Faster setup, no revert protection.
+      --dry-run            Prepare and sign, then stop. Same as the dryrun command.
   -y, --yes                Skip the confirmation prompt.
       --json               Machine-readable output where supported.
   -h, --help               This text.
@@ -265,6 +291,7 @@ OPTIONS
 EXAMPLES
   intern init
   intern check https://opensea.io/collection/tadaaaaaa
+  intern dryrun tadaaaaaa --chain robinhood --quantity 2
   intern mint tadaaaaaa --chain robinhood --quantity 2
   intern mint 0xabc…def --chain base --at 21:00 --max-fee 0.05 -y
   intern rpc --chain base
@@ -277,4 +304,10 @@ NOTES
 
   Transactions are signed before the stage opens; at T-0 the only work left is
   writing bytes to already-open sockets.
+
+  \`dryrun\` runs the same preflight as \`mint\` — balances, per-wallet cap,
+  simulation, clock drift, nonces, signing — and stops at the broadcast. It does
+  not wait for T-0; it reports when T-0 is. A clean dry run does not promise the
+  mint will succeed: before a stage opens every simulation reverts with NotActive,
+  eligible or not.
 `;

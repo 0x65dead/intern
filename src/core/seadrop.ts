@@ -20,7 +20,27 @@
 // requires OpenSea and has no local equivalent. It lives in allowlist.ts.
 
 import { BigNumberish, Contract, Interface, JsonRpcProvider, getAddress } from "ethers";
+import { MINT_PARAMS_TUPLE, MintParams } from "./merkle";
 
+/**
+ * Call a contract method by name, failing loudly when the ABI lacks it.
+ *
+ * Two casts, both deliberate, because SeaDrop is read through four ABIs that do
+ * not all carry the same methods and the shape is only known at runtime:
+ *
+ *   `Contract` exposes its methods through a runtime proxy, so there is no static
+ *   member to index. The `as unknown as Record<string, unknown>` reaches that
+ *   proxy; the `typeof fn !== "function"` check immediately after is what makes it
+ *   safe, and it is the reason a v2-only method called on a v1 contract surfaces
+ *   as `ABI missing getPublicDrop` rather than `fn is not a function`.
+ *
+ *   `T` is the caller's claim about the decoded return, not a checked fact —
+ *   ethers decodes against the ABI, so the runtime shape follows the ABI the
+ *   `Contract` was built with, and `T` must be kept in step with it by hand.
+ *   Every call site here passes a type matching the ABI fragment directly above
+ *   it, and every value read out is range-checked or coerced by its caller rather
+ *   than trusted.
+ */
 async function callFn<T>(
   c: Contract,
   name: string,
@@ -52,6 +72,9 @@ const V1_ABI = [
   "function mintPublic(address nftContract, address feeRecipient, address minterIfNotPayer, uint256 quantity) payable",
   `function getPublicDrop(address nftContract) view returns (${PUBLIC_DROP_TUPLE})`,
   "function getAllowedFeeRecipients(address nftContract) view returns (address[])",
+  `function mintAllowList(address nftContract, address feeRecipient, address minterIfNotPayer, uint256 quantity, ${MINT_PARAMS_TUPLE} mintParams, bytes32[] proof) payable`,
+  "function getAllowListMerkleRoot(address nftContract) view returns (bytes32)",
+  "function getSigners(address nftContract) view returns (address[])",
 ];
 
 // v2 token-contract surface. `getPublicDrop()` takes no argument because the
@@ -60,6 +83,9 @@ const V2_ABI = [
   "function mintPublic(address feeRecipient, address minterIfNotPayer, uint256 quantity, uint256 publicDropIndex) payable",
   `function getPublicDrop() view returns (${PUBLIC_DROP_TUPLE})`,
   "function getAllowedFeeRecipients() view returns (address[])",
+  `function mintAllowList(address feeRecipient, address minterIfNotPayer, uint256 quantity, ${MINT_PARAMS_TUPLE} mintParams, bytes32[] proof) payable`,
+  "function getAllowListMerkleRoot() view returns (bytes32)",
+  "function getSigners() view returns (address[])",
 ];
 
 // Supply reads, used to warn on a sold-out or nearly-exhausted drop. Optional:
@@ -355,4 +381,137 @@ export function planWarnings(plan: MintPlan, nowMs: number): string[] {
     }
   }
   return warnings;
+}
+
+// ── Merkle allowlist ────────────────────────────────────────────────────────
+//
+// Everything below is the offline-provable gated path. The contract holds a root;
+// we hold the list; the proof is computed locally. Unlike mintSigned() there is
+// no third party to ask, so eligibility is known ahead of the open and the
+// transaction can be signed during the wait exactly like a public mint.
+
+const ZERO_ROOT = `0x${"00".repeat(32)}`;
+
+/**
+ * Read the allow-list root the contract is actually enforcing.
+ *
+ * Returns null rather than throwing when the collection exposes no such getter:
+ * plenty of SeaDrop deployments have no allow-list at all, and that is a fact
+ * about the drop, not a failure to report. A zero root is also null — it means
+ * configured-but-empty, which is equally unmintable.
+ */
+export async function fetchAllowListRoot(
+  provider: JsonRpcProvider,
+  nftContract: string,
+  variant: SeaDropVariant,
+): Promise<string | null> {
+  const token = getAddress(nftContract);
+  try {
+    const root =
+      variant === "v1-singleton"
+        ? await callFn<string>(
+            new Contract(SEADROP_V1, V1_ABI, provider),
+            "getAllowListMerkleRoot",
+            token,
+          )
+        : await callFn<string>(
+            new Contract(token, V2_ABI, provider),
+            "getAllowListMerkleRoot",
+          );
+    if (typeof root !== "string" || root.toLowerCase() === ZERO_ROOT) return null;
+    return root;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Build mintAllowList calldata.
+ *
+ * Unlike the public path this is per-wallet: the proof belongs to one minter, so
+ * there is no shared encode across the wallet set. minterIfNotPayer stays zero
+ * for the same reason as always — the caller is the minter, and the leaf was
+ * hashed against that address.
+ */
+export function encodeMintAllowList(
+  variant: SeaDropVariant,
+  nftContract: string,
+  feeRecipient: string,
+  quantity: number,
+  params: MintParams,
+  proof: string[],
+): string {
+  const tuple = [
+    params.mintPrice,
+    params.maxTotalMintableByWallet,
+    params.startTime,
+    params.endTime,
+    params.dropStageIndex,
+    params.maxTokenSupplyForStage,
+    params.feeBps,
+    params.restrictFeeRecipients,
+  ];
+  if (variant === "v1-singleton") {
+    return v1Interface.encodeFunctionData("mintAllowList", [
+      getAddress(nftContract),
+      getAddress(feeRecipient),
+      ZERO,
+      BigInt(quantity),
+      tuple,
+      proof,
+    ]);
+  }
+  return v2Interface.encodeFunctionData("mintAllowList", [
+    getAddress(feeRecipient),
+    ZERO,
+    BigInt(quantity),
+    tuple,
+    proof,
+  ]);
+}
+
+/** Decode our own allowlist calldata back, so a plan can be verified not trusted. */
+export function decodeMintAllowList(
+  data: string,
+): { name: string; args: readonly unknown[] } | null {
+  for (const iface of [v1Interface, v2Interface]) {
+    try {
+      const parsed = iface.parseTransaction({ data });
+      if (parsed && parsed.name === "mintAllowList") {
+        return { name: parsed.name, args: parsed.args };
+      }
+    } catch {
+      /* try the other variant */
+    }
+  }
+  return null;
+}
+
+/**
+ * The addresses allowed to sign `mintSigned` payloads for this drop.
+ *
+ * Normally this is an OpenSea-operated key, which is the whole reason the signed
+ * path needs their server. When a creator runs their own signer and the operator
+ * holds that key, the same stage becomes locally produceable — so this read is
+ * what separates "must ask OpenSea" from "can sign it here".
+ *
+ * Empty on any failure: most drops expose no signer at all, and that is a fact
+ * about the drop rather than an error to surface.
+ */
+export async function fetchSigners(
+  provider: JsonRpcProvider,
+  nftContract: string,
+  variant: SeaDropVariant,
+): Promise<string[]> {
+  const token = getAddress(nftContract);
+  try {
+    const signers =
+      variant === "v1-singleton"
+        ? await callFn<string[]>(new Contract(SEADROP_V1, V1_ABI, provider), "getSigners", token)
+        : await callFn<string[]>(new Contract(token, V2_ABI, provider), "getSigners");
+    if (!Array.isArray(signers)) return [];
+    return signers.filter((s) => typeof s === "string" && getAddress(s) !== ZERO).map(getAddress);
+  } catch {
+    return [];
+  }
 }

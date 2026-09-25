@@ -13,12 +13,13 @@
 import { ChainProfile, explorerTx } from "../core/chains";
 import { EngineEvent } from "../core/engine";
 import { MintPlan } from "../core/seadrop";
+import { DRY_RUN_CAVEAT, dryRunLines, dryRunVerdict } from "../core/dryrun";
 import { EndpointHealth, RpcPlan, isBenignProbeError, maskRpc } from "../core/rpc";
 import { formatEth, weiToGwei } from "../core/wallets";
 import { formatLocal, formatRemaining, formatUtc } from "../core/timing";
 import { ClockSync } from "../core/clock";
 import { StageTable, actionableStage, formatClock } from "../core/stages";
-import { STAGE_COLUMNS, allStageCells, stageSummaryLines } from "../core/stagetable";
+import { STAGE_COLUMNS, StageContext, allStageCells, stageSummaryLines } from "../core/stagetable";
 import {
   c,
   clearTransient,
@@ -33,9 +34,10 @@ import {
   warn,
 } from "../util/render";
 
+import { writeOut } from "../util/out";
 export function printRpcPlan(plan: RpcPlan, chain: ChainProfile): void {
   for (const bad of plan.dropped) {
-    process.stdout.write(
+    writeOut(
       fail(
         `${bad.label} reports chain ${bad.chainId}, not ${chain.chainId} — excluded from broadcasting.\n`,
       ),
@@ -47,18 +49,18 @@ export function printRpcPlan(plan: RpcPlan, chain: ChainProfile): void {
     if (plan.dropped.includes(h)) continue;
     rows.push(endpointRow(h));
   }
-  if (rows.length > 0) process.stdout.write(`${table(rows)}\n`);
+  if (rows.length > 0) writeOut(`${table(rows)}\n`);
 
   if (plan.read.length === 0) {
-    process.stdout.write(warn("No endpoint answered reads — nonces and balances cannot be read.\n"));
+    writeOut(warn("No endpoint answered reads — nonces and balances cannot be read.\n"));
   } else {
-    process.stdout.write(
+    writeOut(
       ok(
         `chain ${chain.chainId} (${chain.name}) confirmed · reading from ${maskRpc(plan.read[0]!)}\n`,
       ),
     );
   }
-  process.stdout.write(
+  writeOut(
     info(`broadcasting to ${plan.blast.length} endpoint(s) simultaneously\n`),
   );
 }
@@ -84,33 +86,33 @@ export function printPlan(plan: MintPlan, chain: ChainProfile, quantity: number)
   const now = Date.now();
   const live = now >= startMs && now < endMs;
 
-  process.stdout.write(heading("Drop") + "\n");
-  process.stdout.write(
+  writeOut(heading("Drop") + "\n");
+  writeOut(
     ok(`calldata built from on-chain state — no OpenSea account or token needed\n`),
   );
-  process.stdout.write(field("variant", plan.variant === "v1-singleton" ? "SeaDrop v1 singleton" : "SeaDrop v2 (token contract)") + "\n");
-  process.stdout.write(field("target", plan.to) + "\n");
-  process.stdout.write(field("collection", plan.nftContract) + "\n");
-  process.stdout.write(field("fee recipient", `${plan.feeRecipient} ${c.gray(`(${plan.feeRecipientSource})`)}`) + "\n");
-  process.stdout.write(
+  writeOut(field("variant", plan.variant === "v1-singleton" ? "SeaDrop v1 singleton" : "SeaDrop v2 (token contract)") + "\n");
+  writeOut(field("target", plan.to) + "\n");
+  writeOut(field("collection", plan.nftContract) + "\n");
+  writeOut(field("fee recipient", `${plan.feeRecipient} ${c.gray(`(${plan.feeRecipientSource})`)}`) + "\n");
+  writeOut(
     field(
       "price",
       `${formatEth(drop.mintPrice, chain.nativeSymbol)} × ${quantity} = ${c.bold(formatEth(plan.value, chain.nativeSymbol))} per wallet`,
     ) + "\n",
   );
-  process.stdout.write(
+  writeOut(
     field(
       "per-wallet cap",
       drop.maxTotalMintableByWallet > 0 ? String(drop.maxTotalMintableByWallet) : "unlimited",
     ) + "\n",
   );
   if (plan.supply.maxSupply !== null && plan.supply.totalSupply !== null) {
-    process.stdout.write(
+    writeOut(
       field("supply", `${plan.supply.totalSupply} / ${plan.supply.maxSupply} minted`) + "\n",
     );
   }
-  process.stdout.write(field("calldata", `${(plan.data.length - 2) / 2} bytes (identical for every wallet)`) + "\n");
-  process.stdout.write(
+  writeOut(field("calldata", `${(plan.data.length - 2) / 2} bytes (identical for every wallet)`) + "\n");
+  writeOut(
     field(
       "window",
       `${formatLocal(startMs)} ${c.gray("→")} ${formatLocal(endMs)}  ${
@@ -118,27 +120,32 @@ export function printPlan(plan: MintPlan, chain: ChainProfile, quantity: number)
       }`,
     ) + "\n",
   );
-  process.stdout.write(field("", c.gray(`${formatUtc(startMs)} UTC`)) + "\n");
+  writeOut(field("", c.gray(`${formatUtc(startMs)} UTC`)) + "\n");
 }
 
 /**
- * The stage table — the same seven columns `intern check` and the 📊 Stages panel
- * both show, because both build their cells from `allStageCells`.
+ * The stage table — the same columns `intern check` and the 📊 Stages panel both
+ * show, because both build their cells from `allStageCells`.
  *
- * The bot renders these cells as labelled lines (a phone cannot hold seven aligned
+ * The bot renders these cells as labelled lines (a phone cannot hold eight aligned
  * columns); the terminal has the width for a real table, so it gets one. What the
  * columns *mean* is decided in stagetable.ts, so the two cannot disagree about a
  * drop even though they look different.
  */
-export function printStages(stages: StageTable, chain: ChainProfile, nowMs: number): void {
-  process.stdout.write(heading("Stages") + "\n");
+export function printStages(
+  stages: StageTable,
+  chain: ChainProfile,
+  nowMs: number,
+  ctx: StageContext = {},
+): void {
+  writeOut(heading("Stages") + "\n");
 
   if (stages.rows.length === 0) {
-    process.stdout.write(info("No stages are configured for this drop yet.\n"));
+    writeOut(info("No stages are configured for this drop yet.\n"));
   } else {
     const header = STAGE_COLUMNS.map((h) => c.gray(h));
     const rows: string[][] = [header];
-    for (const cell of allStageCells(stages, chain, formatLocal)) {
+    for (const cell of allStageCells(stages, chain, formatLocal, ctx)) {
       rows.push([
         cell.stage,
         cell.price,
@@ -146,24 +153,32 @@ export function printStages(stages: StageTable, chain: ChainProfile, nowMs: numb
         cell.cap,
         cell.status,
         cell.mintsLeft,
+        // A "not fireable" cell is the one thing in this table an operator must
+        // not skim past, so it is coloured as the warning it is.
+        cell.eligibility.startsWith("not fireable")
+          ? c.yellow(cell.eligibility)
+          : cell.eligibility,
         // The source is what tells "on-chain, untamperable" apart from "OpenSea's
         // copy of the config", so it is never dropped to save a column.
         cell.source === "on-chain" ? c.green(cell.source) : c.gray(cell.source),
       ]);
     }
-    process.stdout.write(`${table(rows)}\n`);
+    writeOut(`${table(rows)}\n`);
   }
 
   // The two verbatim summary lines, for whichever stage the user can act on next.
-  const summary = stageSummaryLines(actionableStage(stages, nowMs), formatClock);
-  for (const line of summary) process.stdout.write(field("", line) + "\n");
+  const summary = stageSummaryLines(
+    actionableStage(stages, nowMs, ctx.fire, ctx.evidence),
+    formatClock,
+  );
+  for (const line of summary) writeOut(field("", line) + "\n");
 
-  if (stages.apiNotice) process.stdout.write(warn(`${stages.apiNotice}\n`));
+  if (stages.apiNotice) writeOut(warn(`${stages.apiNotice}\n`));
 }
 
 export function printClock(sync: ClockSync): void {
   if (!sync.synced) {
-    process.stdout.write(
+    writeOut(
       warn("Could not measure clock offset — firing against the local clock as-is.\n"),
     );
     return;
@@ -174,10 +189,10 @@ export function printClock(sync: ClockSync): void {
   // Under ~50ms is normal drift and needs no attention. Beyond ~500ms the machine
   // has a real clock problem, and correcting for it is the difference between
   // firing at T-0 and firing late.
-  if (magnitude < 50) process.stdout.write(ok(`${text} — negligible\n`));
-  else if (magnitude < 500) process.stdout.write(ok(`${text} — corrected\n`));
+  if (magnitude < 50) writeOut(ok(`${text} — negligible\n`));
+  else if (magnitude < 500) writeOut(ok(`${text} — corrected\n`));
   else
-    process.stdout.write(
+    writeOut(
       warn(`${text} — corrected, but consider enabling NTP on this machine\n`),
     );
 }
@@ -196,6 +211,10 @@ export interface ReporterOptions {
 export function createReporter(opts: ReporterOptions): (event: EngineEvent) => void {
   const { chain } = opts;
   let counting = false;
+  // A dry run ends with minted: 0, which is not a failure and must not be
+  // printed as "nothing minted" in red. The report above it already said what
+  // happened.
+  let wasDryRun = false;
 
   const endCountdown = (): void => {
     if (counting) {
@@ -216,7 +235,7 @@ export function createReporter(opts: ReporterOptions): (event: EngineEvent) => v
           receipts: "Waiting for receipts",
         };
         const label = names[event.name] ?? event.name;
-        process.stdout.write(
+        writeOut(
           heading(label) + (event.detail ? ` ${c.gray(`— ${event.detail}`)}` : "") + "\n",
         );
         break;
@@ -233,15 +252,15 @@ export function createReporter(opts: ReporterOptions): (event: EngineEvent) => v
               ? c.gray("balance unreadable")
               : formatEth(report.balance, event.symbol);
           const line = `[W${report.index}] ${report.address}  ${balance}`;
-          if (report.sufficient) process.stdout.write(info(`${line}\n`));
+          if (report.sufficient) writeOut(info(`${line}\n`));
           else
-            process.stdout.write(
+            writeOut(
               fail(
                 `${line}  needs ${formatEth(event.required, event.symbol)} (short ${formatEth(report.shortfall, event.symbol)})\n`,
               ),
             );
         }
-        process.stdout.write(
+        writeOut(
           info(
             `each wallet must hold value + gasLimit × maxFeePerGas = ${formatEth(event.required, event.symbol)}\n`,
           ),
@@ -250,12 +269,12 @@ export function createReporter(opts: ReporterOptions): (event: EngineEvent) => v
       }
 
       case "simulation":
-        if (event.ok) process.stdout.write(ok(`[W${event.index}] simulation passed\n`));
-        else process.stdout.write(warn(`[W${event.index}] ${event.error ?? "simulation failed"}\n`));
+        if (event.ok) writeOut(ok(`[W${event.index}] simulation passed\n`));
+        else writeOut(warn(`[W${event.index}] ${event.error ?? "simulation failed"}\n`));
         break;
 
       case "signed":
-        process.stdout.write(
+        writeOut(
           ok(
             `${event.count} transaction(s) signed and serialized in ${event.elapsedMs.toFixed(1)}ms — nothing left to compute at T-0\n`,
           ),
@@ -273,59 +292,85 @@ export function createReporter(opts: ReporterOptions): (event: EngineEvent) => v
           event.timingErrorMs === 0
             ? ""
             : ` ${c.gray(`· fired ${event.timingErrorMs > 0 ? "+" : ""}${event.timingErrorMs.toFixed(0)}ms from target`)}`;
-        process.stdout.write(
+        writeOut(
           `\n  ${c.bold(c.green(`▲ DISPATCHED ${event.count} transaction(s)`))} ${c.gray(`in ${event.dispatchMs.toFixed(2)}ms`)}${drift}\n`,
         );
         break;
       }
 
       case "tx":
-        process.stdout.write(info(`[W${event.index}] ${event.txHash}\n`));
+        writeOut(info(`[W${event.index}] ${event.txHash}\n`));
         break;
 
       case "accepted":
-        process.stdout.write(
+        writeOut(
           ok(`[W${event.index}] accepted by ${event.label} in ${event.elapsedMs.toFixed(0)}ms\n`),
         );
         break;
 
       case "rejected":
-        process.stdout.write(
+        writeOut(
           fail(`[W${event.index}] rejected by every endpoint — not broadcast.\n`),
         );
-        for (const reason of event.reasons) process.stdout.write(`      ${c.red(reason)}\n`);
-        if (event.hint) process.stdout.write(`      ${c.yellow(`→ ${event.hint}`)}\n`);
+        for (const reason of event.reasons) writeOut(`      ${c.red(reason)}\n`);
+        if (event.hint) writeOut(`      ${c.yellow(`→ ${event.hint}`)}\n`);
         break;
 
       case "receipt": {
         const status = event.success ? c.bold(c.green("MINTED")) : c.bold(c.red("REVERTED"));
-        process.stdout.write(
+        writeOut(
           `  ${status} ${c.gray(`[W${event.index}]`)} block ${event.block} · position ${event.position} · gas ${event.gasUsed}\n`,
         );
-        process.stdout.write(info(`${explorerTx(chain.chainId, event.txHash)}\n`));
+        if (event.reason) writeOut(warn(`         ${event.reason}\n`));
+        writeOut(info(`${explorerTx(chain.chainId, event.txHash)}\n`));
         break;
       }
 
       case "receiptTimeout":
-        process.stdout.write(
+        writeOut(
           warn(
-            `[W${event.index}] no receipt yet — still pending or dropped: ${explorerTx(chain.chainId, event.txHash)}\n`,
+            event.cancelled === true
+              ? // Cancelling stopped the watching. It did not stop the transaction,
+                // and saying "cancelled" without that would invite a second mint.
+                `[W${event.index}] stopped watching (cancelled) — the transaction was already broadcast and may still mint: ${explorerTx(chain.chainId, event.txHash)}\n`
+              : `[W${event.index}] no receipt yet — still pending or dropped: ${explorerTx(chain.chainId, event.txHash)}\n`,
           ),
         );
         break;
 
       case "warning":
-        process.stdout.write(warn(`${event.message}\n`));
+        writeOut(warn(`${event.message}\n`));
         break;
+
+      case "dryRun": {
+        endCountdown();
+        wasDryRun = true;
+        const verdict = dryRunVerdict(event.report);
+        writeOut("\n");
+        for (const line of dryRunLines(event.report, formatLocal)) {
+          // The caveat and the verdict are the two lines an operator must not
+          // skim past, so they are the two that are not grey.
+          if (line === DRY_RUN_CAVEAT) writeOut(`${c.gray(line)}\n`);
+          else if (line === verdict.detail) {
+            writeOut(
+              `  ${verdict.wouldFire ? c.bold(c.green(line)) : c.bold(c.yellow(line))}\n`,
+            );
+          } else if (line.startsWith("DRY RUN")) writeOut(`  ${c.bold(c.cyan(line))}\n`);
+          else writeOut(`  ${line}\n`);
+        }
+        writeOut("\n");
+        break;
+      }
 
       case "done": {
         endCountdown();
+        if (wasDryRun) break;
         const summary =
           event.minted > 0
             ? c.bold(c.green(`${event.minted} wallet(s) minted`))
             : c.bold(c.red("nothing minted"));
         const failedPart = event.failed > 0 ? c.gray(` · ${event.failed} failed`) : "";
-        process.stdout.write(`\n  ${summary}${failedPart}\n`);
+        writeOut(`\n  ${summary}${failedPart}\n`);
         break;
       }
     }
@@ -338,16 +383,16 @@ export function printGasSummary(
   gasLimit: bigint,
   baseFeeWei: bigint | null,
 ): void {
-  process.stdout.write(heading("Gas") + "\n");
+  writeOut(heading("Gas") + "\n");
   if (baseFeeWei !== null) {
-    process.stdout.write(field("base fee now", `${weiToGwei(baseFeeWei).toFixed(4)} gwei`) + "\n");
+    writeOut(field("base fee now", `${weiToGwei(baseFeeWei).toFixed(4)} gwei`) + "\n");
   }
-  process.stdout.write(
+  writeOut(
     field("fee ceiling", `${weiToGwei(maxFeeWei).toFixed(4)} gwei ${c.gray("(a maximum, not a payment)")}`) + "\n",
   );
-  process.stdout.write(field("priority tip", `${weiToGwei(priorityWei).toFixed(4)} gwei`) + "\n");
-  process.stdout.write(field("gas limit", String(gasLimit)) + "\n");
-  process.stdout.write(
+  writeOut(field("priority tip", `${weiToGwei(priorityWei).toFixed(4)} gwei`) + "\n");
+  writeOut(field("gas limit", String(gasLimit)) + "\n");
+  writeOut(
     field(
       "worst case",
       `${formatEth(gasLimit * maxFeeWei, "ETH")} per wallet if the ceiling is fully used`,

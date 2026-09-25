@@ -38,6 +38,15 @@ export class OpenSeaError extends Error {
   constructor(
     public readonly status: number,
     message: string,
+    /**
+     * What Retry-After asked for, in ms, when the response carried one.
+     *
+     * Honouring it matters more than it looks: during a contested stage the
+     * signature endpoint rate-limits hard, and a client that ignores the header
+     * and keeps hammering stays limited for longer than one that waits. The
+     * polite path is the fast path here.
+     */
+    public readonly retryAfterMs: number | null = null,
   ) {
     super(message);
     this.name = "OpenSeaError";
@@ -70,6 +79,31 @@ const STATUS_REASONS: Record<number, string> = {
   503: "OpenSea temporarily unavailable",
 };
 
+/**
+ * Parse a Retry-After header into a delay in ms.
+ *
+ * Two formats are legal and both appear in the wild: a count of seconds, and an
+ * HTTP date. A date in the past yields 0, not a negative — the request is due
+ * now, and a negative would read as "no header" to a caller checking for null.
+ *
+ * `nowMs` is passed in rather than read so the date branch is testable without
+ * waiting for wall-clock time to move.
+ */
+export function parseRetryAfter(value: string | null | undefined, nowMs: number): number | null {
+  if (value === null || value === undefined) return null;
+  const trimmed = value.trim();
+  if (trimmed === "") return null;
+
+  if (/^\d+(\.\d+)?$/.test(trimmed)) {
+    const seconds = Number(trimmed);
+    return Number.isFinite(seconds) ? Math.max(0, Math.round(seconds * 1000)) : null;
+  }
+
+  const at = Date.parse(trimmed);
+  if (Number.isNaN(at)) return null;
+  return Math.max(0, at - nowMs);
+}
+
 async function request<T>(
   path: string,
   opts: { apiKey?: string; body?: object; timeoutMs?: number } = {},
@@ -95,7 +129,11 @@ async function request<T>(
 
   if (!res.ok) {
     const reason = STATUS_REASONS[res.status] ?? "OpenSea API error";
-    throw new OpenSeaError(res.status, `${reason} (HTTP ${res.status}).`);
+    throw new OpenSeaError(
+      res.status,
+      `${reason} (HTTP ${res.status}).`,
+      parseRetryAfter(res.headers.get("retry-after"), Date.now()),
+    );
   }
   return (await res.json()) as T;
 }

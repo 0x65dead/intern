@@ -58,6 +58,34 @@ export function planFire(
 }
 
 /**
+ * Raised when a countdown is cancelled. Distinct wording from the engine's
+ * pre-dispatch check so a journal says which of the two stopped the run.
+ */
+function throwIfCancelled(signal: AbortSignal | undefined): void {
+  if (signal?.aborted) throw new Error("Cancelled during the countdown — nothing was sent.");
+}
+
+/**
+ * Sleep, waking early if the run is cancelled.
+ *
+ * Without the listener a cancellation waits out the current chunk. That is a
+ * second at worst here, but the same function is used for the fine hops, and a
+ * countdown that ignores the abort it was handed is the bug this replaced.
+ */
+function nap(ms: number, signal: AbortSignal | undefined): Promise<void> {
+  if (signal === undefined) return new Promise((resolve) => setTimeout(resolve, ms));
+  return new Promise((resolve) => {
+    const wake = (): void => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", wake);
+      resolve();
+    };
+    const timer = setTimeout(wake, ms);
+    signal.addEventListener("abort", wake, { once: true });
+  });
+}
+
+/**
  * Block until the corrected clock reaches `targetMs`.
  *
  * Returns the signed error in milliseconds: negative means the loop exited
@@ -68,7 +96,9 @@ export async function waitUntil(
   targetMs: number,
   clock: CorrectedClock,
   onProgress?: (progress: WaitProgress) => void,
+  signal?: AbortSignal,
 ): Promise<number> {
+  throwIfCancelled(signal);
   let remaining = targetMs - clock.now();
   if (remaining <= 0) return -remaining;
 
@@ -77,7 +107,8 @@ export async function waitUntil(
     onProgress?.({ remainingMs: remaining, phase: "coarse" });
     // Cap each sleep so a moved stage or a re-sync is noticed within a second.
     const sleep = Math.min(remaining - FINE_WINDOW_MS, 1000);
-    await new Promise((resolve) => setTimeout(resolve, sleep));
+    await nap(sleep, signal);
+    throwIfCancelled(signal);
     remaining = targetMs - clock.now();
   }
 
@@ -86,7 +117,8 @@ export async function waitUntil(
   while (remaining > SPIN_WINDOW_MS) {
     onProgress?.({ remainingMs: remaining, phase: "fine" });
     const sleep = Math.min(remaining - SPIN_WINDOW_MS, FINE_HOP_MS);
-    await new Promise((resolve) => setTimeout(resolve, sleep));
+    await nap(sleep, signal);
+    throwIfCancelled(signal);
     remaining = targetMs - clock.now();
   }
 

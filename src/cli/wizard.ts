@@ -19,6 +19,7 @@ import { shortAddress } from "../core/target";
 import { c, field, heading, info, ok, warn } from "../util/render";
 import { askChoice, askHidden, askNumber, askText, askYesNo } from "../util/prompt";
 
+import { writeOut } from "../util/out";
 export interface TargetConfig {
   wallets: LoadedWallet[];
   chainKey: string;
@@ -48,17 +49,17 @@ export interface ExecutionConfig {
 async function collectWallets(): Promise<LoadedWallet[]> {
   const fromEnv = walletsFromEnv();
   if (fromEnv.length > 0) {
-    process.stdout.write(
+    writeOut(
       ok(`${fromEnv.length} wallet(s) loaded from .env: ${fromEnv.map((w) => shortAddress(w.address)).join(", ")}\n`),
     );
     if (await askYesNo("Use these wallets?", true)) return fromEnv;
   }
 
-  process.stdout.write(heading("Wallets") + "\n");
-  process.stdout.write(
+  writeOut(heading("Wallets") + "\n");
+  writeOut(
     info("Paste one private key per line. Input is not echoed. Blank line when done.\n"),
   );
-  process.stdout.write(info("Keys entered here stay in memory and are never written to disk.\n"));
+  writeOut(info("Keys entered here stay in memory and are never written to disk.\n"));
 
   const keys: string[] = [];
   for (;;) {
@@ -69,9 +70,9 @@ async function collectWallets(): Promise<LoadedWallet[]> {
       // rather than after the whole set has been entered.
       const wallet = loadWallets([raw])[0]!;
       keys.push(raw);
-      process.stdout.write(ok(`W${keys.length - 1}  ${wallet.address}\n`));
+      writeOut(ok(`W${keys.length - 1}  ${wallet.address}\n`));
     } catch (err: unknown) {
-      process.stdout.write(
+      writeOut(
         `  ${c.red("✗")} ${err instanceof Error ? err.message : "Invalid key."}\n`,
       );
     }
@@ -80,7 +81,7 @@ async function collectWallets(): Promise<LoadedWallet[]> {
   const wallets = loadWallets(keys);
   if (wallets.length === 0) throw new Error("No wallets entered — nothing to mint with.");
   if (wallets.length < keys.length) {
-    process.stdout.write(
+    writeOut(
       warn(`${keys.length - wallets.length} duplicate key(s) ignored — they share a nonce space.\n`),
     );
   }
@@ -114,8 +115,8 @@ export async function collectTargetConfig(
 
   let target = preset.target ?? "";
   while (!target.trim()) {
-    process.stdout.write(heading("Target") + "\n");
-    process.stdout.write(info("An OpenSea link, a collection slug, or a contract address.\n"));
+    writeOut(heading("Target") + "\n");
+    writeOut(info("An OpenSea link, a collection slug, or a contract address.\n"));
     target = await askText("target");
   }
 
@@ -138,12 +139,12 @@ export async function collectTargetConfig(
 async function collectRpcs(chainKey: string): Promise<string[]> {
   const configured = process.env[`RPC_URL_${chainKey.toUpperCase()}`] ?? process.env.RPC_URL;
   if (configured) {
-    process.stdout.write(ok(`private RPC from .env: ${maskRpc(configured.split(",")[0]!)}\n`));
+    writeOut(ok(`private RPC from .env: ${maskRpc(configured.split(",")[0]!)}\n`));
     return [];
   }
 
-  process.stdout.write(heading("RPC") + "\n");
-  process.stdout.write(
+  writeOut(heading("RPC") + "\n");
+  writeOut(
     warn("No private RPC configured. Public endpoints are shared and rate-limited.\n"),
   );
   const entry = await askText("RPC URL or Alchemy key (enter to use public endpoints)");
@@ -165,13 +166,13 @@ export async function collectExecutionConfig(
   const suggestedMaxFee = Number(weiToGwei(run.gas.maxFeePerGas).toFixed(4));
   const suggestedPriority = Number(weiToGwei(run.gas.maxPriorityFeePerGas).toFixed(4));
 
-  process.stdout.write(heading("Gas") + "\n");
+  writeOut(heading("Gas") + "\n");
   if (run.fees.baseFeeWei !== null) {
-    process.stdout.write(
+    writeOut(
       info(`base fee is ${weiToGwei(run.fees.baseFeeWei).toFixed(4)} gwei right now\n`),
     );
   }
-  process.stdout.write(
+  writeOut(
     info("The ceiling is a maximum, not a payment — unused headroom is refunded.\n"),
   );
 
@@ -186,7 +187,7 @@ export async function collectExecutionConfig(
   );
 
   const worstCase = gasLimit * BigInt(Math.round(maxFeeGwei * 1e9));
-  process.stdout.write(
+  writeOut(
     info(`worst case gas: ${formatEth(worstCase, run.chain.nativeSymbol)} per wallet\n`),
   );
 
@@ -211,7 +212,7 @@ async function collectTiming(run: PreparedRun): Promise<Timing> {
   const untilStart = startMs - Date.now();
 
   if (untilStart <= 0) {
-    process.stdout.write(ok("The stage is already open — firing immediately.\n"));
+    writeOut(ok("The stage is already open — firing immediately.\n"));
     return "now";
   }
 
@@ -236,16 +237,16 @@ async function collectTiming(run: PreparedRun): Promise<Timing> {
     const raw = await askText("fire at");
     try {
       const atMs = parseTimeInput(raw);
-      process.stdout.write(ok(`firing at ${formatLocal(atMs)}\n`));
+      writeOut(ok(`firing at ${formatLocal(atMs)}\n`));
       if (atMs < startMs) {
-        process.stdout.write(
+        writeOut(
           warn("That is before the stage opens — the mint will revert with NotActive.\n"),
         );
         if (!(await askYesNo("Fire anyway?", false))) continue;
       }
       return { atMs };
     } catch (err: unknown) {
-      process.stdout.write(`  ${c.red("✗")} ${err instanceof Error ? err.message : "Bad time."}\n`);
+      writeOut(`  ${c.red("✗")} ${err instanceof Error ? err.message : "Bad time."}\n`);
     }
   }
 }
@@ -265,7 +266,7 @@ export async function confirmFire(
   chain: ChainProfile,
 ): Promise<boolean> {
   const plan = run.plan;
-  process.stdout.write(heading("Confirm") + "\n");
+  writeOut(heading("Confirm") + "\n");
 
   const perWallet = plan?.value ?? 0n;
   const total = perWallet * BigInt(wallets.length);
@@ -273,21 +274,21 @@ export async function confirmFire(
   const gasWorstCase = config.gasLimit * BigInt(Math.round(maxFeeGwei * 1e9));
   const totalWorstCase = total + gasWorstCase * BigInt(wallets.length);
 
-  process.stdout.write(field("chain", `${chain.name} ${c.gray(`(id ${chain.chainId})`)}`) + "\n");
-  process.stdout.write(field("contract", run.contract) + "\n");
-  if (run.collection) process.stdout.write(field("collection", run.collection.name) + "\n");
-  process.stdout.write(
+  writeOut(field("chain", `${chain.name} ${c.gray(`(id ${chain.chainId})`)}`) + "\n");
+  writeOut(field("contract", run.contract) + "\n");
+  if (run.collection) writeOut(field("collection", run.collection.name) + "\n");
+  writeOut(
     field("wallets", `${wallets.length} — ${wallets.map((w) => shortAddress(w.address)).join(", ")}`) + "\n",
   );
   if (plan) {
-    process.stdout.write(
+    writeOut(
       field("mint cost", `${formatEth(total, chain.nativeSymbol)} total (${formatEth(perWallet, chain.nativeSymbol)} each)`) + "\n",
     );
   }
-  process.stdout.write(
+  writeOut(
     field("max total", `${formatEth(totalWorstCase, chain.nativeSymbol)} ${c.gray("if every ceiling is fully used")}`) + "\n",
   );
-  process.stdout.write(
+  writeOut(
     field(
       "fires",
       config.timing === "now"

@@ -75,6 +75,7 @@ intern init       # writes a commented .env (mode 0600)
 |---|---|
 | `intern` | help |
 | `intern mint <target>` | the main event — interactive unless everything is given |
+| `intern dryrun <target>` | prepare, check and **sign** everything, then stop without broadcasting. Spends nothing. Exits 1 if a live run would have refused, so `intern dryrun … && intern mint …` is safe to write |
 | `intern check <target>` | read the drop and print every number. Signs nothing |
 | `intern watch <target>` | wait for a public stage to appear, then report. Signs nothing |
 | `intern allowlist <target>` | allowlist/FCFS mint via OpenSea's signature endpoint |
@@ -100,7 +101,8 @@ their chain, so `intern mint https://opensea.io/assets/base/0x…/1` needs no
     --now                 fire immediately
     --lead-ms <n>         fire this many ms early (default 0)
     --watch               wait for the stage to be configured, then mint it
-    --skip-simulation     no dry run. Faster setup, no revert protection
+    --dry-run             sign everything, broadcast nothing. Same as `intern dryrun`
+    --skip-simulation     no preflight simulation. Faster setup, no revert protection
     --require-simulation  abort if any wallet's dry run reverts
 -y, --yes                 non-interactive
     --json                machine-readable output (rpc, clock, check)
@@ -308,6 +310,14 @@ transactions would be discarded by the network with nothing to show for it.
 ```bash
 intern allowlist <target>   # needs OPENSEA_API_KEY
 ```
+
+<!-- BEGIN GENERATED: speed-statement -->
+> **The speed claim, stated once.** A gated mint (allowlist / GTD / FCFS backed by an OpenSea signature) is slower than a public mint and always will be. The signature is bound to one minter, one quantity and one salt, and OpenSea does not issue it before the stage opens — so one HTTP round trip is inside the race and cannot be moved out of it. intern removes everything else: nonce, fees, balance check and TLS handshakes are all completed before T-0, leaving request → verify → sign → broadcast. A Merkle allow-list is the exception: its proof is computed locally, so that path pre-signs exactly like a public mint and is as fast as one.
+>
+> This paragraph is generated from `SPEED_STATEMENT` in `src/core/race.ts` and is
+> rendered identically in [CAPABILITY.md](CAPABILITY.md). Run `npm run docs` after
+> changing it.
+<!-- END GENERATED: speed-statement -->
 
 This path is structurally slower than a public mint, and no engineering removes
 that. `mintSigned()` requires a signature from OpenSea's server, bound to one

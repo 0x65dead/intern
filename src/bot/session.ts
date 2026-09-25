@@ -45,7 +45,9 @@ import {
   noDropMessage,
   prepareRun,
   refreshRun,
+  stageContext,
 } from "../core/prepare";
+import { StageContext } from "../core/stagetable";
 import { Defaults } from "../util/env";
 import { WatchUpdate, waitForPublicStage } from "../core/watcher";
 import { formatLocal, parseTimeInput } from "../core/timing";
@@ -53,6 +55,7 @@ import { parseTarget, shortAddress } from "../core/target";
 import {
   InlineButton,
   TelegramClient,
+  TelegramError,
   TgCallbackQuery,
   TgChat,
   TgMessage,
@@ -60,6 +63,7 @@ import {
   bold,
   code,
   esc,
+  isMessageGone,
   link,
 } from "./api";
 import { createTelegramReporter, formatGas } from "./format";
@@ -69,6 +73,7 @@ import {
   PanelAction,
   chainKeyboard,
   confirmKeyboard,
+  dryRunButton,
   encodeCallback,
   parseCallback,
   quantityKeyboard,
@@ -80,10 +85,45 @@ import {
   renderStages,
   updatedFooter,
 } from "./panel";
-import { AUTO_REFRESH_MS, EditGate, RefreshSource, debouncedToast } from "./refresh";
+import {
+  AUTO_REFRESH_MS,
+  EditGate,
+  MIN_EDIT_GAP_MS,
+  RefreshSource,
+  WriteGate,
+  debouncedToast,
+  newWriteGate,
+  nextWriteDelay,
+  noteRateLimit,
+} from "./refresh";
 
 /** A prepared run left unconfirmed this long is dropped and its provider closed. */
 const DRAFT_TTL_MS = 15 * 60_000;
+
+/**
+ * The drift limit an unattended run uses when none was configured.
+ *
+ * Two seconds of uncertainty is already far more than a mint can absorb — a
+ * stage opens in a single block — so this is a backstop against a badly broken
+ * clock, not a precision target. The CLI leaves the guard advisory by default
+ * because an operator is there to read the measured offset; nobody is here.
+ */
+const DEFAULT_BOT_DRIFT_LIMIT_MS = 2_000;
+
+/**
+ * Said when the live run panel could not be brought up to date.
+ *
+ * It is worth a sentence rather than a silent stale message. The panel is the
+ * only place the per-wallet lines and tx hashes appear, and an operator who
+ * cannot see that it failed to update will read a half-finished countdown as the
+ * state of a mint that has already resolved.
+ */
+const PANEL_STALE =
+  "⚠ The panel above is out of date — Telegram refused the final edit. What follows is the real outcome; check the explorer for per-wallet results.";
+
+/** The dry-run equivalent, where the panel was the entire report. */
+const DRY_PANEL_LOST =
+  "Telegram refused the edit that carried the dry-run report, so it is gone rather than stale. Nothing was broadcast. Run the check again.";
 
 /** What the panel is currently showing. */
 type View =
@@ -94,6 +134,12 @@ type View =
   | "awaitTime"
   | "confirm"
   | "running"
+  /**
+   * 👀 Watch. Distinct from "running" because a watch holds no lock, sends
+   * nothing, and must not be repainted over by a finishing run's teardown — all
+   * three of which used to be decided by this one shared value.
+   */
+  | "watching"
   | "check"
   | "stages"
   | "wallets"
@@ -108,7 +154,6 @@ interface Draft {
   chainKey?: string;
   quantity?: number;
   run?: PreparedRun;
-  preparedAt?: number;
   balances?: BalanceReport[];
   /** Candidate chains from an ambiguous detection, awaiting a pick. */
   candidates?: string[];
@@ -126,8 +171,39 @@ interface Session {
   autoTimer?: NodeJS.Timeout;
   /** Paces edits to this chat's panel. */
   gate: EditGate;
+  /**
+   * Telegram's pacing for this chat's panel, as opposed to ours.
+   *
+   * `gate` decides whether a *refresh* is worth doing. This decides when the edit
+   * it produces may actually go out, and it applies to every paint — menu
+   * navigation included, which is where a burst of taps used to earn a 429 that
+   * `paintNow` swallowed, leaving the panel frozen on the frame before.
+   */
+  write: WriteGate;
+  /**
+   * Serializes edits to this chat's panel, so two paints cannot interleave.
+   *
+   * `prepare` reports progress through an unawaited `void this.paint(...)`, which
+   * meant several edits to the same message were in flight at once. Two things
+   * went wrong. Out-of-order completion could leave the panel showing an earlier
+   * step than the one it had already drawn — including leaving "Working…" on
+   * screen permanently over a finished result. And because a failed edit clears
+   * `panelId` and posts a replacement, two concurrent failures each posted one,
+   * so the chat filled with duplicate panels.
+   */
+  paintQueue: PaintQueue<{ text: string; buttons: InlineButton[][] }>;
   /** Row statuses at the last render, to notice a stage transition. */
   stageSignature?: string;
+  /** Consecutive auto-refresh failures, reset by the first success. */
+  refreshFailures?: number;
+  /**
+   * 👀 Watch's abort handle, kept apart from `controller`.
+   *
+   * Watch used to assign `session.controller`, overwriting a live mint's handle,
+   * so the mint became unabortable — `shutdown` and `cancel` would abort the watch
+   * and leave the run signing.
+   */
+  watchController?: AbortController;
 }
 
 export interface SessionManagerOptions {
@@ -174,10 +250,248 @@ const HELP = [
   ),
 ].join("\n");
 
+/**
+ * Whether a run may start, given who holds the global lock.
+ *
+ * HARD CONSTRAINT 6 is one mint run at a time, *globally*. The check used to read
+ * `this.running !== chatId`, exempting the chat that already held the lock — which
+ * was invisible only because the update loop was blocked for the whole run, so a
+ * second ✅ Send could not be delivered until the first had finished. With the run
+ * detached so ❌ Cancel can land, that exemption becomes a double-tap that signs
+ * two sets of transactions at the same nonces, and the network keeps one.
+ *
+ * Returns the refusal to show, or `null` to proceed. Pure, so the rule is testable
+ * without standing up a chat, a wallet set and a chain.
+ */
+export function lockRefusal(
+  holder: number | null,
+  chatId: number,
+): { title: string; body: string } | null {
+  if (holder === null) return null;
+  if (holder === chatId) {
+    return {
+      title: "Already running",
+      body: "This chat already has a run in progress. Use ❌ Cancel to stop it; starting a second would reuse the same nonces and one would be silently discarded.",
+    };
+  }
+  return {
+    title: "Another chat is mid-run",
+    body: "The same wallets are already signing. Two runs would use the same nonces and one would be silently discarded, so this one is not starting.",
+  };
+}
+
+/**
+ * The controllers ❌ Cancel should abort.
+ *
+ * Two, not one. The mint lock is global, so a run started from a group panel has
+ * to be stoppable from the operator's DM — `cancel` used to consult only the
+ * calling chat's own handle, which meant the only chat that could stop a run was
+ * the one that started it. And HARD CONSTRAINT 6 asks a single button to kill a
+ * live mint *and* a live panel loop, which for one chat can be two controllers.
+ *
+ * Already-aborted handles are dropped so the caller can distinguish "something was
+ * stopped" from "there was nothing to stop", and the same handle appearing twice
+ * is returned once.
+ */
+export function abortTargets(
+  ...controllers: (AbortController | null | undefined)[]
+): AbortController[] {
+  const live = new Set<AbortController>();
+  for (const controller of controllers) {
+    if (controller && !controller.signal.aborted) live.add(controller);
+  }
+  return [...live];
+}
+
+/** What a finished run is still entitled to tear down. */
+export interface RunTeardown {
+  /** Drop the session's controller reference — only while it is still this run's. */
+  clearController: boolean;
+  /** The draft is still this run's, so the whole draft goes with it. */
+  discardDraft: boolean;
+  /** The operator prepared something new; close only what this run itself held. */
+  closeOwnRunOnly: boolean;
+  /** Repaint the menu — only if the operator has not navigated away. */
+  showMenu: boolean;
+}
+
+/**
+ * Decide what a finished run may tear down.
+ *
+ * Preparing a mint takes no lock, deliberately: reading a drop must never be
+ * blocked by somebody else's run. That was invisible until the run itself was
+ * detached so ❌ Cancel could be delivered — and then the combination became
+ * reachable. The operator can now prepare a second mint while the first is still
+ * in flight, and the first run's teardown runs against a session that has moved on.
+ *
+ * Every field answers one question: is this still mine? Tearing down state that
+ * belongs to the next run is worse than leaking it — a blanket `discardDraft`
+ * closes the provider the confirm panel is about to use, and nothing in the
+ * resulting failure names the run that closed it.
+ */
+export function planTeardown(
+  state: {
+    controller: AbortController | undefined;
+    draftRun: object | undefined;
+    view: string;
+  },
+  owned: { controller: AbortController; run: object },
+): RunTeardown {
+  const draftIsMine = state.draftRun === owned.run;
+  return {
+    clearController: state.controller === owned.controller,
+    discardDraft: draftIsMine,
+    closeOwnRunOnly: !draftIsMine,
+    showMenu: state.view === "running",
+  };
+}
+
+/**
+ * A serialization slot: one edit in flight, one waiting, the waiting one replaceable.
+ */
+export interface PaintQueue<T> {
+  chain: Promise<void>;
+  pending?: T;
+}
+
+/**
+ * Queue a draw behind whatever is already in flight, latest-wins.
+ *
+ * Telegram edits the same message, so concurrent edits to it are not merely
+ * wasteful — they land in whatever order the network decides, and the panel ends
+ * up showing whichever one happened to finish last. The visible symptom is a
+ * panel stuck on "Working…" over a result that is actually ready.
+ *
+ * Only the newest queued value is kept: a burst of progress callbacks is worth one
+ * edit, not one edit each, and intermediate steps nobody saw are not worth a round
+ * trip against a rate-limited token.
+ *
+ * The chain is advanced with the *caught* promise, because a chain that rejects
+ * would skip every draw queued behind it — turning one failed edit into a panel
+ * that never updates again.
+ */
+export function enqueuePaint<T>(
+  queue: PaintQueue<T>,
+  value: T,
+  draw: (value: T) => Promise<void>,
+): Promise<void> {
+  queue.pending = value;
+  const queued = queue.chain.then(async () => {
+    const pending = queue.pending;
+    if (pending === undefined) return; // a later call already drew newer content
+    delete queue.pending;
+    await draw(pending);
+  });
+  queue.chain = queued.catch(() => {});
+  return queued;
+}
+
+/**
+ * Refuse to start a setup flow while this chat is already busy.
+ *
+ * The guard used to read `session.view === "running"`, which is a *display* flag,
+ * not the lock. Any view change cleared it — `/status` sets the view to "status",
+ * and from then on the guard saw an idle chat while a mint was still signing. The
+ * real lock is `running`, so that is what this reads.
+ *
+ * Another chat's run is deliberately not refused here: preparing a target sends
+ * nothing, and the global lock is re-checked at fire time, where it belongs.
+ */
+export function beginRefusal(
+  running: number | null,
+  chatId: number,
+  view: string,
+): { title: string; body: string } | null {
+  if (running === chatId) {
+    return {
+      title: "A run is in progress",
+      body: "Cancel it before starting another.",
+    };
+  }
+  if (view === "watching") {
+    return {
+      title: "A watch is running",
+      body: "Stop watching before starting something else.",
+    };
+  }
+  return null;
+}
+
+/** Consecutive failed auto-refreshes before the chat is told the panel is stale. */
+export const REFRESH_ALERT_AFTER = 3;
+
+/**
+ * Is the panel a refresh was reading for still the panel on screen?
+ *
+ * `refreshRun` and `readBalances` take seconds against live RPC. The guard that
+ * decided the refresh was worth doing ran before them, and the write-back ran
+ * after — so in between the operator could navigate away, press ❌ Cancel, or
+ * start a mint, and the refresh would commit anyway: painting a stale Check panel
+ * over whatever was now on screen, and replacing `draft.run` with a rebuilt run
+ * that the mint about to fire had not been prepared against.
+ *
+ * Identity, not equality. A rebuilt run is a different object even when every
+ * number in it matches, which is exactly the case that must not be committed.
+ */
+export function refreshStillApplies(
+  startedView: string,
+  currentView: string,
+  startedRun: unknown,
+  currentRun: unknown,
+): boolean {
+  if (currentView !== startedView) return false;
+  if (currentRun !== startedRun) return false;
+  return currentView === "check" || currentView === "stages";
+}
+
+/**
+ * Decide where a failed refresh gets reported.
+ *
+ * A refresh driven by a button press has a `callback_query_id` to answer, and the
+ * toast lands on the operator's screen. A refresh driven by the ⏱ Auto timer has
+ * none — and the code used to answer `queryId ?? ""` anyway, which Telegram
+ * rejects, into a `.catch(() => {})`. So the one failure mode that happens while
+ * nobody is pressing anything was reported nowhere at all: the countdown simply
+ * stopped advancing, which looks exactly like a countdown that is up to date.
+ *
+ * A single timer failure is genuinely not worth a message — the next tick usually
+ * succeeds, which is why it is swallowed rather than fatal. A streak is, because
+ * by then the numbers on screen are stale and the operator is making decisions
+ * from them. Announcing on the Nth failure exactly, rather than every failure
+ * past N, keeps a long outage to one message.
+ */
+export function planRefreshReport(
+  queryId: string | undefined,
+  consecutiveFailures: number,
+): { toast: boolean; announce: boolean } {
+  const interactive = queryId !== undefined && queryId !== "";
+  return {
+    toast: interactive,
+    announce: !interactive && consecutiveFailures === REFRESH_ALERT_AFTER,
+  };
+}
+
 export class SessionManager {
   private readonly sessions = new Map<number, Session>();
   /** chatId currently holding the run lock, or null. Mint runs only. */
   private running: number | null = null;
+
+  /**
+   * The live run's abort handle, held here rather than only on the session.
+   *
+   * The lock is global, so cancellation has to be too: a run started from a group
+   * panel used to be uncancellable from the operator's DM, because `cancel` only
+   * ever looked at the calling chat's own controller.
+   */
+  private activeController: AbortController | null = null;
+
+  /** The detached run, so shutdown can wait for it instead of cutting it off. */
+  private activeRun: Promise<void> | null = null;
+
+  /** The detached watch. Holds no lock, but shutdown still waits for it. */
+  private activeWatch: Promise<void> | null = null;
+  /** The contract the live run is firing at, for the heartbeat. null when idle. */
+  private runningTarget: string | null = null;
   private readonly clock: CorrectedClock;
 
   constructor(private readonly opts: SessionManagerOptions) {
@@ -186,6 +500,30 @@ export class SessionManager {
 
   private now(): number {
     return this.clock.now();
+  }
+
+  /**
+   * The stage table's context, built the same way for every panel.
+   *
+   * Shares src/core/prepare.ts's builder with the CLI, so 📊 Stages in Telegram
+   * and `intern check` in a terminal cannot reach different verdicts about
+   * whether a stage is fireable.
+   */
+  private stageCtx(run: PreparedRun): StageContext {
+    return stageContext(run, {
+      allowlistMinting: this.opts.defaults.allowlistMinting,
+      openseaApiKey: this.opts.defaults.openseaApiKey !== null,
+    });
+  }
+
+  /** Whether a mint run currently holds the global lock. For the heartbeat. */
+  isRunning(): boolean {
+    return this.running !== null;
+  }
+
+  /** The contract a live run is firing at, or null when idle. For the heartbeat. */
+  currentTarget(): string | null {
+    return this.runningTarget;
   }
 
   // ── authorization ──────────────────────────────────────────────────────────
@@ -226,6 +564,8 @@ export class SessionManager {
         view: "menu",
         draft: { intent: "mint" },
         gate: new EditGate(),
+        write: newWriteGate(),
+        paintQueue: { chain: Promise.resolve() },
       };
       this.sessions.set(chatId, session);
     }
@@ -241,27 +581,101 @@ export class SessionManager {
    * new panel, because the usual cause is that the user deleted the old message
    * and a bot that then refuses to draw anything looks broken.
    */
-  private async paint(
+  /**
+   * Queue a panel edit behind any edit already in flight for this chat.
+   *
+   * Latest-wins: a paint still waiting its turn is replaced rather than stacked,
+   * so a burst of progress callbacks costs one edit instead of one per step. The
+   * returned promise resolves once the panel shows content at least as new as
+   * this call's, which is what every caller actually wants.
+   */
+  /**
+   * The press awaiting an answer, or null once answered.
+   *
+   * A single field is enough because the poll loop applies updates strictly
+   * sequentially — see the note at its `for` loop in index.ts. Two presses are
+   * never in flight at once.
+   */
+  private pendingAck: string | null = null;
+
+  private paint(session: Session, text: string, buttons: InlineButton[][]): Promise<void> {
+    return enqueuePaint(session.paintQueue, { text, buttons }, (pending) =>
+      this.paintNow(session, pending.text, pending.buttons),
+    );
+  }
+
+  private async paintNow(
     session: Session,
     text: string,
     buttons: InlineButton[][],
   ): Promise<void> {
+    // Paints are serialized and latest-wins, so waiting here does not stack edits:
+    // taps that arrive during the wait collapse into the single pending frame that
+    // runs next. Five taps in a second cost two edits instead of five and a 429.
+    const delay = nextWriteDelay(session.write, this.now(), MIN_EDIT_GAP_MS);
+    if (delay > 0) await sleep(delay);
+    session.write = { ...session.write, lastWriteMs: this.now() };
     session.gate.record(this.now());
 
     if (session.panelId !== null) {
       try {
         await this.opts.client.editMessage(session.chatId, session.panelId, text, { buttons });
         return;
-      } catch {
-        session.panelId = null; // deleted or too old to edit — fall through
+      } catch (err: unknown) {
+        // The one useful thing a 429 carries. Without it the next paint retries
+        // into the same limit and the panel stays a frame behind indefinitely.
+        if (err instanceof TelegramError) {
+          session.write = noteRateLimit(session.write, this.now(), err.retryAfterSec);
+        }
+        // Only a message that is genuinely gone justifies posting a replacement.
+        // Every failure used to land here, so a single 429 orphaned the panel and
+        // posted a second one — and the next paint rate-limited too, and the chat
+        // filled with panels while the live one scrolled away. A transient failure
+        // keeps the panel and skips this frame; the next paint edits it again.
+        if (!isMessageGone(err)) return;
+        session.panelId = null;
       }
     }
     try {
       const sent = await this.opts.client.sendMessage(session.chatId, text, { buttons });
       session.panelId = sent.message_id;
-    } catch {
+    } catch (err: unknown) {
       // A chat that has blocked the bot must not take the process down.
+      if (err instanceof TelegramError) {
+        session.write = noteRateLimit(session.write, this.now(), err.retryAfterSec);
+      }
     }
+  }
+
+  /**
+   * Answer a button press exactly once, without losing what was said.
+   *
+   * Telegram accepts one answerCallbackQuery per press and rejects the rest, and
+   * the client swallows that rejection. So the pre-emptive empty acknowledgement
+   * in `handleCallback` did not merely duplicate work — it spent the press's one
+   * answer, and every alert a handler raised afterwards went nowhere. "Invalid
+   * quantity.", "Auto-refresh only applies to a Check or Stages panel." and
+   * "Refresh failed: …" were all being shown to no one. A button that works and
+   * says nothing is what gets reported as a broken bot.
+   *
+   * The acknowledgement still goes first, because Telegram spins the button for
+   * about thirty seconds without it and preparing a run takes several seconds.
+   * What changes is the fallback: a handler speaking after the press has been
+   * answered gets a chat message rather than silence. Less pretty than a toast,
+   * and it actually arrives.
+   */
+  private async ackCallback(
+    session: Session,
+    queryId: string,
+    text?: string,
+    alert = false,
+  ): Promise<void> {
+    if (queryId !== "" && this.pendingAck === queryId) {
+      this.pendingAck = null;
+      await this.opts.client.answerCallback(queryId, text, alert);
+      return;
+    }
+    if (text !== undefined && text !== "") await this.say(session.chatId, esc(text));
   }
 
   /** A one-off message that is not the panel — run reports and run summaries. */
@@ -355,7 +769,7 @@ export class SessionManager {
       case "awaitTime": {
         try {
           const atMs = parseTimeInput(text, this.now());
-          await this.fire(session, { atMs });
+          this.launch(session, { atMs });
         } catch (err: unknown) {
           await this.paint(
             session,
@@ -388,6 +802,10 @@ export class SessionManager {
    * sent before any of the work because Telegram spins the client's button for
    * about thirty seconds without it, and preparing a run takes several seconds —
    * long enough for a user to conclude nothing happened and press again.
+   *
+   * That acknowledgement is a press's only one, so it goes through `ackCallback`
+   * rather than straight to the client: see the note there for what a second
+   * answer used to cost.
    */
   private async handleCallback(query: TgCallbackQuery): Promise<void> {
     const chat: TgChat | undefined = query.message?.chat;
@@ -420,10 +838,19 @@ export class SessionManager {
     // keeps working instead of being orphaned.
     if (session.panelId === null && query.message) session.panelId = query.message.message_id;
 
-    // Refresh answers its own callback, because it needs to report a debounce.
-    if (parsed.action !== "refresh") await this.opts.client.answerCallback(query.id);
+    this.pendingAck = query.id;
+    // Refresh answers its own press: it is the one action whose outcome is worth a
+    // toast, and it finishes inside the spinner's window either way.
+    if (parsed.action !== "refresh") await this.ackCallback(session, query.id);
 
-    await this.dispatchAction(session, parsed.action, parsed.value, query.id);
+    try {
+      await this.dispatchAction(session, parsed.action, parsed.value, query.id);
+    } finally {
+      // Whatever happened, the spinner stops. An unanswered press spins for about
+      // thirty seconds and reads as a hang — and a handler that threw is exactly
+      // when the operator most needs the button to stop pretending to work.
+      await this.ackCallback(session, query.id);
+    }
   }
 
   private async dispatchAction(
@@ -465,7 +892,7 @@ export class SessionManager {
         // way typed input is rather than trusted because we authored the button.
         const quantity = Number(value);
         if (!Number.isInteger(quantity) || quantity < 1 || quantity > 1000) {
-          await this.opts.client.answerCallback(queryId, "Invalid quantity.", true);
+          await this.ackCallback(session, queryId, "Invalid quantity.", true);
           return;
         }
         session.draft.quantity = quantity;
@@ -473,7 +900,10 @@ export class SessionManager {
         return;
       }
       case "send":
-        await this.fire(session, "stage");
+        this.launch(session, "stage");
+        return;
+      case "dryrun":
+        this.launch(session, "stage", true);
         return;
       case "fire":
         if (value === "custom") {
@@ -485,7 +915,7 @@ export class SessionManager {
           );
           return;
         }
-        await this.fire(session, value === "now" ? "now" : "stage");
+        this.launch(session, value === "now" ? "now" : "stage");
         return;
       case "refresh":
         await this.refreshPanel(session, "manual", queryId);
@@ -501,11 +931,12 @@ export class SessionManager {
   // ── setup flow ─────────────────────────────────────────────────────────────
 
   private async begin(session: Session, intent: Intent, target: string): Promise<void> {
-    if (session.view === "running") {
+    const busy = beginRefusal(this.running, session.chatId, session.view);
+    if (busy !== null) {
       await this.paint(
         session,
-        `${bold("A run is in progress")}\n${esc("Cancel it before starting another.")}`,
-        [[{ text: "❌ Cancel the run", callback_data: encodeCallback("cancel") }]],
+        `${bold(busy.title)}\n${esc(busy.body)}`,
+        [[{ text: "❌ Cancel", callback_data: encodeCallback("cancel") }]],
       );
       return;
     }
@@ -613,6 +1044,10 @@ export class SessionManager {
         target: draft.target,
         chainKey: draft.chainKey,
         quantity: draft.quantity ?? this.opts.defaults.quantity,
+        // Addresses only. The stage table needs to know whether a configured
+        // SeaDrop signer is a wallet we hold a key for; the keys stay here.
+        walletAddresses: this.opts.wallets.map((w) => w.address),
+        allowlistSource: this.opts.defaults.allowlistSource,
         apiKey: this.opts.defaults.openseaApiKey,
         maxFeeGwei: this.opts.defaults.maxFeeGwei,
         priorityGwei: this.opts.defaults.priorityGwei,
@@ -645,10 +1080,9 @@ export class SessionManager {
     }
 
     draft.run = run;
-    draft.preparedAt = Date.now();
 
     if (draft.intent === "watch") {
-      await this.watch(session);
+      this.launchWatch(session);
       return;
     }
     if (draft.intent === "stages") {
@@ -735,7 +1169,7 @@ export class SessionManager {
         .join("\n"),
     );
 
-    blocks.push(renderStages(run.stages, run.chain, formatLocal, nowMs));
+    blocks.push(renderStages(run.stages, run.chain, formatLocal, nowMs, this.stageCtx(run)));
 
     if (!run.plan) {
       blocks.push(
@@ -784,7 +1218,7 @@ export class SessionManager {
       head,
       esc(`${run.chain.name} · ${shortAddress(run.contract)}`),
       "",
-      renderStages(run.stages, run.chain, formatLocal, nowMs),
+      renderStages(run.stages, run.chain, formatLocal, nowMs, this.stageCtx(run)),
       "",
       updatedFooter(nowMs),
     ].join("\n");
@@ -812,17 +1246,18 @@ export class SessionManager {
 
     if (!session.gate.allows(source, nowMs)) {
       if (queryId) {
-        await this.opts.client.answerCallback(
-          queryId,
-          debouncedToast(session.gate.waitMs(source, nowMs)),
-        );
+        await this.ackCallback(session, queryId, debouncedToast(session.gate.waitMs(source, nowMs)));
       }
       return;
     }
-    if (queryId) await this.opts.client.answerCallback(queryId, "Refreshing…");
+    // Deliberately no "Refreshing…" here. It answered the press, which meant the
+    // failure toast below was rejected as a duplicate and the operator saw a
+    // refresh that reported success and changed nothing. The spinner runs for the
+    // second or two the re-read takes, which is what a spinner is for.
 
     const run = session.draft.run;
-    if (!run || (session.view !== "check" && session.view !== "stages")) {
+    const startedView = session.view;
+    if (!run || (startedView !== "check" && startedView !== "stages")) {
       this.stopAuto(session);
       return;
     }
@@ -842,17 +1277,39 @@ export class SessionManager {
       // tearing down a countdown someone is watching because one RPC call timed
       // out is worse than showing slightly stale numbers.
       const message = redactKeys(err instanceof Error ? err.message : String(err));
-      await this.opts.client
-        .answerCallback(queryId ?? "", `Refresh failed: ${message.slice(0, 150)}`)
-        .catch(() => {});
+      session.refreshFailures = (session.refreshFailures ?? 0) + 1;
+      const report = planRefreshReport(queryId, session.refreshFailures);
+      if (report.toast) {
+        await this.ackCallback(
+          session,
+          queryId ?? "",
+          `Refresh failed: ${message.slice(0, 150)}`,
+        ).catch(() => {});
+      }
+      if (report.announce) {
+        await this.say(
+          session.chatId,
+          `${bold("Panel is stale")}\n${esc(
+            `The last ${REFRESH_ALERT_AFTER} refreshes failed, so the numbers above are not current: ${message.slice(0, 200)}`,
+          )}`,
+        ).catch(() => {});
+      }
       return;
     }
 
+    // The reads worked, whatever happens to the result below.
+    session.refreshFailures = 0;
+
+    const balances = startedView === "check" ? await this.readBalances(fresh) : undefined;
+
+    // Re-checked after the reads, not only before them. Discarding `fresh` costs
+    // nothing: `refreshRun` reuses the same provider, so there is no handle here
+    // to close and nothing to leak.
+    if (!refreshStillApplies(startedView, session.view, run, session.draft.run)) return;
+
     // The provider is shared, so the old run must not be closed here.
     session.draft.run = fresh;
-    if (session.view === "check") {
-      session.draft.balances = await this.readBalances(fresh);
-    }
+    if (balances !== undefined) session.draft.balances = balances;
 
     // A stage that opens or closes changes what the buttons should mean, so auto
     // mode stops and hands control back rather than continuing to tick.
@@ -862,7 +1319,7 @@ export class SessionManager {
     if (transitioned) this.stopAuto(session);
 
     const text =
-      session.view === "check" ? this.renderCheck(session, fresh) : this.renderStagesPanel(fresh);
+      startedView === "check" ? this.renderCheck(session, fresh) : this.renderStagesPanel(fresh);
     const body = transitioned
       ? `${text}\n\n${bold("A stage just changed — auto-refresh stopped.")}`
       : text;
@@ -879,7 +1336,8 @@ export class SessionManager {
    */
   private async toggleAuto(session: Session, on: boolean, queryId: string): Promise<void> {
     if (session.view !== "check" && session.view !== "stages") {
-      await this.opts.client.answerCallback(
+      await this.ackCallback(
+        session,
         queryId,
         "Auto-refresh only applies to a Check or Stages panel.",
         true,
@@ -981,6 +1439,7 @@ export class SessionManager {
         { text: "❌ Cancel", callback_data: encodeCallback("cancel") },
       ],
     ];
+    buttons.push([dryRunButton()]);
     if (!open) {
       buttons.push([
         { text: "⚡ Fire now anyway", callback_data: encodeCallback("fire", "now") },
@@ -991,7 +1450,69 @@ export class SessionManager {
     await this.paint(session, blocks.join("\n\n"), buttons);
   }
 
-  private async fire(session: Session, mode: "stage" | "now" | { atMs: number }): Promise<void> {
+  /**
+   * Start a run without holding up the update loop.
+   *
+   * `fire` is deliberately not awaited. A mint can sit in its countdown for hours,
+   * and awaiting it here meant `handleUpdate` never returned — so the bot made no
+   * further `getUpdates` call for the whole run, and the ❌ Cancel tap the run's own
+   * message offers was never delivered. The cancel button was decorative.
+   *
+   * The promise is kept so shutdown can wait for the run to unwind rather than
+   * cutting it off mid-flight.
+   */
+  private launch(
+    session: Session,
+    mode: "stage" | "now" | { atMs: number },
+    dryRun = false,
+  ): void {
+    // A refused start resolves almost immediately. Installing it as `activeRun`
+    // anyway would replace the live run's promise with one that is already done,
+    // so `drain()` would return while the real mint was still signing and
+    // shutdown would cut it off mid-broadcast.
+    const refused = lockRefusal(this.running, session.chatId) !== null;
+    const run = this.fire(session, mode, dryRun)
+      .catch(async (err: unknown) => {
+        // Nothing awaits this promise, so an escape would be an unhandled
+        // rejection — and a bot that dies mid-mint is worse than one that reports
+        // a failure. `fire` handles its own run errors; this catches the paint
+        // and menu calls around them.
+        const message = redactKeys(err instanceof Error ? err.message : String(err));
+        await this.say(session.chatId, `${bold("Run stopped")}\n${esc(message)}`).catch(() => {});
+      })
+      .finally(() => {
+        // Only if it is still ours: a later run may already have replaced it.
+        if (this.activeRun === run) this.activeRun = null;
+      });
+    if (!refused) this.activeRun = run;
+  }
+
+  /**
+   * Start a watch without blocking the update loop.
+   *
+   * `watch` was still awaited inside `handleUpdate`, which is the same defect
+   * detaching `fire` fixed and left on this path: a watch runs until the stage
+   * opens, so the bot stopped reading updates for as long as that took. ❌ Cancel
+   * could not be delivered, because delivering it required the loop that was
+   * waiting on the watch. A watch is read-only and takes no lock.
+   */
+  private launchWatch(session: Session): void {
+    const task = this.watch(session)
+      .catch(async (err: unknown) => {
+        const message = redactKeys(err instanceof Error ? err.message : String(err));
+        await this.say(session.chatId, `${bold("Watch stopped")}\n${esc(message)}`).catch(() => {});
+      })
+      .finally(() => {
+        if (this.activeWatch === task) this.activeWatch = null;
+      });
+    this.activeWatch = task;
+  }
+
+  private async fire(
+    session: Session,
+    mode: "stage" | "now" | { atMs: number },
+    dryRun = false,
+  ): Promise<void> {
     const chatId = session.chatId;
     const run = session.draft.run;
     if (!run?.plan) {
@@ -1002,18 +1523,9 @@ export class SessionManager {
       );
       return;
     }
-    if (this.running !== null && this.running !== chatId) {
-      await this.paint(
-        session,
-        [
-          bold("Another chat is mid-run"),
-          "",
-          esc(
-            "The same wallets are already signing. Two runs would use the same nonces and one would be silently discarded, so this one is not starting.",
-          ),
-        ].join("\n"),
-        MAIN_MENU,
-      );
+    const refusal = lockRefusal(this.running, chatId);
+    if (refusal !== null) {
+      await this.paint(session, [bold(refusal.title), "", esc(refusal.body)].join("\n"), MAIN_MENU);
       return;
     }
 
@@ -1022,10 +1534,12 @@ export class SessionManager {
     // would fight the run reporter for the rate limit.
     this.stopAuto(session);
     this.running = chatId;
+    this.runningTarget = run.contract;
     session.view = "running";
     this.clearExpiry(session);
     const controller = new AbortController();
     session.controller = controller;
+    this.activeController = controller;
 
     const { fireAtMs } = resolveFireTime(run.plan, mode, this.opts.defaults.leadMs);
     // A null fire time means "as soon as everything is signed" — there is no
@@ -1035,17 +1549,21 @@ export class SessionManager {
     await this.paint(
       session,
       [
-        bold("Running"),
+        bold(dryRun ? "Dry run" : "Running"),
         "",
         esc(`${run.chain.name} · ${shortAddress(run.contract)}`),
         esc(`${this.opts.wallets.length} wallet(s) · ${when}`),
         "",
-        esc("Progress is reported below. Cancel stops anything not yet broadcast."),
+        esc(
+          dryRun
+            ? "Every check and every signature will run. Nothing will be broadcast."
+            : "Progress is reported below. Cancel stops anything not yet broadcast.",
+        ),
       ].join("\n"),
       [[{ text: "❌ Cancel", callback_data: encodeCallback("cancel") }]],
     );
 
-    const reporter = createTelegramReporter(this.opts.client, chatId, run.chain);
+    const reporter = createTelegramReporter(this.opts.client, chatId, run.chain, () => this.clock.now());
 
     try {
       const result = await runMint(
@@ -1059,16 +1577,32 @@ export class SessionManager {
           fireAtMs,
           leadMs: this.opts.defaults.leadMs,
           receiptTimeoutMs: this.opts.defaults.receiptTimeoutMs,
+          dryRun,
+          // Enforced here, unlike in the CLI. Nobody is watching a bot run, so
+          // there is no one to read a clock warning and decide it is acceptable.
+          driftLimitMs: this.opts.defaults.clockDriftLimitMs ?? DEFAULT_BOT_DRIFT_LIMIT_MS,
+          target: run.contract,
           signal: controller.signal,
         },
         reporter.handle,
       );
-      await reporter.settle();
+      const landed = await reporter.settle();
 
-      const tail = [
+      // The dry-run report is the entire output, and the reporter has already
+      // sent it. A minted/failed tally underneath would say 0 / 0 and read as a
+      // failure.
+      if (dryRun) {
+        if (!landed) await this.say(chatId, `${bold("Report not delivered")}\n${esc(DRY_PANEL_LOST)}`);
+        return;
+      }
+
+      const tail = [];
+      // Before the outcome, not after: the operator reads the top of a message.
+      if (!landed) tail.push(esc(PANEL_STALE), "");
+      tail.push(
         bold("Summary"),
         esc(`dispatch: ${result.dispatchMs.toFixed(2)}ms to write every transaction`),
-      ];
+      );
       if (result.timingErrorMs !== 0) {
         tail.push(
           esc(
@@ -1079,14 +1613,30 @@ export class SessionManager {
       tail.push(esc(`minted: ${result.minted} · failed: ${result.failed}`));
       await this.say(chatId, tail.join("\n"));
     } catch (err: unknown) {
-      await reporter.settle();
+      const landed = await reporter.settle();
       const message = redactKeys(err instanceof Error ? err.message : String(err));
-      await this.say(chatId, `${bold("Run stopped")}\n${esc(message)}`);
+      const note = landed ? "" : `\n\n${esc(PANEL_STALE)}`;
+      await this.say(chatId, `${bold("Run stopped")}\n${esc(message)}${note}`);
     } finally {
       this.running = null;
-      delete session.controller;
-      this.discardDraft(session);
-      await this.showMenu(session);
+      this.runningTarget = null;
+      this.activeController = null;
+      // Only tear down what this run owned. Now that the run is detached, the
+      // operator can prepare a *new* mint while this one is still in flight —
+      // preparing takes no lock, deliberately. A blanket `discardDraft` would
+      // close that new run's provider and drop its plan, leaving a confirm panel
+      // whose ✅ Send fires against a dead provider. Nothing about that failure
+      // would name the run that caused it.
+      const teardown = planTeardown(
+        { controller: session.controller, draftRun: session.draft.run, view: session.view },
+        { controller, run },
+      );
+      if (teardown.clearController) delete session.controller;
+      if (teardown.discardDraft) this.discardDraft(session);
+      if (teardown.closeOwnRunOnly) closeRun(run);
+      // Do not repaint over a panel the operator has moved on to. The run's
+      // closing summary is a separate message, so it is not lost either way.
+      if (teardown.showMenu) await this.showMenu(session);
     }
   }
 
@@ -1106,9 +1656,11 @@ export class SessionManager {
       return;
     }
 
-    session.view = "running";
+    session.view = "watching";
     const controller = new AbortController();
-    session.controller = controller;
+    // Not `session.controller`: that belongs to a run, and overwriting it left a
+    // live mint with no abort handle at all.
+    session.watchController = controller;
 
     await this.paint(
       session,
@@ -1150,9 +1702,16 @@ export class SessionManager {
         await this.say(chatId, esc(redactKeys(err instanceof Error ? err.message : String(err))));
       }
     } finally {
-      delete session.controller;
-      this.discardDraft(session);
-      await this.showMenu(session);
+      if (session.watchController === controller) delete session.watchController;
+      // The watch is detached now, so the operator may have built a new draft
+      // while it ran. Only discard the one this watch was actually using.
+      if (session.draft.run === run) {
+        this.discardDraft(session);
+      } else {
+        closeRun(run);
+      }
+      // Do not repaint over a panel the operator has moved on to.
+      if (session.view === "watching") await this.showMenu(session);
     }
   }
 
@@ -1181,6 +1740,10 @@ export class SessionManager {
   }
 
   private async showStatus(session: Session): Promise<void> {
+    // Read the view *before* overwriting it. This used to assign "status" first
+    // and then look the new value up, so the lookup could only ever land on the
+    // "status" row — /status answered "Idle." during a live mint.
+    const was = session.view;
     session.view = "status";
     const describe: Record<View, string> = {
       menu: "Idle.",
@@ -1190,13 +1753,16 @@ export class SessionManager {
       awaitTime: "Waiting for a time to fire at.",
       confirm: "Prepared and waiting for confirmation. Nothing has been sent.",
       running: "Running. Cancel to abort.",
+      watching: "Watching for the public stage. Nothing will be sent.",
       check: "Showing a drop.",
       stages: "Showing a drop's stages.",
       wallets: "Showing wallets.",
       status: "Idle.",
     };
 
-    const lines = [bold("📈 Status"), "", esc(describe[session.view])];
+    // The lock is the truth; the view is a display flag any panel can overwrite.
+    const state = this.running === session.chatId ? "Running. Cancel to abort." : describe[was];
+    const lines = [bold("📈 Status"), "", esc(state)];
     const run = session.draft.run;
     if (run) {
       lines.push(esc(`target: ${shortAddress(run.contract)} on ${run.chain.name}`));
@@ -1228,8 +1794,18 @@ export class SessionManager {
     const wasAuto = this.isAuto(session);
     this.stopAuto(session);
 
-    if (session.controller && !session.controller.signal.aborted) {
-      session.controller.abort();
+    // Both handles, not just this chat's. The mint lock is global, so a run
+    // started from a group panel has to be stoppable from the operator's DM —
+    // and HARD CONSTRAINT 6 asks for one button that kills a live mint *and* a
+    // live panel loop, which for this chat may be two different controllers.
+    // Anything reaching here has already passed the authorization check.
+    const live = abortTargets(
+      this.activeController,
+      session.controller,
+      session.watchController,
+    );
+    if (live.length > 0) {
+      for (const controller of live) controller.abort();
       await this.paint(
         session,
         [
@@ -1295,10 +1871,27 @@ export class SessionManager {
     }
   }
 
+  /**
+   * Wait for a detached run to finish unwinding after `shutdown` aborted it.
+   *
+   * Raising the abort is not the same as having stopped: the run still has to
+   * settle its reporter and send its closing line. Exiting the instant the abort
+   * is raised drops that message, and the operator is left with a countdown that
+   * simply went quiet.
+   */
+  async drain(): Promise<void> {
+    await Promise.allSettled([this.activeRun, this.activeWatch]);
+  }
+
   /** Abort everything in flight — used on shutdown. */
   shutdown(): void {
+    // The lock is global, so the handle is too: a run started from one chat used
+    // to survive SIGTERM because shutdown only walked per-session controllers,
+    // and `watch` had overwritten the one it looked at.
+    this.activeController?.abort();
     for (const session of this.sessions.values()) {
       session.controller?.abort();
+      session.watchController?.abort();
       this.clearExpiry(session);
       this.stopAuto(session);
       if (session.draft.run) closeRun(session.draft.run);
@@ -1315,4 +1908,11 @@ export class SessionManager {
  */
 export function stageSignature(run: Pick<PreparedRun, "stages">): string {
   return run.stages.rows.map((row) => `${row.kind}:${row.label}:${row.status}`).join("|");
+}
+
+/** Used only to wait out Telegram's pacing before a panel edit. */
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
 }
