@@ -344,6 +344,70 @@ describe("stageContext", () => {
     detail: "This address is not in the allow-list.",
   });
 
+  const openSeaSaid = (address: string, state: "eligible" | "ineligible" | "unknown") => ({
+    address,
+    state,
+    mechanism: "opensea-signed" as const,
+    detail: `OpenSea ${state}`,
+  });
+
+  describe("two evidence sources in one report", () => {
+    const A = "0x1111111111111111111111111111111111111111";
+    const B = "0x2222222222222222222222222222222222222222";
+
+    it("files each verdict under the mechanism that decided it", () => {
+      const ctx = stageContext(withReport([proven(A), openSeaSaid(B, "eligible")], { merkleRoot: true }), {
+        allowlistMinting: true,
+        openseaApiKey: true,
+      });
+      assert.ok(ctx.eligibility?.["merkle-allowlist"]);
+      assert.ok(ctx.eligibility?.["opensea-signed"]);
+    });
+
+    it("counts each mechanism against its own rows, not the whole report", () => {
+      // One proven wallet and one OpenSea refusal. Summarised together this would
+      // read "1/2 eligible" for both mechanisms, which is true of neither: the
+      // Merkle check proved its only subject, and OpenSea refused its only one.
+      const ctx = stageContext(withReport([proven(A), openSeaSaid(B, "ineligible")], { merkleRoot: true }), {
+        allowlistMinting: true,
+        openseaApiKey: true,
+      });
+      assert.match(String(ctx.eligibility?.["merkle-allowlist"]), /all 1 eligible/);
+      assert.match(String(ctx.eligibility?.["opensea-signed"]), /none of 1 eligible/);
+    });
+
+    it("does not let an OpenSea verdict stand in for a Merkle proof", () => {
+      // The distinction that costs money: OpenSea saying "eligible" is a real
+      // verdict, but it carries no proof, and mintAllowList needs a proof.
+      const ctx = stageContext(withReport([openSeaSaid(A, "eligible")], { merkleRoot: true }), {
+        allowlistMinting: true,
+        openseaApiKey: true,
+      });
+      assert.equal(ctx.fire?.merkleProof, false);
+    });
+
+    it("attaches an allow-list load failure to the allow-list only", () => {
+      const ctx = stageContext(
+        withReport([openSeaSaid(A, "eligible")], { merkleRoot: true }, "ENOENT: ./list.json"),
+        { allowlistMinting: true, openseaApiKey: true },
+      );
+      assert.deepEqual(ctx.eligibilityUnavailable, ["merkle-allowlist"]);
+      assert.match(String(ctx.eligibility?.["merkle-allowlist"]), /unusable/);
+      // OpenSea's answer is unaffected by a file the local check could not read.
+      assert.match(String(ctx.eligibility?.["opensea-signed"]), /eligible/);
+      assert.doesNotMatch(String(ctx.eligibility?.["opensea-signed"]), /unusable/);
+    });
+
+    it("leaves eligibility absent when no check produced a row", () => {
+      const ctx = stageContext(run({ merkleRoot: true }), {
+        allowlistMinting: true,
+        openseaApiKey: true,
+      });
+      assert.equal(ctx.eligibility, undefined);
+      assert.equal(ctx.eligibilityUnavailable, undefined);
+    });
+  });
+
   it("carries the operator's ALLOWLIST_MINTING decision through unchanged", () => {
     assert.equal(
       stageContext(run(), { allowlistMinting: true, openseaApiKey: false }).fire?.allowlistMinting,

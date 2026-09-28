@@ -37,7 +37,7 @@ import { DropStage } from "./opensea";
 import { OpenSeaAuthError, OpenSeaAuthManager } from "./openseaauth";
 import { OpenSeaError, openSeaRequest } from "./opensea";
 import { StageKind, stageKindOf } from "./stages";
-import { EligibilityHint, Failure, classifyOpenSeaFailure } from "./failures";
+import { EligibilityHint, Failure, classifyOpenSeaFailure, localFailure } from "./failures";
 
 /** One stage's terms for one wallet, normalised. */
 export interface WalletStageEligibility {
@@ -341,10 +341,23 @@ export async function tryFetchWalletEligibility(
       };
     }
     if (err instanceof OpenSeaAuthError) {
+      // A statusless auth error never reached OpenSea: it is a verdict on the
+      // configured credential, reached here. Handing it to the HTTP classifier
+      // means handing it status 0, which that function defines as "never reached
+      // the server" and reports as RPC_TIMEOUT — so an expired OPENSEA_WALLET_TOKEN
+      // came back as a network fault: retryable forever, naming nothing the
+      // operator could fix. The error already knows whether a retry can help, so
+      // it decides the code rather than a fabricated status doing it.
+      if (err.status === null) {
+        return {
+          snapshot: null,
+          failure: localFailure(err.retryable ? "AUTH_EXPIRED" : "AUTH_INVALID", err.message),
+        };
+      }
       return {
         snapshot: null,
         failure: classifyOpenSeaFailure(
-          { status: err.status ?? 0, message: err.message },
+          { status: err.status, message: err.message },
           { endpoint: "exchange" },
         ),
       };

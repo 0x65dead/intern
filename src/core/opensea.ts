@@ -197,6 +197,9 @@ export async function openSeaRequest<T>(path: string, opts: RequestOptions = {})
   return (await res.json()) as T;
 }
 
+/** Long enough for any real API message, short enough that an HTML page cannot flood a log. */
+const DETAIL_LIMIT = 300;
+
 /**
  * OpenSea's own description of an error, across the envelopes it uses.
  *
@@ -235,8 +238,15 @@ async function errorDetail(res: Response): Promise<string | null> {
     message = text.replace(/\s+/g, " ").trim();
   }
   if (message === null) return null;
-  // An error body can echo what was sent, and what was sent includes a token.
-  return redactKeys(message.slice(0, 300));
+  // Redact first, truncate second, and never the other way round. An error body
+  // can echo the request that caused it, and that request carries a token; both
+  // mechanisms that would catch it match a whole value — `redactLiterals` tests
+  // `includes(secret)`, and the JWT pattern needs all three segments. Slicing
+  // first turns a credential that straddles the cut into a prefix that matches
+  // neither, so the truncation itself is what defeats the redaction and the
+  // leading characters of a live token reach the log.
+  const safe = redactKeys(message);
+  return safe.length <= DETAIL_LIMIT ? safe : `${safe.slice(0, DETAIL_LIMIT)}…`;
 }
 
 /** The pre-existing internal spelling, kept so this file reads unchanged below. */

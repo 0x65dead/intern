@@ -81,8 +81,15 @@ export interface WalletToken {
 export interface OpenSeaAuthOptions {
   /** Identifies the integration. Sent as `x-api-key` on wallet-scoped calls. */
   apiKey: string;
-  /** The durable credential from OpenSea developer settings. Exchanged, never sent. */
-  scopedToken: string;
+  /**
+   * The durable credential from OpenSea developer settings. Exchanged, never sent.
+   *
+   * Optional because the rule below is "one of the two", and a caller holding an
+   * already-issued wallet token has nothing to exchange. Omitting it is the same
+   * as passing an empty string; omitting BOTH credentials raises the domain error
+   * that names them, rather than a TypeError from this field.
+   */
+  scopedToken?: string | null;
   /**
    * A wallet access token already issued to this wallet, used as-is.
    *
@@ -228,7 +235,7 @@ export class OpenSeaAuthManager {
 
   constructor(opts: OpenSeaAuthOptions) {
     this.apiKey = opts.apiKey.trim();
-    this.scopedToken = opts.scopedToken.trim();
+    this.scopedToken = opts.scopedToken?.trim() ?? "";
     this.now = opts.now ?? Date.now;
     this.refreshSkewMs = Math.max(0, opts.refreshSkewMs ?? DEFAULT_REFRESH_SKEW_MS);
 
@@ -274,7 +281,7 @@ export class OpenSeaAuthManager {
     const existing = this.inFlight;
     if (existing !== null) return existing;
 
-    const attempt = this.exchange(opts.signal)
+    const attempt = this.exchange(opts.signal, opts.force === true)
       .then((token) => {
         this.cached = token;
         this.lastError = null;
@@ -296,14 +303,33 @@ export class OpenSeaAuthManager {
    * a retry could conceivably help, because the caller's correct behaviour differs
    * completely between the two and the HTTP status is the only thing that knows.
    */
-  private async exchange(signal?: AbortSignal): Promise<WalletToken> {
+  private async exchange(signal?: AbortSignal, forced = false): Promise<WalletToken> {
     const startedAt = this.now();
 
     // Already holding what the exchange would have produced. Its expiry is read
     // the same way and it refreshes the same way — which, for a token nobody can
     // re-issue without the operator, means it expires and says so rather than
     // silently going stale.
-    if (this.walletToken !== null) {
+    // A forced refresh means OpenSea has just rejected what we sent. Re-offering
+    // the identical string would replay the refused request byte for byte: two
+    // guaranteed 401s per attempt, and — because the eligibility 401 is scored
+    // retryable on the assumption that a refresh produces something new — an
+    // invitation to the scheduler to do it again, forever, during the minute the
+    // rate limit matters most. A fixed token cannot be re-issued here, so either
+    // escalate to the exchange (a genuinely different credential) or say plainly
+    // that this credential is the problem.
+    if (this.walletToken !== null && forced && this.scopedToken === "") {
+      this.lastError = "the supplied wallet token was rejected";
+      throw new OpenSeaAuthError(
+        "OPENSEA_WALLET_TOKEN was rejected by OpenSea and cannot be refreshed. " +
+          "Wallet access tokens are short-lived: issue a new one, or unset it to " +
+          "use the scoped-token exchange.",
+        null,
+        false,
+      );
+    }
+
+    if (this.walletToken !== null && !forced) {
       const claimed = readJwtExpiryMs(this.walletToken);
       if (claimed !== null && claimed <= startedAt) {
         this.lastError = "the supplied wallet token has expired";

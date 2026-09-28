@@ -35,6 +35,8 @@ import {
   tryFetchWalletEligibility,
 } from "../src/core/openseaeligibility";
 import { OpenSeaAuthManager } from "../src/core/openseaauth";
+import { openSeaEligibilityRows } from "../src/core/eligibility";
+import { localFailure } from "../src/core/failures";
 
 const NOW = 1_773_576_000_000;
 const HOUR = 3_600_000;
@@ -76,30 +78,36 @@ function schedule(): DropStage[] {
 }
 
 /** The verified live response: eligible for all three, two free, one priced. */
-function liveResponse(): object {
+/**
+ * @param over  Applied to every stage, so a test can change one term without
+ *              restating a three-stage payload. Keys are the raw snake_case
+ *              spellings the API actually sends.
+ */
+function liveResponse(over: Record<string, unknown> = {}): object {
+  const stage = (base: Record<string, unknown>) => ({ ...base, ...over });
   return {
     stages: [
-      {
+      stage({
         stage_uuid: UUID_GTD,
         is_eligible: true,
         price: "0",
         max_total_mintable_by_wallet: "1",
         max_total_mintable_by_wallet_per_token: null,
-      },
-      {
+      }),
+      stage({
         stage_uuid: UUID_FCFS,
         is_eligible: true,
         price: "0",
         max_total_mintable_by_wallet: "2",
         max_total_mintable_by_wallet_per_token: null,
-      },
-      {
+      }),
+      stage({
         stage_uuid: UUID_PUBLIC,
         is_eligible: true,
         price: "1000000000000000",
         max_total_mintable_by_wallet: "5",
         max_total_mintable_by_wallet_per_token: null,
-      },
+      }),
     ],
   };
 }
@@ -747,5 +755,180 @@ describe("hintForStage — who the answer is about", () => {
     // null is "no limit stated"; 0 is "a stated limit of zero". The classifier
     // reads them differently, so collapsing them invents a limit.
     assert.equal(hint.hint.maxMintable, null);
+  });
+});
+
+describe("openSeaEligibilityRows — one token answers for one wallet", () => {
+  // The table row is where an attribution mistake becomes visible to the
+  // operator, so this is the last place it can be caught. The invariant under
+  // test throughout: a wallet the token does not cover is `unknown`, never the
+  // answered wallet's verdict copied across. Two wallets on the same drop
+  // routinely have different allowances, and a borrowed "eligible" is how a run
+  // fires with a wallet that was never on the list.
+  const OTHER = "0x2222222222222222222222222222222222222222";
+  const THIRD = "0x3333333333333333333333333333333333333333";
+  const publicStage = () => schedule()[2]!;
+
+  it("gives the answered wallet a verdict and says so in its own terms", () => {
+    const rows = openSeaEligibilityRows(parse(liveResponse()), publicStage(), [WALLET]);
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0]!.address, WALLET);
+    assert.equal(rows[0]!.state, "eligible");
+    assert.equal(rows[0]!.mechanism, "opensea-signed");
+    assert.match(rows[0]!.detail, /confirms/);
+  });
+
+  it("leaves every other loaded wallet unknown, not eligible", () => {
+    const rows = openSeaEligibilityRows(parse(liveResponse()), publicStage(), [WALLET, OTHER, THIRD]);
+    assert.equal(rows.length, 3);
+    const byAddress = new Map(rows.map((r) => [r.address, r]));
+    assert.equal(byAddress.get(WALLET)!.state, "eligible");
+    for (const addr of [OTHER, THIRD]) {
+      assert.equal(byAddress.get(addr)!.state, "unknown", addr);
+      assert.match(byAddress.get(addr)!.detail, /one wallet only/);
+    }
+  });
+
+  it("carries a refusal through as ineligible rather than unknown", () => {
+    // A stated "no" and an unanswered question are different facts. Collapsing
+    // them either hides a refusal or invents one.
+    const snap = parse(liveResponse({ is_eligible: false }));
+    const rows = openSeaEligibilityRows(snap, publicStage(), [WALLET]);
+    assert.equal(rows[0]!.state, "ineligible");
+    assert.match(rows[0]!.detail, /refuses/);
+  });
+
+  it("keeps a free stage distinguishable from an unpriced one", () => {
+    const free = openSeaEligibilityRows(parse(liveResponse()), schedule()[0]!, [WALLET]);
+    assert.match(free[0]!.detail, /free/);
+    const unpriced = openSeaEligibilityRows(
+      parse(liveResponse({ price: null })),
+      schedule()[0]!,
+      [WALLET],
+    );
+    assert.doesNotMatch(unpriced[0]!.detail, /free/);
+    assert.doesNotMatch(unpriced[0]!.detail, /wei/);
+  });
+
+  it("states an allowance only when OpenSea stated one", () => {
+    const stated = openSeaEligibilityRows(parse(liveResponse()), publicStage(), [WALLET]);
+    assert.match(stated[0]!.detail, /up to 5/);
+    const unstated = openSeaEligibilityRows(
+      parse(liveResponse({ max_total_mintable_by_wallet: null })),
+      publicStage(),
+      [WALLET],
+    );
+    assert.doesNotMatch(unstated[0]!.detail, /up to/);
+  });
+
+  it("refuses to attribute an answer about an address the run does not hold", () => {
+    const rows = openSeaEligibilityRows(
+      parse(liveResponse(), { wallet: OTHER }),
+      publicStage(),
+      [WALLET],
+    );
+    assert.equal(rows[0]!.state, "unknown");
+    assert.match(rows[0]!.detail, /not one of the loaded wallets/);
+    // And it names the address, so the operator can see which token they have.
+    assert.match(rows[0]!.detail, new RegExp(OTHER, "i"));
+  });
+
+  it("refuses to guess when the answer names nobody and several wallets are loaded", () => {
+    const rows = openSeaEligibilityRows(
+      parse(liveResponse(), { wallet: "" }),
+      publicStage(),
+      [WALLET, OTHER],
+    );
+    assert.equal(rows.length, 2);
+    for (const row of rows) {
+      assert.equal(row.state, "unknown");
+      assert.match(row.detail, /cannot be attributed/);
+    }
+  });
+
+  it("takes the single loaded wallet when the answer names nobody", () => {
+    // The ordinary case: the token implies its own wallet, and there is only one
+    // candidate, so there is nothing to disambiguate.
+    const rows = openSeaEligibilityRows(parse(liveResponse(), { wallet: "" }), publicStage(), [WALLET]);
+    assert.equal(rows[0]!.state, "eligible");
+  });
+
+  it("says the stage was not answered for rather than answering about another", () => {
+    const snap = parse(liveResponse());
+    const unlisted: DropStage = { ...publicStage(), uuid: "8f2a1c40-0000-4000-8000-00000000ffff" };
+    const rows = openSeaEligibilityRows(snap, unlisted, [WALLET]);
+    assert.equal(rows[0]!.state, "unknown");
+    assert.match(rows[0]!.detail, /none of them this one/);
+  });
+
+  it("says so plainly when there is no gated stage to ask about", () => {
+    const rows = openSeaEligibilityRows(parse(liveResponse()), null, [WALLET]);
+    assert.equal(rows[0]!.state, "unknown");
+    assert.match(rows[0]!.detail, /No gated stage/);
+  });
+
+  it("returns nothing at all when no wallets are loaded", () => {
+    // Not one unknown row with no address attached: there is no subject, so
+    // there is no row, and the table shows the question as never asked.
+    assert.deepEqual(openSeaEligibilityRows(parse(liveResponse()), publicStage(), []), []);
+  });
+
+  it("matches wallets case-insensitively", () => {
+    const rows = openSeaEligibilityRows(
+      parse(liveResponse(), { wallet: WALLET.toLowerCase() }),
+      publicStage(),
+      [WALLET.toUpperCase()],
+    );
+    assert.equal(rows[0]!.state, "eligible");
+    // The address is echoed as the operator supplied it, not as OpenSea spelled it.
+    assert.equal(rows[0]!.address, WALLET.toUpperCase());
+  });
+
+  it("flags a stage whose type could not be confirmed against the schedule", () => {
+    // OpenSea's terms are still trustworthy — they came from OpenSea — but the
+    // label and type could not be checked against the schedule, so the row says
+    // so instead of presenting an inferred type as a confirmed one.
+    const snap = parse(liveResponse(), { stages: [] });
+    const rows = openSeaEligibilityRows(snap, publicStage(), [WALLET]);
+    assert.equal(rows[0]!.state, "eligible");
+    assert.match(rows[0]!.detail, /unconfirmed/);
+  });
+});
+
+describe("tryFetchWalletEligibility — a credential verdict is not a network fault", () => {
+  // An OpenSeaAuthError raised locally carries no HTTP status, and status 0 is
+  // this codebase's "never reached the server". Routing one through the HTTP
+  // classifier therefore produced RPC_TIMEOUT: a retryable network code, with a
+  // message about the upstream being slow, for a token the operator has to
+  // replace by hand. The operator reads "did not respond in time" and waits.
+  const EXPIRED_JWT = `${Buffer.from(JSON.stringify({ alg: "none" })).toString("base64url")}.${Buffer.from(
+    JSON.stringify({ exp: Math.floor(NOW / 1000) - 60 }),
+  ).toString("base64url")}.sig`;
+
+  it("reports an expired wallet token as a credential problem, not as RPC_TIMEOUT", async () => {
+    const auth = new OpenSeaAuthManager({
+      apiKey: "api-key-value-0123456789",
+      walletToken: EXPIRED_JWT,
+      now: () => NOW,
+    });
+
+    const { snapshot, failure } = await tryFetchWalletEligibility({ slug: SLUG, auth });
+
+    assert.equal(snapshot, null);
+    assert.ok(failure !== null);
+    assert.notEqual(failure.code, "RPC_TIMEOUT", "a local verdict never reached the network");
+    assert.equal(failure.code, "AUTH_INVALID");
+    assert.equal(failure.retryable, false, "waiting cannot re-issue a token");
+    assert.match(failure.message, /OPENSEA_WALLET_TOKEN/, "it names the credential to replace");
+  });
+
+  it("keeps the operator pointed at whichever credential they configured", () => {
+    // AUTH_INVALID used to be phrased as a verdict on the scoped token alone,
+    // which sends someone running on OPENSEA_WALLET_TOKEN to rotate a variable
+    // that is not even set.
+    const failure = localFailure("AUTH_INVALID");
+    assert.match(failure.message, /OPENSEA_WALLET_TOKEN/);
+    assert.match(failure.message, /OPENSEA_SCOPED_TOKEN/);
+    assert.match(failure.message, /read:eligibility/);
   });
 });

@@ -406,3 +406,38 @@ describe("failure messages", () => {
     assert.equal(localFailure("UNKNOWN").source, "local");
   });
 });
+
+describe("a transport status is never a verdict on the wallet", () => {
+  // Ported from the deleted `classifyProbe` suite, which swept the status range
+  // to prove that only 403 ever meant "ineligible". That function inferred
+  // eligibility from a mint refusal, which is the architecture this codebase
+  // deliberately left behind: the mint endpoint answers "did this request
+  // succeed", and reading a wallet's standing out of that answer is a guess
+  // dressed as a fact. The invariant survives the function, in a stronger form.
+  const ENDPOINTS: OpenSeaEndpoint[] = ["exchange", "eligibility", "mint", "drop", "collection"];
+
+  it("never reports ELIGIBILITY_FALSE from a status alone, on any endpoint", () => {
+    const leaked: string[] = [];
+    for (const endpoint of ENDPOINTS) {
+      for (let status = 200; status <= 599; status += 1) {
+        const failure = classifyOpenSeaFailure({ status }, { endpoint });
+        if (failure.code === "ELIGIBILITY_FALSE") leaked.push(`${endpoint} ${status}`);
+      }
+    }
+    // ELIGIBILITY_FALSE means the eligibility endpoint said is_eligible=false.
+    // Nothing else may claim it — its own meta calls it terminal for the wallet,
+    // so a status that reached it would end a task on an inference.
+    assert.deepEqual(leaked, [], "only a parsed eligibility answer may say this");
+  });
+
+  it("keeps the inferred refusal distinguishable from the authoritative one", () => {
+    // Both exist on purpose. An operator deciding whether to swap wallets needs
+    // to know whether OpenSea stated the verdict or intern deduced it.
+    assert.notEqual(
+      FAILURE_META.WALLET_NOT_ELIGIBLE.title,
+      FAILURE_META.ELIGIBILITY_FALSE.title,
+    );
+    assert.match(FAILURE_META.ELIGIBILITY_FALSE.title, /OpenSea says/);
+    assert.match(FAILURE_META.WALLET_NOT_ELIGIBLE.title, /at mint time/);
+  });
+});

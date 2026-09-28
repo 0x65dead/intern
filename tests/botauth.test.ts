@@ -76,6 +76,7 @@ function defaults(): Defaults {
     leadMs: 0,
     openseaApiKey: null,
     openseaScopedToken: null,
+    openseaWalletToken: null,
     telegramToken: "test-token",
     telegramAllowedIds: [ALLOWED, ALLOWED_GROUP],
     receiptTimeoutMs: 60_000,

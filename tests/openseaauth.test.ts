@@ -24,7 +24,7 @@ import {
   authManagerFrom,
   readJwtExpiryMs,
 } from "../src/core/openseaauth";
-import { OpenSeaError } from "../src/core/opensea";
+import { OpenSeaError, openSeaRequest } from "../src/core/opensea";
 import { redactKeys } from "../src/core/wallets";
 
 const API_KEY = "test-api-key-abcdef0123456789";
@@ -424,6 +424,32 @@ describe("OpenSeaAuthManager — failure reporting", () => {
       () => new OpenSeaAuthManager({ apiKey: API_KEY, scopedToken: "", walletToken: "wt-abc" }),
     );
   });
+
+  it("treats an absent scoped token like an empty one, rather than crashing", () => {
+    // Passing `scopedToken: ""` and omitting the key are the same intent — "there
+    // is nothing to exchange" — and used to be different outcomes: the empty
+    // string reached the one-of-the-two check, the missing key died on
+    // `undefined.trim()` first. The test above passed throughout, because it
+    // spells the field out. A live probe that did not spell it out is how this
+    // surfaced, so the shape is pinned here in the form that actually broke.
+    assert.doesNotThrow(() => new OpenSeaAuthManager({ apiKey: API_KEY, walletToken: "wt-abc" }));
+  });
+
+  it("names both credentials when neither key is present at all", () => {
+    // The distinction being held: an operator who configured nothing should read
+    // which variables to set. A TypeError about `trim` tells them the tool is
+    // broken, which is both unhelpful and untrue.
+    const err = (() => {
+      try {
+        new OpenSeaAuthManager({ apiKey: API_KEY });
+        return null;
+      } catch (e: unknown) {
+        return e;
+      }
+    })();
+    assert.ok(err instanceof OpenSeaAuthError, "a missing credential is a config error");
+    assert.match(err.message, /OPENSEA_SCOPED_TOKEN or OPENSEA_WALLET_TOKEN/);
+  });
 });
 
 describe("OpenSeaAuthManager — secrecy", () => {
@@ -605,5 +631,68 @@ describe("a wallet token supplied directly", () => {
     assert.match(err.message, /disabled the token exchange/i);
     assert.match(err.message, /OPENSEA_WALLET_TOKEN/);
     assert.doesNotMatch(err.message, /Check OPENSEA_SCOPED_TOKEN is current/);
+  });
+});
+
+describe("OpenSeaAuthManager — a fixed wallet token cannot be refreshed", () => {
+  // The exchange route mints a new JWT on demand, so "refresh and retry" is a
+  // real recovery. OPENSEA_WALLET_TOKEN has no such route: the operator pasted a
+  // string and that string is all there is. Treating the two the same way is how
+  // a rejected token turns into an unbounded retry loop, because every layer
+  // above assumes a forced refresh produces something that was not just refused.
+  const live = jwt({ exp: Math.floor(NOW / 1000) + 3600 });
+
+  it("refuses a forced refresh instead of handing back the same string", async () => {
+    const auth = new OpenSeaAuthManager({ apiKey: API_KEY, walletToken: live, now: () => NOW });
+    const first = await auth.token();
+    assert.equal(first.token, live, "the supplied token is used as-is when it is not refused");
+
+    const err = await auth.token({ force: true }).then(
+      () => null,
+      (e: unknown) => e as OpenSeaAuthError,
+    );
+    assert.ok(err instanceof OpenSeaAuthError, "a forced refresh must not silently succeed");
+    assert.match(err.message, /OPENSEA_WALLET_TOKEN was rejected/);
+    assert.equal(err.retryable, false, "no retry can change a credential nobody can re-issue");
+  });
+
+  it("does not replay the refused request when the 401 arrives mid-call", async () => {
+    // The cost being prevented: withAuth reacts to a 401 by forcing a refresh and
+    // calling again. With the same token back, the second call is a byte-for-byte
+    // repeat of the one OpenSea just refused — pure rate-limit spend at T-0.
+    const calls = stubFetch([{ status: 401, json: { errors: ["Invalid or expired token"] } }]);
+    const auth = new OpenSeaAuthManager({ apiKey: API_KEY, walletToken: live, now: () => NOW });
+
+    await assert.rejects(
+      () =>
+        auth.withAuth((headers) =>
+          openSeaRequest("/drops/x/eligibility", {
+            apiKey: headers.apiKey,
+            bearer: headers.bearer,
+          }),
+        ),
+      /OPENSEA_WALLET_TOKEN was rejected/,
+    );
+    assert.equal(calls.length, 1, "exactly one request reached OpenSea, not a doomed second");
+  });
+
+  it("escalates to the exchange when a scoped token is also configured", async () => {
+    // Both set is not a conflict, it is a fallback: the wallet token is tried
+    // first because it needs no round trip, and a rejection is the moment the
+    // exchange earns its keep. Failing here would throw away a working credential.
+    const minted = jwt({ exp: Math.floor(NOW / 1000) + 7200 });
+    const calls = stubFetch([{ json: { access_token: minted, expires_in: 7200 } }]);
+    const auth = new OpenSeaAuthManager({
+      apiKey: API_KEY,
+      scopedToken: PAT,
+      walletToken: live,
+      now: () => NOW,
+    });
+
+    assert.equal((await auth.token()).token, live);
+    const refreshed = await auth.token({ force: true });
+    assert.equal(refreshed.token, minted, "the exchange supplied a genuinely different token");
+    assert.equal(calls.length, 1, "and it did so by actually exchanging");
+    assert.match(calls[0]?.url ?? "", /\/auth\/tokens\/exchange$/);
   });
 });

@@ -32,7 +32,7 @@ import { shortAddress } from "../core/target";
 import { PRE_ARM_LEAD_MS } from "../core/race";
 import { waitForPublicStage, waitForScheduledStage } from "../core/watcher";
 import { DropStage, fetchDropSchedule, liveStage, nextStage } from "../core/opensea";
-import { authManagerFrom } from "../core/openseaauth";
+import { OpenSeaAuthManager, authManagerFrom } from "../core/openseaauth";
 import { EligibilityHint } from "../core/failures";
 import {
   hintForStage,
@@ -154,6 +154,26 @@ function stageCtx(
     allowlistMinting: defaults.allowlistMinting,
     openseaApiKey: defaults.openseaApiKey !== null,
   });
+}
+
+/**
+ * The eligibility credential, built once per process.
+ *
+ * Built once and shared rather than per call, because the manager's value is the
+ * JWT it holds: a second manager means a second token exchange for the same
+ * answer. Returns null when neither credential is configured, which is a
+ * supported state — the stage table then reports eligibility as unknown, with
+ * the reason, rather than claiming a verdict it has no way to obtain.
+ */
+function eligibilityAuth(
+  defaults: ReturnType<typeof readDefaults>,
+): OpenSeaAuthManager | null {
+  const { manager } = authManagerFrom({
+    apiKey: defaults.openseaApiKey,
+    scopedToken: defaults.openseaScopedToken,
+    walletToken: defaults.openseaWalletToken,
+  });
+  return manager;
 }
 
 async function prepareResolvingChain(opts: PrepareOptions): Promise<PreparedRun> {
@@ -314,6 +334,7 @@ async function cmdCheck(args: CliArgs, defaults: ReturnType<typeof readDefaults>
     quantity,
     walletAddresses: wallets.map((w) => w.address),
     allowlistSource: defaults.allowlistSource,
+    openseaAuth: eligibilityAuth(defaults),
     manualRpcs: args.rpc ?? [],
     apiKey: defaults.openseaApiKey,
     maxFeeGwei: args.maxFeeGwei ?? defaults.maxFeeGwei,
@@ -480,6 +501,7 @@ async function cmdMint(
     quantity: config.quantity,
     walletAddresses: envWallets.map((w) => w.address),
     allowlistSource: defaults.allowlistSource,
+    openseaAuth: eligibilityAuth(defaults),
     manualRpcs: config.manualRpcs,
     apiKey: defaults.openseaApiKey,
     maxFeeGwei: args.maxFeeGwei ?? defaults.maxFeeGwei,
@@ -634,10 +656,22 @@ async function cmdAllowlist(
   const target = requireTarget(args);
   const quantity = args.quantity ?? defaults.quantity;
 
+  // Built here, before the prepare, so the whole command shares one manager and
+  // therefore one token exchange. The prepare uses it for the stage table and
+  // `learnEligibility` reuses it at T-60s off the cached JWT.
+  const { manager: auth, reason: noAuth } = authManagerFrom({
+    apiKey,
+    scopedToken: defaults.openseaScopedToken,
+    walletToken: defaults.openseaWalletToken,
+  });
+
   const run = await prepareResolvingChain({
     target,
     chainKey: args.chain,
     quantity,
+    walletAddresses: wallets.map((w) => w.address),
+    allowlistSource: defaults.allowlistSource,
+    openseaAuth: auth,
     manualRpcs: args.rpc ?? [],
     apiKey,
     maxFeeGwei: args.maxFeeGwei ?? defaults.maxFeeGwei,
@@ -681,11 +715,6 @@ async function cmdAllowlist(
     // one wallet's allowance must never be used to explain another's refusal.
     const eligibility = new Map<string, EligibilityHint>();
     const loaded = new Set(wallets.map((w) => w.address.toLowerCase()));
-    const { manager: auth, reason: noAuth } = authManagerFrom({
-      apiKey,
-      scopedToken: defaults.openseaScopedToken,
-      walletToken: defaults.openseaWalletToken,
-    });
 
     /**
      * Ask OpenSea what the wallet may mint, before the stage opens.

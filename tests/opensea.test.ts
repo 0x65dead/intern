@@ -13,12 +13,14 @@ import { describe, it } from "node:test";
 import { ZeroAddress } from "ethers";
 import {
   DropSchedule,
+  OpenSeaError,
   RawMintTx,
   allowlistInterface,
   fetchDropSchedule,
   isPublicMintCalldata,
   verifyAllowlistTx,
 } from "../src/core/opensea";
+import { registerSecret, resetRedactionRegistry } from "../src/core/wallets";
 
 const SEADROP_V1 = "0x00005EA00Ac477B1030CE78506496e8C2dE24bf5";
 const FEE_RECIPIENT = "0x0000a26b00c1F0DF003000390027140000fAa719";
@@ -330,5 +332,116 @@ describe("fetchDropSchedule — the fields the live payload actually carries", (
     const s = await fetchWith(drop({ ...liveStageBody(), price: 250, max_per_wallet: 2 }));
     assert.equal(s.stages[0]!.priceWei, 250n);
     assert.equal(s.stages[0]!.maxPerWallet, 2);
+  });
+});
+
+describe("error bodies — what OpenSea said, without what we sent", () => {
+  /** Drives the real error path: a non-ok response through fetchDropSchedule. */
+  const failWith = async (
+    status: number,
+    body: string,
+    contentType = "application/json",
+  ): Promise<OpenSeaError> => {
+    const saved = globalThis.fetch;
+    globalThis.fetch = (async () =>
+      new Response(body, { status, headers: { "content-type": contentType } })) as typeof globalThis.fetch;
+    try {
+      await fetchDropSchedule("some-slug", "key");
+      throw new Error("expected a rejection");
+    } catch (err: unknown) {
+      assert.ok(err instanceof OpenSeaError, `not an OpenSeaError: ${String(err)}`);
+      return err;
+    } finally {
+      globalThis.fetch = saved;
+    }
+  };
+
+  it("keeps OpenSea's own words instead of only the canned reason", async () => {
+    const err = await failWith(403, JSON.stringify({ error: { message: "Token exchange is not available" } }));
+    assert.equal(err.detail, "Token exchange is not available");
+    // The message carries both, so a caller that only logs `.message` still sees it.
+    assert.match(err.message, /Token exchange is not available/);
+    assert.match(err.message, /403/);
+  });
+
+  it("reads the envelopes OpenSea actually uses", async () => {
+    for (const body of [
+      { error: { message: "nope" } },
+      { error: "nope" },
+      { errors: ["nope", "second"] },
+      { message: "nope" },
+      { detail: "nope" },
+    ]) {
+      const err = await failWith(422, JSON.stringify(body));
+      assert.equal(err.detail, "nope", JSON.stringify(body));
+    }
+  });
+
+  it("falls back to the raw text when the body is not JSON", async () => {
+    const err = await failWith(502, "<html>\n  <body>Bad   Gateway</body>\n</html>", "text/html");
+    assert.equal(err.detail, "<html> <body>Bad Gateway</body> </html>");
+  });
+
+  it("leaves detail null when there is nothing to add", async () => {
+    for (const [body, type] of [
+      ["", "application/json"],
+      ["   \n  ", "application/json"],
+      [JSON.stringify({ code: 7 }), "application/json"],
+      [JSON.stringify({ error: { code: 7 } }), "application/json"],
+      [JSON.stringify({ message: "   " }), "application/json"],
+    ] as const) {
+      const err = await failWith(500, body, type);
+      assert.equal(err.detail, null, body);
+      // And the message is then exactly the canned reason, with no trailing space.
+      assert.doesNotMatch(err.message, / $/);
+    }
+  });
+
+  it("bounds a body that is a whole web page", async () => {
+    const err = await failWith(502, "x".repeat(5_000), "text/html");
+    assert.ok(err.detail !== null);
+    assert.ok(err.detail.length <= 301, `${err.detail.length} chars`);
+    assert.match(err.detail, /…$/);
+  });
+
+  it("redacts a credential the error body echoed back", async () => {
+    resetRedactionRegistry();
+    const pat = "os_pat_9f3c1d2b4a5e6f708192a3b4c5d6e7f8";
+    registerSecret(pat);
+    try {
+      const err = await failWith(400, JSON.stringify({ error: { message: `Invalid subjectToken: ${pat}` } }));
+      assert.ok(err.detail !== null);
+      assert.doesNotMatch(err.detail, /9f3c1d2b/);
+      assert.match(err.detail, /⟨redacted-credential⟩/);
+    } finally {
+      resetRedactionRegistry();
+    }
+  });
+
+  it("redacts a credential that would have straddled the truncation point", async () => {
+    // The ordering bug this guards: slicing to 300 chars before redacting leaves a
+    // prefix that `includes(secret)` no longer matches, so the first characters of
+    // a live token survive a function whose entire purpose is that they do not.
+    resetRedactionRegistry();
+    const pat = "os_pat_9f3c1d2b4a5e6f708192a3b4c5d6e7f8";
+    registerSecret(pat);
+    try {
+      const err = await failWith(
+        400,
+        JSON.stringify({ error: { message: `${"pad ".repeat(72)}${pat} rejected` } }),
+      );
+      assert.ok(err.detail !== null);
+      assert.doesNotMatch(err.detail, /os_pat_/);
+      assert.doesNotMatch(err.detail, /9f3c1d2b/);
+    } finally {
+      resetRedactionRegistry();
+    }
+  });
+
+  it("redacts a bearer token echoed by a shape pattern, not a registration", async () => {
+    const jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIweGFiYyIsImV4cCI6MTk5OTk5OTk5OX0.c2lnbmF0dXJl";
+    const err = await failWith(401, JSON.stringify({ error: { message: `bad token: ${jwt}` } }));
+    assert.ok(err.detail !== null);
+    assert.doesNotMatch(err.detail, /eyJ/);
   });
 });

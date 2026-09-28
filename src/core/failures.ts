@@ -96,10 +96,16 @@ export const FAILURE_META: Record<FailureCode, FailureMeta> = {
     remedy: "",
   },
   AUTH_INVALID: {
-    title: "OpenSea rejected the scoped token",
+    // Names both doors, because there are two and only the operator knows which
+    // one they configured. Telling someone running on OPENSEA_WALLET_TOKEN to go
+    // and check OPENSEA_SCOPED_TOKEN is the same wild goose chase this chain was
+    // rebuilt to escape — a rotation of a credential that was never in play.
+    title: "OpenSea rejected the eligibility credential",
     retryable: false,
     terminal: true,
-    remedy: "Check OPENSEA_SCOPED_TOKEN is current and carries the read:eligibility scope.",
+    remedy:
+      "Check OPENSEA_SCOPED_TOKEN — or OPENSEA_WALLET_TOKEN, if that is the one " +
+      "you set — is current and carries the read:eligibility scope.",
   },
   API_KEY_INVALID: {
     title: "OpenSea rejected the API key",

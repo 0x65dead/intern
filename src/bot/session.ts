@@ -47,6 +47,7 @@ import {
   refreshRun,
   stageContext,
 } from "../core/prepare";
+import { OpenSeaAuthManager, authManagerFrom } from "../core/openseaauth";
 import { StageContext } from "../core/stagetable";
 import { Defaults } from "../util/env";
 import { WatchUpdate, waitForPublicStage } from "../core/watcher";
@@ -493,6 +494,17 @@ export class SessionManager {
   /** The contract the live run is firing at, for the heartbeat. null when idle. */
   private runningTarget: string | null = null;
   private readonly clock: CorrectedClock;
+  /**
+   * The eligibility credential, built at most once for the process lifetime.
+   *
+   * `undefined` means not yet built; `null` means built and unavailable. The
+   * distinction matters because the bot is long-lived: rebuilding per prepare
+   * would perform a token exchange every time a panel opens, and re-deriving
+   * "unavailable" on every one of those would be a request per panel for an
+   * answer that cannot change without a restart. The manager holds the JWT and
+   * refreshes it on its own schedule, so one instance is the whole point.
+   */
+  private openseaAuth: OpenSeaAuthManager | null | undefined;
 
   constructor(private readonly opts: SessionManagerOptions) {
     this.clock = opts.clock ?? new CorrectedClock(0);
@@ -509,6 +521,18 @@ export class SessionManager {
    * and `intern check` in a terminal cannot reach different verdicts about
    * whether a stage is fireable.
    */
+  /** Lazily built so a bot with no eligibility credential never tries. */
+  private auth(): OpenSeaAuthManager | null {
+    if (this.openseaAuth === undefined) {
+      this.openseaAuth = authManagerFrom({
+        apiKey: this.opts.defaults.openseaApiKey,
+        scopedToken: this.opts.defaults.openseaScopedToken,
+        walletToken: this.opts.defaults.openseaWalletToken,
+      }).manager;
+    }
+    return this.openseaAuth;
+  }
+
   private stageCtx(run: PreparedRun): StageContext {
     return stageContext(run, {
       allowlistMinting: this.opts.defaults.allowlistMinting,
@@ -1048,6 +1072,7 @@ export class SessionManager {
         // SeaDrop signer is a wallet we hold a key for; the keys stay here.
         walletAddresses: this.opts.wallets.map((w) => w.address),
         allowlistSource: this.opts.defaults.allowlistSource,
+        openseaAuth: this.auth(),
         apiKey: this.opts.defaults.openseaApiKey,
         maxFeeGwei: this.opts.defaults.maxFeeGwei,
         priorityGwei: this.opts.defaults.priorityGwei,
@@ -1266,6 +1291,11 @@ export class SessionManager {
     try {
       fresh = await refreshRun(run, {
         quantity: session.draft.quantity ?? this.opts.defaults.quantity,
+        // Re-asked each refresh: the gated stage being asked about changes as
+        // stages open, so carrying the last answer forward would describe the
+        // wrong stage with full confidence.
+        openseaAuth: this.auth(),
+        walletAddresses: this.opts.wallets.map((w) => w.address),
         apiKey: this.opts.defaults.openseaApiKey,
         maxFeeGwei: this.opts.defaults.maxFeeGwei,
         priorityGwei: this.opts.defaults.priorityGwei,

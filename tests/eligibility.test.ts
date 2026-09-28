@@ -13,7 +13,6 @@ import { AbiCoder, JsonRpcProvider } from "ethers";
 import {
   WalletEligibility,
   checkMerkleEligibility,
-  classifyProbe,
   eligibilityIcon,
   eligibilityLabel,
   summariseEligibility,
@@ -57,69 +56,6 @@ function providerReturning(root: string): JsonRpcProvider {
 }
 
 const ZERO_ROOT = `0x${"00".repeat(32)}`;
-
-describe("classifyProbe", () => {
-  it("treats a signature as eligibility, and says it is momentary", () => {
-    const { state, detail } = classifyProbe(200);
-    assert.equal(state, "eligible");
-    // The tick must not read as a standing entitlement — the signature is bound
-    // to one quantity and salt and expires.
-    assert.match(detail, /right now/i);
-  });
-
-  it("treats 403 as the one true negative", () => {
-    const { state, detail } = classifyProbe(403);
-    assert.equal(state, "ineligible");
-    assert.match(detail, /not eligible/i);
-  });
-
-  it("refuses to call 422 ineligible", () => {
-    // 422 covers four causes, three of which are temporary. Reading it as "not on
-    // the list" tells an operator to stop trying when supply was simply exhausted
-    // for that instant.
-    const { state, detail } = classifyProbe(422);
-    assert.equal(state, "unknown");
-    assert.match(detail, /would be a guess/i);
-  });
-
-  it("does not blame the wallet for our own bad key", () => {
-    const { state, detail } = classifyProbe(401);
-    assert.equal(state, "unknown");
-    assert.match(detail, /says nothing about the wallet/i);
-  });
-
-  it("reports the pre-open 409 as unknown, not as a refusal", () => {
-    const { state, detail } = classifyProbe(409);
-    assert.equal(state, "unknown");
-    assert.match(detail, /before a stage opens/i);
-  });
-
-  it("returns no information for a rate limit", () => {
-    assert.equal(classifyProbe(429).state, "unknown");
-  });
-
-  it("falls back to unknown for a status it has never seen", () => {
-    const { state, detail } = classifyProbe(503);
-    assert.equal(state, "unknown");
-    assert.match(detail, /503/);
-  });
-
-  it("marks exactly one status as ineligible across the whole 2xx-5xx range", () => {
-    // The guard against a future edit quietly widening the negative. Only a 403
-    // means "this wallet cannot mint"; everything else is eligible or unknown.
-    const negatives: number[] = [];
-    for (let status = 200; status <= 599; status += 1) {
-      if (classifyProbe(status).state === "ineligible") negatives.push(status);
-    }
-    assert.deepEqual(negatives, [403]);
-  });
-
-  it("marks nothing outside 2xx as eligible", () => {
-    for (let status = 300; status <= 599; status += 1) {
-      assert.notEqual(classifyProbe(status).state, "eligible", `status ${status}`);
-    }
-  });
-});
 
 describe("checkMerkleEligibility", () => {
   const run = (root: string, addresses: string[], entries = LIST) =>

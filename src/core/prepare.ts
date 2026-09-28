@@ -14,20 +14,28 @@
 import { JsonRpcProvider } from "ethers";
 import { ChainProfile, resolveChain } from "./chains";
 import { MintPlan, buildMintPlan, fetchAllowListRoot, fetchSigners } from "./seadrop";
-import { MechanismEvidence, NO_EVIDENCE } from "./capabilities";
+import { MechanismEvidence, MintMechanism, NO_EVIDENCE } from "./capabilities";
 import { RpcPlan, planRpcs, resolveRpcsForChain, toRpcUrl } from "./rpc";
 import { Detection, detectChain, noCodeMessage } from "./detect";
 import { normalizeAddress, parseTarget } from "./target";
 import {
   CollectionInfo,
   DropSchedule,
+  DropStage,
   OpenSeaError,
   fetchDropSchedule,
   resolveCollection,
 } from "./opensea";
+import { OpenSeaAuthManager } from "./openseaauth";
+import { tryFetchWalletEligibility } from "./openseaeligibility";
 import { StageTable, buildStageTable } from "./stages";
 import { StageContext, firstSentence } from "./stagetable";
-import { WalletEligibility, checkMerkleEligibility, summariseEligibility } from "./eligibility";
+import {
+  WalletEligibility,
+  checkMerkleEligibility,
+  openSeaEligibilityRows,
+  summariseEligibility,
+} from "./eligibility";
 import { loadAllowList } from "./allowlistsource";
 import {
   FeeSnapshot,
@@ -359,6 +367,20 @@ export interface PrepareOptions {
    * than answered "no".
    */
   allowlistSource?: string | null;
+  /**
+   * Authenticated access to OpenSea's wallet eligibility endpoint.
+   *
+   * The manager is passed in rather than built here, and that is the whole
+   * point: it holds the short-lived wallet JWT in memory and refreshes it before
+   * expiry, so one manager shared across a prepare and every subsequent refresh
+   * performs one token exchange instead of one per refresh. Constructing it per
+   * call would re-exchange on a timer.
+   *
+   * null or absent means the eligibility question goes to the table as unknown.
+   * That is a supported state, not a degraded one — it is the only honest answer
+   * available without a wallet-scoped credential.
+   */
+  openseaAuth?: OpenSeaAuthManager | null;
 }
 
 /**
@@ -446,14 +468,31 @@ export async function prepareRun(opts: PrepareOptions): Promise<PreparedRun> {
       opts.walletAddresses ?? [],
     );
 
-    const eligibility = await readEligibility({
-      provider: rpc.provider,
-      contract: resolved.contract,
-      plan,
-      root,
-      addresses: opts.walletAddresses ?? [],
-      source: opts.allowlistSource ?? null,
-    });
+    // Both checks run, and both run concurrently: they answer the same question
+    // from independent evidence — a proof computed against the on-chain root, and
+    // OpenSea's own verdict — and a drop can be gated by either. Running them in
+    // sequence would add a round trip for no reason, since neither reads the
+    // other's result.
+    const [eligibility, openSeaRows] = await Promise.all([
+      readEligibility({
+        provider: rpc.provider,
+        contract: resolved.contract,
+        plan,
+        root,
+        addresses: opts.walletAddresses ?? [],
+        source: opts.allowlistSource ?? null,
+      }),
+      readOpenSeaEligibility({
+        slug: resolved.slug,
+        schedule: scheduleResult.schedule,
+        auth: opts.openseaAuth,
+        addresses: opts.walletAddresses ?? [],
+        nowMs,
+      }),
+    ]);
+    // Combined, not merged into each other: `stageContext` groups by mechanism,
+    // so the two sources stay separately attributable all the way to the table.
+    const combined = withOpenSeaRows(eligibility, openSeaRows);
 
     return {
       chain: resolved.chain,
@@ -468,7 +507,7 @@ export async function prepareRun(opts: PrepareOptions): Promise<PreparedRun> {
       stages,
       evidence,
       signers,
-      eligibility,
+      eligibility: combined,
       ...(resolved.detection ? { detection: resolved.detection } : {}),
     };
   } catch (err) {
@@ -559,6 +598,89 @@ async function readEligibility(opts: {
   }
 }
 
+/**
+ * Replace the OpenSea rows in a report, leaving the local ones untouched.
+ *
+ * Replace rather than append, because this is called again on every refresh and
+ * appending would accumulate one stale row per refresh — each describing whatever
+ * stage was current when it was written. The local allow-list rows are left
+ * alone: they are proofs against an on-chain root that does not move while a
+ * panel is open, and re-deriving them would be an RPC call on a timer.
+ */
+function withOpenSeaRows(
+  report: EligibilityReport,
+  rows: WalletEligibility[],
+): EligibilityReport {
+  return {
+    ...report,
+    results: [...report.results.filter((r) => r.mechanism !== "opensea-signed"), ...rows],
+  };
+}
+
+/**
+ * The gated stage this run would actually fire at, or null if there is none.
+ *
+ * Chosen by the clock, never by position: a gated stage that is open now, else
+ * the soonest one still to come. `schedule.stages` is sorted by start time at
+ * construction, which is what makes "the first one still ahead" the same thing
+ * as "the soonest one".
+ *
+ * Public stages are excluded because they have no eligibility question to ask —
+ * anyone can mint them, and spending a round trip to be told so would be the
+ * only outcome.
+ */
+export function gatedStageToAsk(schedule: DropSchedule, nowMs: number): DropStage | null {
+  const gated = schedule.stages.filter((st) => !st.isPublic);
+  return gated.find((st) => st.startMs <= nowMs && nowMs < st.endMs) ?? gated.find((st) => st.startMs > nowMs) ?? null;
+}
+
+/**
+ * Ask OpenSea whether the loaded wallets can mint the gated stage.
+ *
+ * Always returns rows, never throws, and never blocks anything. Eligibility is
+ * information: it turns a refusal at T-0 into a stated reason beforehand, which
+ * is worth a round trip, but a failure to obtain it is not a reason to withhold
+ * a stage table or to stop a mint. Every failure path therefore ends in rows
+ * that say "unknown" and why, which is a fact the operator can act on, rather
+ * than in a thrown error that loses the rest of the preparation.
+ *
+ * Empty when there is no gated stage or no credential — that is the difference
+ * between "not asked" and "asked and not answered", and the table shows them
+ * differently.
+ */
+async function readOpenSeaEligibility(opts: {
+  slug: string | undefined;
+  schedule: DropSchedule | null;
+  auth: OpenSeaAuthManager | null | undefined;
+  addresses: string[];
+  nowMs: number;
+}): Promise<WalletEligibility[]> {
+  const { slug, schedule, auth, addresses, nowMs } = opts;
+  if (!slug || !schedule || !auth || addresses.length === 0) return [];
+
+  const stage = gatedStageToAsk(schedule, nowMs);
+  if (stage === null) return [];
+
+  const { snapshot, failure } = await tryFetchWalletEligibility({
+    slug,
+    auth,
+    stages: schedule.stages,
+    now: () => nowMs,
+  });
+  if (!snapshot) {
+    // The classifier's message, not a generic one: a 401 on the exchange and a
+    // 429 on the endpoint need different things done about them.
+    const why = failure?.message ?? "the eligibility check did not complete";
+    return addresses.map((address) => ({
+      address,
+      state: "unknown" as const,
+      mechanism: "opensea-signed" as const,
+      detail: redactKeys(why),
+    }));
+  }
+  return openSeaEligibilityRows(snapshot, stage, addresses);
+}
+
 export function closeRun(run: Pick<PreparedRun, "rpc">): void {
   run.rpc.provider.destroy();
 }
@@ -588,6 +710,13 @@ export async function refreshRun(
     priorityGwei?: number | null;
     gasLimit?: bigint;
     nowMs: number;
+    /**
+     * The same manager the prepare used, so the JWT is reused rather than
+     * re-exchanged. Absent means the eligibility rows carry over unchanged.
+     */
+    openseaAuth?: OpenSeaAuthManager | null;
+    /** The addresses to ask about. Absent means carry the existing rows over. */
+    walletAddresses?: string[];
   },
 ): Promise<PreparedRun> {
   const warnings: string[] = [];
@@ -602,6 +731,26 @@ export async function refreshRun(
     loadSchedule(run.slug, opts.apiKey ?? null),
   ]);
   warnings.push(...gasDecision.warnings);
+
+  // Re-asked on every refresh, unlike the allow-list rows, because what it
+  // describes moves: the gated stage being asked about changes as stages open
+  // and close, and a mint already made consumes the allowance the last answer
+  // reported. A stale row here would be a true statement about the wrong stage.
+  // Left exactly as-is when there is no credential or no wallet list, so a
+  // caller that does not pass them loses nothing it had.
+  const refreshedEligibility =
+    opts.openseaAuth && opts.walletAddresses
+      ? withOpenSeaRows(
+          run.eligibility,
+          await readOpenSeaEligibility({
+            slug: run.slug,
+            schedule: scheduleResult.schedule,
+            auth: opts.openseaAuth,
+            addresses: opts.walletAddresses,
+            nowMs: opts.nowMs,
+          }),
+        )
+      : run.eligibility;
 
   const stages = buildStageTable({
     plan,
@@ -623,6 +772,7 @@ export async function refreshRun(
     fees: gasDecision.fees,
     warnings,
     stages,
+    eligibility: refreshedEligibility,
   };
 }
 
@@ -643,21 +793,62 @@ export function stageContext(
   },
 ): StageContext {
   const report = run.eligibility ?? { origin: null, results: [], error: null };
-  const summary = eligibilitySummary(report);
+
+  // Grouped by the mechanism each row was decided under, rather than filed
+  // wholesale under "merkle-allowlist" as this used to do. The report can now
+  // hold rows from two different sources — a local Merkle proof and OpenSea's
+  // own answer — and they are not interchangeable: they are established by
+  // different evidence, they fail independently, and a stage rendered from the
+  // wrong one would cite a proof it does not have. `summariseEligibility` reads
+  // the mechanism off its first row, so a mixed list would have silently
+  // labelled every row with whichever happened to be first.
+  const byMechanism = new Map<MintMechanism, WalletEligibility[]>();
+  for (const row of report.results) {
+    const bucket = byMechanism.get(row.mechanism);
+    if (bucket) bucket.push(row);
+    else byMechanism.set(row.mechanism, [row]);
+  }
+
+  const eligibility: Partial<Record<MintMechanism, string>> = {};
+  for (const [mechanism, rows] of byMechanism) {
+    const summary = summariseEligibility(rows);
+    if (summary) eligibility[mechanism] = summary;
+  }
+
+  // The local allow-list check is the one that can fail as a whole, because it is
+  // the one with a source to load — `report.error` is that failure and nothing
+  // else. So it is summarised through `eligibilitySummary`, which knows a load
+  // failure outranks any verdicts, while every other mechanism is summarised
+  // from its rows alone. Handled after the loop so it overwrites rather than
+  // races with the grouped summary.
+  // Filtered, not the whole report: `eligibilitySummary` summarises every row it
+  // is given, and handing it a mixed list would label OpenSea's verdicts as
+  // allow-list proofs.
+  const merkle = eligibilitySummary({
+    ...report,
+    results: byMechanism.get("merkle-allowlist") ?? [],
+  });
+  if (merkle !== null) eligibility["merkle-allowlist"] = merkle;
+
+  const unavailable: MintMechanism[] = [];
+  if (report.error !== null) unavailable.push("merkle-allowlist");
+
   return {
     fire: {
       allowlistMinting: opts.allowlistMinting,
       openseaApiKey: opts.openseaApiKey,
       // Derived, never asserted by the caller. A proof exists when a wallet was
       // actually proven against the on-chain root — the one fact that turns a
-      // Merkle stage from unreachable into fireable.
+      // Merkle stage from unreachable into fireable. Deliberately still keyed on
+      // `proof`, not on state: an OpenSea "eligible" row is a real verdict but it
+      // carries no proof, and it must not unlock the Merkle path.
       merkleProof: report.results.some((r) => r.state === "eligible" && r.proof !== undefined),
     },
     evidence: run.evidence,
-    ...(summary ? { eligibility: { "merkle-allowlist": summary } } : {}),
+    ...(Object.keys(eligibility).length > 0 ? { eligibility } : {}),
     // A configured list that did not load is not the same as no list, and the
     // table must not let the two read alike.
-    ...(report.error !== null ? { eligibilityUnavailable: ["merkle-allowlist" as const] } : {}),
+    ...(unavailable.length > 0 ? { eligibilityUnavailable: unavailable } : {}),
   };
 }
 

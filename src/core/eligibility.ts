@@ -26,8 +26,9 @@
 import { JsonRpcProvider, getAddress } from "ethers";
 import { MintMechanism } from "./capabilities";
 import { AllowListEntry, MintParams, checkEligibility } from "./merkle";
-import { OpenSeaError, requestMintTx } from "./opensea";
 import { SeaDropVariant, fetchAllowListRoot, fetchSigners } from "./seadrop";
+import { DropStage } from "./opensea";
+import { EligibilitySnapshot, hintForStage } from "./openseaeligibility";
 
 export type EligibilityState = "eligible" | "ineligible" | "unknown";
 
@@ -145,124 +146,6 @@ export async function detectLocalSigner(
   return signers.find((s) => held.has(s)) ?? null;
 }
 
-// ── Path B: the OpenSea probe ───────────────────────────────────────────────
-
-/**
- * What a probe's HTTP status actually tells us.
- *
- * Pure, and separated from the request for exactly that reason: this is the
- * judgement call in the signed path, and it is the thing most likely to be got
- * wrong in a way that shows a green tick to someone who is not on the list.
- *
- * The rules:
- *   200/201  — a signature was issued. Eligible, *at this instant*.
- *   401      — our API key is bad. Says nothing about the wallet.
- *   403      — refused for this minter. Final, and the one true negative.
- *   404      — no such drop, or no mintable stage. Not a wallet verdict.
- *   409      — the drop is not currently mintable. Expected before the open.
- *   422      — ambiguous by design: not-on-list, cap reached, sold out and
- *              insufficient balance all land here. Never reported as ineligible.
- *   429      — rate limited. No information at all.
- */
-export function classifyProbe(status: number): { state: EligibilityState; detail: string } {
-  if (status >= 200 && status < 300) {
-    return {
-      state: "eligible",
-      detail:
-        "OpenSea issued a signature for this wallet. Note this is a fact about " +
-        "right now: the signature is bound to one quantity and salt and is not " +
-        "a standing entitlement.",
-    };
-  }
-  switch (status) {
-    case 401:
-      return {
-        state: "unknown",
-        detail: "OpenSea rejected the API key (401). This says nothing about the wallet.",
-      };
-    case 403:
-      return {
-        state: "ineligible",
-        detail: "OpenSea refused to mint for this wallet (403) — it is not eligible for this stage.",
-      };
-    case 404:
-      return {
-        state: "unknown",
-        detail: "OpenSea has no mintable stage for this drop (404). Not a verdict on the wallet.",
-      };
-    case 409:
-      return {
-        state: "unknown",
-        detail:
-          "The drop is not currently mintable (409). Expected before a stage opens — " +
-          "eligibility cannot be established until then.",
-      };
-    case 422:
-      return {
-        state: "unknown",
-        detail:
-          "OpenSea returned 422, which covers not-on-the-allowlist, per-wallet limit " +
-          "reached, sold out and insufficient balance with no way to tell them apart. " +
-          "Reporting this as 'not eligible' would be a guess.",
-      };
-    case 429:
-      return {
-        state: "unknown",
-        detail: "Rate limited by OpenSea (429). No eligibility information was returned.",
-      };
-    default:
-      return {
-        state: "unknown",
-        detail: `OpenSea returned HTTP ${status}. No eligibility information was returned.`,
-      };
-  }
-}
-
-export interface ProbeOptions {
-  slug: string;
-  apiKey: string;
-  addresses: string[];
-  quantity: number;
-}
-
-/**
- * Best-effort eligibility probe for the OpenSea-signed path.
- *
- * Best-effort is meant literally: before the stage opens this returns `unknown`
- * for every wallet, because that is the true answer. It is run anyway because a
- * 403 is worth knowing hours early — it is the difference between an operator who
- * discovers at T-0 that they were never on the list and one who does not.
- *
- * Probes run sequentially. Firing the whole wallet set at OpenSea at once is the
- * reliable way to earn a 429, which costs the information the probe was for.
- */
-export async function probeOpenSeaEligibility(
-  opts: ProbeOptions,
-): Promise<WalletEligibility[]> {
-  const results: WalletEligibility[] = [];
-  for (const address of opts.addresses) {
-    const addr = getAddress(address);
-    try {
-      await requestMintTx(opts.slug, opts.apiKey, addr, opts.quantity);
-      const { state, detail } = classifyProbe(200);
-      results.push({ address: addr, state, detail, mechanism: "opensea-signed" });
-    } catch (err: unknown) {
-      if (err instanceof OpenSeaError) {
-        const { state, detail } = classifyProbe(err.status);
-        results.push({ address: addr, state, detail, mechanism: "opensea-signed" });
-      } else {
-        results.push({
-          address: addr,
-          state: "unknown",
-          mechanism: "opensea-signed",
-          detail: `Could not reach OpenSea: ${err instanceof Error ? err.message : String(err)}`,
-        });
-      }
-    }
-  }
-  return results;
-}
-
 /**
  * Summarise a wallet set into one line for the stage table.
  *
@@ -270,6 +153,92 @@ export async function probeOpenSeaEligibility(
  * and rounding it to "eligible" because one wallet can mint hides that four
  * cannot.
  */
+// ── Path B: OpenSea answers for the wallet its token was issued to ──────────
+
+/**
+ * Turn an eligibility snapshot into table rows, one per loaded wallet.
+ *
+ * This is the honest replacement for inferring eligibility from a mint refusal.
+ * The difference that matters is not the transport but the timing: OpenSea will
+ * answer this before the stage opens, whereas a refusal only exists after it has
+ * opened and the chance to act on the answer has already gone.
+ *
+ * The rule that shapes the output: a scoped token is bound to ONE wallet, so a
+ * snapshot can only ever speak about one of the addresses loaded here. That
+ * wallet gets a verdict; every other wallet gets `unknown` with the reason — not
+ * the answered wallet's verdict copied across. Two wallets on the same drop
+ * routinely differ, and one wallet's "yes" standing in for another's is the most
+ * expensive mistake available in this file.
+ *
+ * Attribution is delegated to `hintForStage` rather than redone here, because
+ * deciding who an answer is about has three distinct failure modes and they are
+ * already enumerated and tested there.
+ */
+export function openSeaEligibilityRows(
+  snapshot: EligibilitySnapshot,
+  stage: DropStage | null,
+  addresses: readonly string[],
+): WalletEligibility[] {
+  if (addresses.length === 0) return [];
+  const loaded = new Set(addresses.map((a) => a.toLowerCase()));
+  const hint = hintForStage(snapshot, stage, loaded);
+
+  // Narrowed on the discriminant rather than on a separate flag: the compiler
+  // cannot carry a boolean's meaning back onto `hint`, and destructuring a union
+  // it has not narrowed is exactly the kind of "it is obviously fine" that this
+  // file's strictness exists to catch.
+  if (hint.kind !== "recorded") {
+    // Why no wallet could be answered for. Stated in the row rather than
+    // dropped, because "unknown" without a cause sends the operator to check
+    // their wallets when the fault is a token issued to a different one.
+    const reason =
+      hint.kind === "foreign"
+        ? `OpenSea answered for ${hint.wallet}, which is not one of the loaded wallets.`
+        : hint.kind === "ambiguous"
+          ? `OpenSea did not name a wallet and ${hint.candidates} are loaded, so the answer cannot be attributed to one.`
+          : stage === null
+            ? "No gated stage was identified to ask about."
+            : `OpenSea answered for ${hint.answered} stage(s), none of them this one.`;
+    return addresses.map((address) => ({
+      address,
+      state: "unknown" as const,
+      mechanism: "opensea-signed" as const,
+      detail: reason,
+    }));
+  }
+
+  const { wallet: subject, row } = hint;
+  return addresses.map((address) => {
+    if (address.toLowerCase() !== subject) {
+      return {
+        address,
+        state: "unknown" as const,
+        mechanism: "opensea-signed" as const,
+        // Not a verdict. A second wallet needs a second token.
+        detail:
+          "Not covered by this token — an OpenSea eligibility token answers for one wallet only.",
+      };
+    }
+    // `price` and `maxMintable` keep null distinct from zero throughout: an
+    // unstated limit is not a limit of zero, and an unstated price is not free.
+    const terms = [
+      row.price === null ? null : row.price === 0n ? "free" : `${row.price} wei`,
+      row.maxMintable === null ? null : `up to ${row.maxMintable}`,
+    ].filter((t): t is string => t !== null);
+    const detail =
+      `OpenSea ${row.isEligible ? "confirms" : "refuses"} "${row.stageLabel}"` +
+      (terms.length > 0 ? ` — ${terms.join(", ")}` : "") +
+      (row.unmapped ? " (stage type unconfirmed against the schedule)" : "") +
+      ".";
+    return {
+      address,
+      state: (row.isEligible ? "eligible" : "ineligible") as EligibilityState,
+      mechanism: "opensea-signed" as const,
+      detail,
+    };
+  });
+}
+
 export function summariseEligibility(results: WalletEligibility[]): string {
   if (results.length === 0) return "no wallets loaded";
   const eligible = results.filter((r) => r.state === "eligible").length;
