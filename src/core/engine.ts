@@ -24,6 +24,7 @@
 
 import { JsonRpcProvider, Wallet } from "ethers";
 import { ChainProfile } from "./chains";
+import { FailureCode } from "./failures";
 import { CorrectedClock, ClockSync, syncClock, driftGuard } from "./clock";
 import {
   BlastOutcome,
@@ -56,6 +57,8 @@ import {
   LoadedWallet,
   checkBalances,
   fetchNonces,
+  pairByAddress,
+  splitByFunding,
   formatEth,
   requiredBalance,
 } from "./wallets";
@@ -64,7 +67,21 @@ export type EngineEvent =
   | { type: "phase"; name: string; detail?: string }
   | { type: "clock"; sync: ClockSync }
   | { type: "balances"; reports: BalanceReport[]; required: bigint; symbol: string }
-  | { type: "simulation"; ok: boolean; index: number; address: string; error?: string }
+  | {
+      type: "simulation";
+      ok: boolean;
+      index: number;
+      address: string;
+      error?: string;
+      /**
+       * The structured cause, when one was determined.
+       *
+       * Carried alongside the prose rather than instead of it: the sentence is
+       * what an operator reads, the code is what a retry policy and a task state
+       * machine can act on without parsing English.
+       */
+      code?: FailureCode;
+    }
   | { type: "signed"; count: number; elapsedMs: number }
   | { type: "countdown"; remainingMs: number; text: string }
   | { type: "fired"; count: number; dispatchMs: number; timingErrorMs: number }
@@ -439,14 +456,21 @@ export async function runMint(
     }
     emit({ type: "balances", reports: balances, required, symbol: chain.nativeSymbol });
 
-    const fundedWallets = wallets.filter((w) => balances[w.index]?.sufficient !== false);
-    for (const w of wallets) {
-      if (balances[w.index]?.sufficient === false) {
-        skippedWallets.push({
-          address: w.address,
-          reason: `underfunded — needs ${formatEth(required, chain.nativeSymbol)}`,
-        });
-      }
+    // Paired by address, not by subscript: both arrays are positional, and
+    // `wallets` is a subset whenever a task selects wallets rather than using
+    // every loaded key. See splitByFunding for why the naive subscript fails
+    // open rather than closed.
+    const funding = splitByFunding(wallets, balances);
+    const nonceByAddress = pairByAddress(wallets, nonces);
+
+    const fundedWallets = funding.funded;
+    for (const { wallet, verified } of funding.blocked) {
+      skippedWallets.push({
+        address: wallet.address,
+        reason: verified
+          ? `underfunded — needs ${formatEth(required, chain.nativeSymbol)}`
+          : "funding unverified — no balance report for this wallet",
+      });
     }
     if (fundedWallets.length === 0) {
       throw new Error(
@@ -498,7 +522,7 @@ export async function runMint(
     const signStart = performance.now();
     const bundles: SignedBundle[] = [];
     for (const wallet of eligibleWallets) {
-      const nonce = nonces[wallet.index];
+      const nonce = nonceByAddress.get(wallet.address.toLowerCase());
       if (nonce === undefined) throw new Error(`Missing nonce for wallet ${wallet.index}.`);
       const raw = await new Wallet(wallet.key).signTransaction({
         to: plan.to,

@@ -191,7 +191,14 @@ describe(".env.example documents what the parser actually reads", () => {
     // A live secret line is a placeholder an operator might not replace, and a
     // placeholder key that parses is worse than one that fails loudly.
     const live = Object.keys(liveSettings());
-    for (const secret of ["PRIVATE_KEYS", "OPENSEA_API_KEY", "TELEGRAM_BOT_TOKEN", "TELEGRAM_ALLOWED_IDS"]) {
+    for (const secret of [
+      "PRIVATE_KEY",
+      "PRIVATE_KEYS",
+      "OPENSEA_API_KEY",
+      "OPENSEA_SCOPED_TOKEN",
+      "TELEGRAM_BOT_TOKEN",
+      "TELEGRAM_ALLOWED_IDS",
+    ]) {
       assert.ok(!live.includes(secret), `${secret} must not ship uncommented`);
     }
   });

@@ -34,6 +34,30 @@ export interface WatchOptions {
   timeoutMs?: number;
   signal?: AbortSignal;
   onUpdate?: (update: WatchUpdate) => void;
+  /**
+   * How long before a stage opens to run {@link onPreArm}.
+   *
+   * The watcher is the only thing here that knows the countdown, so it is the
+   * only place that can honour a lead. Zero — the default — keeps the plain
+   * behaviour of doing nothing but watch.
+   */
+  preArmLeadMs?: number;
+  /**
+   * Preparation that has to be finished before the stage opens.
+   *
+   * Called at most once per scheduled start, and re-run if the creator moves the
+   * stage: nonces fetched against the old time are still valid, but the operator
+   * should see the preparation happen against the time that will actually be
+   * used. It is awaited, so the watch does not resume polling until preparation
+   * finishes, and a throw ends the watch — failing to prepare is not something
+   * to find out about at T-0, when there is nothing left to do about it.
+   */
+  onPreArm?: (stage: DropStage) => Promise<void> | void;
+  /**
+   * How to wait. Injected only by tests, which cannot spend a real minute proving
+   * that the lead lands a minute early.
+   */
+  sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
 }
 
 export interface WatchUpdate {
@@ -151,7 +175,9 @@ export async function waitForScheduledStage(
 ): Promise<StageWatchResult> {
   const deadline = opts.timeoutMs ? Date.now() + opts.timeoutMs : Infinity;
   const wantPublic = opts.includePublic ?? true;
+  const sleep = opts.sleep ?? delay;
   let announced: number | null = null;
+  let preArmedFor: number | null = null;
 
   for (;;) {
     if (opts.signal?.aborted) throw new Error("Cancelled while waiting for the stage.");
@@ -164,7 +190,7 @@ export async function waitForScheduledStage(
       // A transient API failure must not end the watch — the mint is still coming.
       if (err instanceof OpenSeaError && (err.status === 0 || err.status >= 429)) {
         opts.onUpdate?.({ kind: "error", message: `${err.message} Retrying.` });
-        await delay(15_000, opts.signal);
+        await sleep(15_000, opts.signal);
         continue;
       }
       throw err;
@@ -192,7 +218,27 @@ export async function waitForScheduledStage(
       announced = upcoming.startMs;
     }
 
-    await delay(pollInterval(upcoming.startMs - now, opts), opts.signal);
+    const lead = opts.preArmLeadMs ?? 0;
+    const arming = opts.onPreArm !== undefined && lead > 0;
+    if (arming && preArmedFor !== upcoming.startMs && upcoming.startMs - now <= lead) {
+      // Set before the await, not after: a preparation that throws must not be
+      // retried on the next poll, because whatever it half-finished is still
+      // half-finished and the reason it failed is unlikely to have changed.
+      preArmedFor = upcoming.startMs;
+      await opts.onPreArm!(upcoming);
+      // Re-read the schedule immediately. Preparation takes real time, and a
+      // creator editing the drop during it is precisely the case this watch
+      // exists to notice.
+      continue;
+    }
+
+    // Never sleep through the lead boundary. Without this the poll interval
+    // decides when preparation happens, so a 60s lead quietly becomes whatever
+    // the last sleep happened to leave of it.
+    let waitMs = pollInterval(upcoming.startMs - now, opts);
+    const untilLead = upcoming.startMs - lead - now;
+    if (arming && untilLead > 0 && untilLead < waitMs) waitMs = untilLead;
+    await sleep(waitMs, opts.signal);
   }
 }
 

@@ -186,14 +186,40 @@ describe("publicStageRow", () => {
 });
 
 describe("apiStageRow", () => {
-  it("marks the row as API-sourced and leaves price unknown", () => {
-    // The schedule endpoint returns windows but never prices — the price arrives
-    // in the signed payload at mint time. A guessed number here would look sourced.
+  it("leaves price and cap unknown when the stage states neither", () => {
+    // This is the honest half of the old behaviour, kept: a stage OpenSea has
+    // not priced still prints "—". What changed is that it is now a statement
+    // about *this stage's payload* rather than about the endpoint, which was
+    // asserted to return no prices at all and does.
     const row = apiStageRow(apiStage(), NOW);
     assert.equal(row.source, "OpenSea API");
     assert.equal(row.priceWei, null);
     assert.equal(row.perWalletCap, 0);
     assert.equal(row.note, "price known at mint time");
+  });
+
+  it("carries the price and cap the stage does state", () => {
+    const row = apiStageRow({ ...apiStage(), priceWei: 1_000_000_000_000_000n, maxPerWallet: 3 }, NOW);
+    assert.equal(row.priceWei, 1_000_000_000_000_000n);
+    assert.equal(row.perWalletCap, 3);
+    // No "known at mint time" note once it is, in fact, known.
+    assert.equal(row.note, undefined);
+  });
+
+  it("keeps a free stage distinguishable from an unpriced one", () => {
+    const free = apiStageRow({ ...apiStage(), priceWei: 0n }, NOW);
+    assert.equal(free.priceWei, 0n);
+    assert.equal(free.note, undefined);
+    assert.equal(apiStageRow(apiStage(), NOW).priceWei, null);
+  });
+
+  it("says why the price is blank when the stage is priced in a token", () => {
+    const usdc = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
+    const row = apiStageRow({ ...apiStage(), priceCurrency: usdc }, NOW);
+    assert.equal(row.priceWei, null);
+    // "—" with no explanation reads as "OpenSea has not priced this". It has.
+    assert.match(row.note ?? "", /token/i);
+    assert.match(row.note ?? "", /0x833589fc/);
   });
 
   it("classifies against the clock like any other row", () => {

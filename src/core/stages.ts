@@ -171,28 +171,45 @@ export function publicStageRow(
 /**
  * An OpenSea-scheduled stage as a row.
  *
- * Price and cap are null/0: the drop schedule endpoint returns a stage's type and
- * window but not its price, and the price only becomes knowable inside the signed
- * mint payload once the stage is open. Printing a guess here would be worse than
- * printing "—", because the number would look like it came from somewhere.
+ * This used to hard-code `priceWei: null` and `perWalletCap: 0`, with a comment
+ * explaining that the drop endpoint returns a stage's type and window but not its
+ * price. That was wrong: the endpoint returns `price` and `max_per_wallet` for
+ * every stage, before it opens. The table showed "—" for numbers OpenSea had
+ * already published — an understatement, but still a table that did not say what
+ * was known.
+ *
+ * What remains genuinely unknowable in advance is *this wallet's* terms, which
+ * can differ from the stage's published ones and need the eligibility endpoint.
+ * So the row carries the stage's stated price and cap, and only falls back to
+ * "—" when OpenSea stated none, or stated a price in an ERC-20 that has no
+ * business being rendered in a native-currency column.
  */
 export function apiStageRow(stage: DropStage, nowMs: number): StageRow {
   const status = classifyStatus(stage.startMs, stage.endMs, nowMs);
   const kind = stageKindOf(stage.type, stage.label);
+  const priceWei = stage.priceWei ?? null;
 
   return {
     kind,
     label: stage.label || stage.type,
     source: "OpenSea API",
-    priceWei: null,
+    priceWei,
     startMs: stage.startMs,
     endMs: stage.endMs,
-    perWalletCap: 0,
+    perWalletCap: stage.maxPerWallet ?? 0,
     status,
     countdownMs: countdownFor(status, stage.startMs, stage.endMs, nowMs),
     mintsLeft: null,
     mintsTotal: null,
-    note: kind === "public" ? undefined : "price known at mint time",
+    ...(priceWei === null
+      ? {
+          note: stage.priceCurrency
+            ? `priced in a token (${stage.priceCurrency.slice(0, 10)}…), not the native currency`
+            : kind === "public"
+              ? undefined
+              : "price known at mint time",
+        }
+      : {}),
   };
 }
 

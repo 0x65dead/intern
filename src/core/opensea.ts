@@ -19,6 +19,7 @@
 import { Interface, ZeroAddress, getAddress } from "ethers";
 import { resolveChain } from "./chains";
 import { SEADROP_V1 } from "./seadrop";
+import { redactKeys } from "./wallets";
 
 const API_BASE = "https://api.opensea.io/api/v2";
 const REQUEST_TIMEOUT_MS = 20_000;
@@ -47,8 +48,21 @@ export class OpenSeaError extends Error {
      * polite path is the fast path here.
      */
     public readonly retryAfterMs: number | null = null,
+    /**
+     * What OpenSea itself said, when the error body carried a message.
+     *
+     * This used to be discarded, and discarding it cost real time. A 403 on the
+     * token exchange was reported as a bare "Forbidden (HTTP 403)", so the layer
+     * above attributed it to the scoped token and told the operator to check its
+     * scope. OpenSea's actual words were "Token exchange is not available" — a
+     * statement about the endpoint, not the credential, and the difference is
+     * between a two-minute fix and regenerating a token that was never wrong.
+     *
+     * Redacted on the way in: an error body can quote back what was sent.
+     */
+    public readonly detail: string | null = null,
   ) {
-    super(message);
+    super(detail === null ? message : `${message} ${detail}`);
     this.name = "OpenSeaError";
   }
 
@@ -68,7 +82,11 @@ export class OpenSeaError extends Error {
 
 const STATUS_REASONS: Record<number, string> = {
   400: "OpenSea rejected the request as malformed",
-  401: "OPENSEA_API_KEY is missing or invalid",
+  // Deliberately does not name a credential. Wallet-scoped calls send two, and
+  // this layer does not know which endpoint it served — naming the API key here
+  // is what sent operators to rotate a key when the JWT had merely expired.
+  // classifyOpenSeaFailure knows the endpoint and names the right one.
+  401: "OpenSea rejected the request's credentials",
   403: "OpenSea denied access — the key may lack drop permissions",
   404: "No drop found for this collection",
   409: "Drop is not open: not started, ended, or paused",
@@ -104,21 +122,61 @@ export function parseRetryAfter(value: string | null | undefined, nowMs: number)
   return Math.max(0, at - nowMs);
 }
 
-async function request<T>(
-  path: string,
-  opts: { apiKey?: string; body?: object; timeoutMs?: number } = {},
-): Promise<T> {
+/**
+ * Options for one OpenSea API call.
+ *
+ * `bearer` carries the short-lived wallet JWT for the endpoints that are scoped to
+ * a wallet rather than to an application — eligibility is the one that matters.
+ * Those endpoints want *both* credentials: `x-api-key` identifies the application
+ * and the bearer identifies the wallet, and sending only one earns a 401 that says
+ * nothing about which was missing.
+ */
+export interface RequestOptions {
+  apiKey?: string;
+  bearer?: string;
+  body?: object;
+  timeoutMs?: number;
+  signal?: AbortSignal;
+  /**
+   * Overrides the method, which otherwise follows the presence of a body.
+   *
+   * The implicit rule is right for every call here, so this exists for the case
+   * where it would stop being right: a POST with no body, or a GET that needs
+   * one. Being able to say so explicitly is cheaper than discovering that the
+   * inference picked GET for a mutation.
+   */
+  method?: "GET" | "POST";
+}
+
+/**
+ * One HTTP path for every OpenSea call this bot makes.
+ *
+ * Deliberately the only one. A second fetch wrapper for the auth endpoints would
+ * be a second place to get the redirect policy, the timeout and the Retry-After
+ * parsing right, and the cost of getting them wrong is either a leaked credential
+ * or a rate-limit spiral during the one minute of the day that matters.
+ *
+ * `signal` composes with the timeout rather than replacing it: a caller's
+ * cancellation and the request's own deadline are different concerns, and a task
+ * that is cancelled mid-poll must abort immediately without waiting out a 20s
+ * timeout it no longer cares about.
+ */
+export async function openSeaRequest<T>(path: string, opts: RequestOptions = {}): Promise<T> {
   const headers: Record<string, string> = { accept: "application/json" };
   if (opts.apiKey) headers["x-api-key"] = opts.apiKey;
+  if (opts.bearer) headers["authorization"] = `Bearer ${opts.bearer}`;
   if (opts.body) headers["content-type"] = "application/json";
+
+  const timeout = AbortSignal.timeout(opts.timeoutMs ?? REQUEST_TIMEOUT_MS);
+  const signal = opts.signal ? AbortSignal.any([opts.signal, timeout]) : timeout;
 
   let res: Response;
   try {
     res = await fetch(`${API_BASE}${path}`, {
-      method: opts.body ? "POST" : "GET",
+      method: opts.method ?? (opts.body ? "POST" : "GET"),
       headers,
       body: opts.body ? JSON.stringify(opts.body) : undefined,
-      signal: AbortSignal.timeout(opts.timeoutMs ?? REQUEST_TIMEOUT_MS),
+      signal,
       // A redirect off api.opensea.io would send the API key to another host.
       redirect: "error",
     });
@@ -133,10 +191,56 @@ async function request<T>(
       res.status,
       `${reason} (HTTP ${res.status}).`,
       parseRetryAfter(res.headers.get("retry-after"), Date.now()),
+      await errorDetail(res),
     );
   }
   return (await res.json()) as T;
 }
+
+/**
+ * OpenSea's own description of an error, across the envelopes it uses.
+ *
+ * Best-effort by construction: a body that cannot be read or does not carry a
+ * message yields null, because a failure to explain a failure must not replace
+ * it. Bounded because an error body is occasionally an HTML page, and a wall of
+ * markup in a log is worse than the canned reason it displaced.
+ */
+async function errorDetail(res: Response): Promise<string | null> {
+  let text: string;
+  try {
+    text = await res.text();
+  } catch {
+    return null;
+  }
+  if (text.trim() === "") return null;
+
+  let message: string | null = null;
+  try {
+    const body = JSON.parse(text) as Record<string, unknown>;
+    const err = body["error"];
+    const errors = body["errors"];
+    for (const candidate of [
+      typeof err === "object" && err !== null ? (err as Record<string, unknown>)["message"] : err,
+      Array.isArray(errors) ? errors[0] : undefined,
+      body["message"],
+      body["detail"],
+    ]) {
+      if (typeof candidate === "string" && candidate.trim() !== "") {
+        message = candidate.trim();
+        break;
+      }
+    }
+  } catch {
+    // Not JSON. The raw text is still better than nothing, once trimmed.
+    message = text.replace(/\s+/g, " ").trim();
+  }
+  if (message === null) return null;
+  // An error body can echo what was sent, and what was sent includes a token.
+  return redactKeys(message.slice(0, 300));
+}
+
+/** The pre-existing internal spelling, kept so this file reads unchanged below. */
+const request = openSeaRequest;
 
 // ── Collections ──────────────────────────────────────────────────────────────
 
@@ -201,6 +305,41 @@ export interface DropStage {
   startMs: number;
   endMs: number;
   isPublic: boolean;
+  /**
+   * OpenSea's own identifier for this stage, when the drop response carries one.
+   *
+   * This is the join key between a stage and a wallet's eligibility for it. The
+   * eligibility endpoint answers per `stage_uuid` and in an order of its own, so
+   * without the uuid the only way to pair the two is by position — which is wrong
+   * the moment OpenSea returns them in a different order, and wrong silently: the
+   * operator would see a price and an allowance belonging to a different stage.
+   *
+   * Optional because it is absent from older drop payloads. A stage with no uuid
+   * simply cannot be joined, and is reported as such rather than guessed at.
+   */
+  uuid?: string;
+
+  /**
+   * The stage's price per token in wei, when the drop response states one in the
+   * chain's native currency.
+   *
+   * Absent means one of two different things, and the distinction matters enough
+   * that the field is optional rather than zero: OpenSea stated no price, or it
+   * stated a price denominated in an ERC-20 (see `priceCurrency`). Zero is a
+   * third, separate fact — a free stage — and is carried as 0n.
+   */
+  priceWei?: bigint;
+
+  /**
+   * The ERC-20 the price is denominated in, when it is not the native currency.
+   *
+   * Set only in that case. Its presence is why `priceWei` is absent: rendering a
+   * USDC amount in an ETH column would be a wrong number that looks right.
+   */
+  priceCurrency?: string;
+
+  /** The stated per-wallet limit. Absent means OpenSea stated none. */
+  maxPerWallet?: number;
 }
 
 export interface DropSchedule {
@@ -213,7 +352,62 @@ export interface DropSchedule {
 interface RawDrop {
   chain?: string;
   contract_address?: string;
-  stages?: { stage_type?: string; label?: string; start_time?: string; end_time?: string }[];
+  stages?: {
+    stage_type?: string;
+    label?: string;
+    start_time?: string;
+    end_time?: string;
+    /**
+     * The live API sends `uuid`. `stage_uuid` is accepted alongside it because
+     * the eligibility endpoint uses that spelling for the same identifier, and
+     * reading only one of the two is how this field came to be silently empty on
+     * every real drop: the parser asked for `stage_uuid`, the drop endpoint sent
+     * `uuid`, nothing errored, and the join key that the entire eligibility
+     * lookup depends on was quietly absent in production while every test that
+     * supplied `stage_uuid` passed.
+     */
+    uuid?: string;
+    stage_uuid?: string;
+    price?: string | number;
+    price_currency_address?: string;
+    max_per_wallet?: string | number;
+  }[];
+}
+
+/** The zero address, which OpenSea uses to mean "the chain's own currency". */
+const NATIVE_CURRENCY = "0x0000000000000000000000000000000000000000";
+
+function firstNonEmpty(...values: (string | undefined)[]): string {
+  for (const v of values) {
+    if (typeof v === "string" && v.trim() !== "") return v.trim();
+  }
+  return "";
+}
+
+/**
+ * A decimal wei string to a bigint, or null.
+ *
+ * Strict on purpose. Anything that is not plainly a non-negative integer becomes
+ * null — "not stated" — rather than a number derived from a shape nobody
+ * verified. A wrong price here is spent money.
+ */
+function parseWeiString(value: string | number | undefined): bigint | null {
+  if (typeof value === "number") {
+    return Number.isSafeInteger(value) && value >= 0 ? BigInt(value) : null;
+  }
+  if (typeof value !== "string") return null;
+  const t = value.trim();
+  return /^\d+$/.test(t) ? BigInt(t) : null;
+}
+
+/** A stated per-wallet limit, or null when none was stated. A stated 0 is kept. */
+function parseCount(value: string | number | undefined): number | null {
+  if (typeof value === "number") return Number.isSafeInteger(value) && value >= 0 ? value : null;
+  if (typeof value !== "string") return null;
+  const t = value.trim();
+  if (!/^\d+$/.test(t)) return null;
+  const n = Number(t);
+  return Number.isSafeInteger(n) ? n : null;
 }
 
 export async function fetchDropSchedule(slug: string, apiKey: string): Promise<DropSchedule> {
@@ -232,12 +426,23 @@ export async function fetchDropSchedule(slug: string, apiKey: string): Promise<D
       throw new Error(`Stage ${i + 1} has an invalid time range.`);
     }
     const type = stage.stage_type ?? "unknown";
+    const uuid = firstNonEmpty(stage.uuid, stage.stage_uuid);
+    const currency = typeof stage.price_currency_address === "string"
+      ? stage.price_currency_address.trim().toLowerCase()
+      : "";
+    const native = currency === "" || currency === NATIVE_CURRENCY;
+    const priceWei = native ? parseWeiString(stage.price) : null;
+    const cap = parseCount(stage.max_per_wallet);
     return {
       type,
       label: stage.label || type,
       startMs,
       endMs,
       isPublic: type === "public_sale",
+      ...(uuid !== "" ? { uuid } : {}),
+      ...(priceWei !== null ? { priceWei } : {}),
+      ...(!native ? { priceCurrency: currency } : {}),
+      ...(cap !== null ? { maxPerWallet: cap } : {}),
     };
   });
 

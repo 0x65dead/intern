@@ -8,15 +8,19 @@
 import assert from "node:assert/strict";
 import { beforeEach, describe, it } from "node:test";
 import {
+  BalanceReport,
+  LoadedWallet,
   affordableMaxFeeGwei,
   formatEth,
   gweiToWei,
   loadWallets,
   markPublicHash,
+  pairByAddress,
   redactKeys,
   registerSecret,
   requiredBalance,
   resetRedactionRegistry,
+  splitByFunding,
   suggestMaxFee,
   weiToGwei,
 } from "../src/core/wallets";
@@ -331,5 +335,153 @@ describe("redactKeys — transaction hashes", () => {
     loadWallets([key]);
     markPublicHash(key); // even an explicit claim does not help
     assert.equal(redactKeys(`key ${key}`), "key 0x⟨redacted-key⟩");
+  });
+});
+
+// ── Pairing per-wallet results with the wallets they describe ────────────────
+//
+// These read as plumbing tests, and the reason they are worth writing is that
+// the bug they pin was live and silent. checkBalances and fetchNonces both
+// answer positionally; the engine indexed them by the wallet's *global* index.
+// Those agree only for the full wallet set starting at zero, and disagree for
+// every subset — which is precisely what per-task wallet selection produces.
+//
+// The insufficient-balance gate then failed OPEN: `balances[5]` was undefined,
+// `undefined?.sufficient !== false` is true, and a wallet nobody had checked
+// was signed for and broadcast. So the cases below are mostly about subsets and
+// about what happens when a report is missing entirely.
+
+const wallet = (index: number, byte: string): LoadedWallet => ({
+  index,
+  address: `0x${byte.repeat(20)}`,
+  key: `0x${byte.repeat(32)}`,
+});
+
+const report = (address: string, sufficient: boolean): BalanceReport => ({
+  index: 0,
+  address,
+  balance: sufficient ? 10n ** 18n : 1n,
+  sufficient,
+  shortfall: sufficient ? 0n : 10n ** 18n - 1n,
+});
+
+describe("splitByFunding", () => {
+  it("clears a funded wallet and blocks an underfunded one", () => {
+    const a = wallet(0, "aa");
+    const b = wallet(1, "bb");
+    const split = splitByFunding([a, b], [report(a.address, true), report(b.address, false)]);
+    assert.deepEqual(split.funded, [a]);
+    assert.deepEqual(split.blocked, [{ wallet: b, verified: true }]);
+  });
+
+  it("pairs by address when the wallets are a subset with non-zero indexes", () => {
+    // The regression. These wallets are #2 and #5 of a larger set, so the
+    // positional arrays have two elements while the indexes are 2 and 5.
+    // Subscripting by index would read past the end of both.
+    const third = wallet(2, "33");
+    const sixth = wallet(5, "66");
+    const split = splitByFunding(
+      [third, sixth],
+      [report(third.address, true), report(sixth.address, false)],
+    );
+    assert.deepEqual(split.funded, [third], "the funded subset wallet must still clear");
+    assert.deepEqual(
+      split.blocked,
+      [{ wallet: sixth, verified: true }],
+      "the underfunded subset wallet must still be blocked, not silently passed",
+    );
+  });
+
+  it("is unaffected by the order the reports arrive in", () => {
+    const a = wallet(0, "aa");
+    const b = wallet(1, "bb");
+    const split = splitByFunding([a, b], [report(b.address, false), report(a.address, true)]);
+    assert.deepEqual(split.funded, [a]);
+    assert.deepEqual(split.blocked, [{ wallet: b, verified: true }]);
+  });
+
+  it("blocks a wallet with no report rather than assuming it is funded", () => {
+    // Fail closed. A missing report means the gate was never evaluated, and
+    // "never evaluated" must not be read as "passed" — that was the original
+    // bug's actual mechanism.
+    const a = wallet(0, "aa");
+    const orphan = wallet(1, "bb");
+    const split = splitByFunding([a, orphan], [report(a.address, true)]);
+    assert.deepEqual(split.funded, [a]);
+    assert.deepEqual(split.blocked, [{ wallet: orphan, verified: false }]);
+  });
+
+  it("distinguishes 'underfunded' from 'never checked'", () => {
+    // The two deserve different words in the operator's report: one is a wallet
+    // to top up, the other is a bug to fix.
+    const poor = wallet(0, "aa");
+    const orphan = wallet(1, "bb");
+    const split = splitByFunding([poor, orphan], [report(poor.address, false)]);
+    assert.equal(split.blocked.find((b) => b.wallet === poor)?.verified, true);
+    assert.equal(split.blocked.find((b) => b.wallet === orphan)?.verified, false);
+  });
+
+  it("matches addresses irrespective of checksum casing", () => {
+    // checkBalances echoes the address it was given; a caller may have
+    // checksummed one and not the other. A case-sensitive compare here would
+    // look exactly like a missing report.
+    const a = wallet(0, "aa");
+    const shouted = { ...report(a.address.toUpperCase(), true) };
+    assert.deepEqual(splitByFunding([a], [shouted]).funded, [a]);
+  });
+
+  it("treats an unreadable balance as sufficient, as checkBalances decided", () => {
+    // Deliberate, and documented at checkBalances: a flaky RPC read must not
+    // cost the mint. splitByFunding must not quietly reverse that call.
+    const a = wallet(0, "aa");
+    const unknown: BalanceReport = {
+      index: 0,
+      address: a.address,
+      balance: null,
+      sufficient: true,
+      shortfall: 0n,
+    };
+    assert.deepEqual(splitByFunding([a], [unknown]).funded, [a]);
+  });
+
+  it("returns empty halves for no wallets", () => {
+    assert.deepEqual(splitByFunding([], []), { funded: [], blocked: [] });
+  });
+});
+
+describe("pairByAddress", () => {
+  it("pairs each wallet with its own positional value", () => {
+    const a = wallet(0, "aa");
+    const b = wallet(1, "bb");
+    const nonces = pairByAddress([a, b], [7, 12]);
+    assert.equal(nonces.get(a.address.toLowerCase()), 7);
+    assert.equal(nonces.get(b.address.toLowerCase()), 12);
+  });
+
+  it("pairs correctly for a subset whose indexes do not start at zero", () => {
+    // fetchNonces returned two values for wallets #4 and #9. Indexing by 4 and 9
+    // would miss both; the nonce lookup then threw, which was safe but wrong.
+    const fifth = wallet(4, "44");
+    const tenth = wallet(9, "99");
+    const nonces = pairByAddress([fifth, tenth], [3, 0]);
+    assert.equal(nonces.get(fifth.address.toLowerCase()), 3);
+    assert.equal(nonces.get(tenth.address.toLowerCase()), 0);
+  });
+
+  it("omits a wallet the values ran out for rather than pairing undefined", () => {
+    // An omitted entry makes the caller's `=== undefined` check fire. Storing an
+    // explicit undefined would too, but it would also make `has()` lie.
+    const a = wallet(0, "aa");
+    const b = wallet(1, "bb");
+    const nonces = pairByAddress([a, b], [7]);
+    assert.equal(nonces.has(b.address.toLowerCase()), false);
+    assert.equal(nonces.size, 1);
+  });
+
+  it("keeps a zero value, which is a legitimate nonce", () => {
+    // A fresh wallet has nonce 0. Any truthiness test on the value would drop it
+    // and the engine would report a missing nonce for a perfectly good wallet.
+    const a = wallet(0, "aa");
+    assert.equal(pairByAddress([a], [0]).get(a.address.toLowerCase()), 0);
   });
 });

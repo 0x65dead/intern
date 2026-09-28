@@ -12,49 +12,27 @@
 //   spends the race on a status message. DeferredEmitter enforces fire-then-notify
 //   rather than leaving it as a rule to remember.
 //
-//   Secrecy — describeArm's output reaches a log line and a crash-recovery file.
-//   A private key in either is a P0, so the assertion is against the serialised
-//   JSON of a real arm carrying a real key, not against a hand-built shape.
+//   Attribution — a retry scheduler must not invent verdicts. planNextPoll decides
+//   only how long to wait; what a status *means* comes from classifyOpenSeaFailure,
+//   and the tests below pin the boundary, because the previous version crossed it
+//   and read a 403 as "this wallet is not on the allowlist".
+//
+// The describeArm and pollForSignature suites are gone with the functions they
+// covered; core/race.ts records why. The no-key-material assertion those tests
+// carried was never about the live crash-recovery file, which is written by
+// core/runstate.ts and asserted on in tests/unattended.test.ts.
 
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { CorrectedClock } from "../src/core/clock";
-import { OpenSeaError, RawMintTx } from "../src/core/opensea";
 import {
-  ArmedRace,
   DeferredEmitter,
   MIN_POLL_MS,
   SPEED_STATEMENT,
   backoffDelayMs,
-  describeArm,
   planNextPoll,
-  pollForSignature,
   withJitter,
 } from "../src/core/race";
 import { EngineEvent } from "../src/core/engine";
-import { GasSettings } from "../src/core/wallets";
-
-/** A clock whose time only moves when a test moves it. */
-class FakeClock extends CorrectedClock {
-  private t: number;
-  constructor(start: number) {
-    super(0);
-    this.t = start;
-  }
-  override now(): number {
-    return this.t;
-  }
-  advance(ms: number): void {
-    this.t += ms;
-  }
-}
-
-const PAYLOAD: RawMintTx = {
-  chain: "base",
-  to: "0x1111111111111111111111111111111111111111",
-  data: "0xdeadbeef",
-  value: "1000",
-};
 
 // A deterministic rand at the midpoint, so jitter contributes exactly zero and
 // the scheduling assertions are about backoff rather than about luck.
@@ -163,19 +141,28 @@ describe("planNextPoll", () => {
     }
   });
 
-  it("stops only on the three statuses that cannot fix themselves", () => {
+  it("stops only on the statuses that cannot fix themselves", () => {
     // Widening this set abandons winnable mints; narrowing it spins on a dead key.
+    // 404 is deliberately absent. It used to stop the poll, on the reading that a
+    // missing drop stays missing — but OpenSea answers 404 for a drop whose stage
+    // is not configured yet, which is the ordinary state of the entire pre-open
+    // window. Stopping there abandoned the mint before it started.
     const terminal: number[] = [];
     for (let status = 200; status <= 599; status += 1) {
       if (planNextPoll(status, 1, { pollMs: 250, rand: MID }).kind === "stop") {
         terminal.push(status);
       }
     }
-    assert.deepEqual(terminal, [401, 403, 404]);
+    assert.deepEqual(terminal, [401, 403]);
+  });
+
+  it("keeps polling through a 404, which is how an unconfigured drop reads", () => {
+    const action = plan(404, 3);
+    assert.equal(action.kind, "retry");
   });
 
   it("says why it stopped, in words an operator can act on", () => {
-    for (const status of [401, 403, 404]) {
+    for (const status of [401, 403]) {
       const action = plan(status);
       assert.equal(action.kind, "stop");
       if (action.kind !== "stop") return;
@@ -190,143 +177,77 @@ describe("planNextPoll", () => {
     if (action.kind !== "retry") return;
     assert.equal(action.delayMs, MIN_POLL_MS);
   });
-});
 
-describe("pollForSignature", () => {
-  /** A fake sleep that moves the virtual clock — so the loop costs no real time. */
-  const virtual = (clock: FakeClock) => async (ms: number) => {
-    clock.advance(ms);
-  };
+  it("blames the credential for a 403, never the wallet", () => {
+    // The regression this exists to prevent. A 403 says the API key was refused.
+    // The previous implementation reported it as "wallet is not eligible", which
+    // sent the operator to check an allowlist while the actual fault was a missing
+    // scope on their key — and, worse, recorded a verdict on a wallet that only
+    // the eligibility endpoint is entitled to give.
+    const action = plan(403);
+    assert.equal(action.kind, "stop");
+    if (action.kind !== "stop") return;
+    assert.doesNotMatch(action.reason, /not eligible|ineligible|allowlist/i);
+    assert.match(action.reason, /key/i);
+    assert.notEqual(action.failure.code, "ELIGIBILITY_FALSE");
+    assert.notEqual(action.failure.code, "WALLET_NOT_ELIGIBLE");
+    assert.equal(action.failure.code, "API_KEY_INVALID");
+  });
 
-  const run = (
-    clock: FakeClock,
-    request: (slug: string, apiKey: string, minter: string, quantity: number) => Promise<RawMintTx>,
-    deadlineMs: number,
-  ) =>
-    pollForSignature({
-      slug: "x",
-      apiKey: "k",
-      minter: "0x1111111111111111111111111111111111111111",
-      quantity: 1,
+  it("carries the structured cause beside the prose", () => {
+    // The sentence is for the operator; the code is what a task state machine acts
+    // on. Returning only the sentence forces the caller to parse English.
+    for (const status of [401, 403]) {
+      const action = plan(status);
+      assert.equal(action.kind, "stop");
+      if (action.kind !== "stop") return;
+      assert.ok(action.failure.terminal, `${status} stopped without a terminal cause`);
+      assert.ok(action.failure.code.length > 0);
+    }
+  });
+
+  it("resolves the ambiguous 422 when eligibility has already answered", () => {
+    // 422 alone means one of four things and is retried, because three of the four
+    // are temporary. With the eligibility answer beside it there is nothing
+    // ambiguous left, and continuing to poll would burn the window on a wallet
+    // that was never going to mint.
+    const refused = planNextPoll(422, 1, {
       pollMs: 250,
-      deadlineMs,
-      clock,
       rand: MID,
-      sleep: virtual(clock),
-      request,
+      endpoint: "mint",
+      eligibility: { isEligible: false, maxMintable: null },
     });
+    assert.equal(refused.kind, "stop");
+    if (refused.kind !== "stop") return;
+    assert.equal(refused.failure.code, "WALLET_NOT_ELIGIBLE");
 
-  it("returns the payload on the first success", async () => {
-    const clock = new FakeClock(0);
-    const result = await run(clock, async () => PAYLOAD, 60_000);
-    assert.equal(result.kind, "payload");
-    if (result.kind !== "payload") return;
-    assert.equal(result.attempts, 1);
-    assert.deepEqual(result.raw, PAYLOAD);
-  });
-
-  it("polls through the pre-open 409s and fires on the first signature", async () => {
-    const clock = new FakeClock(0);
-    let calls = 0;
-    const result = await run(
-      clock,
-      async () => {
-        calls += 1;
-        if (calls < 8) throw new OpenSeaError(409, "not open");
-        return PAYLOAD;
-      },
-      60_000,
-    );
-    assert.equal(result.kind, "payload");
-    if (result.kind !== "payload") return;
-    assert.equal(result.attempts, 8);
-    // Eight attempts at the base rate: seven waits of 250ms, no backoff.
-    assert.equal(clock.now(), 7 * 250);
-  });
-
-  it("stops for a refused wallet instead of burning the window on it", async () => {
-    const clock = new FakeClock(0);
-    let calls = 0;
-    const result = await run(
-      clock,
-      async () => {
-        calls += 1;
-        throw new OpenSeaError(403, "denied");
-      },
-      60_000,
-    );
-    assert.equal(result.kind, "refused");
-    if (result.kind !== "refused") return;
-    assert.match(result.reason, /not eligible/i);
-    // Recorded once and dropped — not retried for the rest of the window.
-    assert.equal(calls, 1);
-  });
-
-  it("times out at the deadline rather than polling forever", async () => {
-    const clock = new FakeClock(0);
-    const result = await run(clock, async () => {
-      throw new OpenSeaError(409, "not open");
-    }, 2_000);
-    assert.equal(result.kind, "timeout");
-    if (result.kind !== "timeout") return;
-    assert.ok(result.attempts > 1);
-    assert.ok(clock.now() >= 2_000);
-  });
-
-  it("never sleeps past the deadline", async () => {
-    // A 429 with a long Retry-After must not park the loop well beyond the point
-    // where the answer stops mattering.
-    const clock = new FakeClock(0);
-    await run(clock, async () => {
-      throw new OpenSeaError(429, "slow down", 60_000);
-    }, 1_000);
-    assert.ok(clock.now() <= 1_000, `slept to ${clock.now()}`);
-  });
-
-  it("gives up immediately when the deadline has already passed", async () => {
-    const clock = new FakeClock(5_000);
-    let calls = 0;
-    const result = await run(clock, async () => {
-      calls += 1;
-      return PAYLOAD;
-    }, 1_000);
-    assert.equal(result.kind, "timeout");
-    assert.equal(calls, 0);
-  });
-
-  it("honours an abort signal", async () => {
-    const clock = new FakeClock(0);
-    const controller = new AbortController();
-    controller.abort();
-    const result = await pollForSignature({
-      slug: "x",
-      apiKey: "k",
-      minter: "0x1111111111111111111111111111111111111111",
-      quantity: 1,
+    const capped = planNextPoll(422, 1, {
       pollMs: 250,
-      deadlineMs: 60_000,
-      clock,
-      sleep: virtual(clock),
-      signal: controller.signal,
-      request: async () => PAYLOAD,
+      rand: MID,
+      endpoint: "mint",
+      eligibility: { isEligible: true, maxMintable: 2, mintedSoFar: 2 },
     });
-    assert.equal(result.kind, "refused");
-    if (result.kind !== "refused") return;
-    assert.match(result.reason, /cancelled/i);
+    assert.equal(capped.kind, "stop");
+    if (capped.kind !== "stop") return;
+    assert.equal(capped.failure.code, "MINT_LIMIT_REACHED");
   });
 
-  it("treats a non-OpenSea throw as a server error and backs off", async () => {
-    // A JSON parse failure or a bug must not spin at the floor interval.
-    const clock = new FakeClock(0);
-    let calls = 0;
-    await run(clock, async () => {
-      calls += 1;
-      throw new TypeError("boom");
-    }, 3_000);
-    assert.ok(calls >= 2);
-    // Backoff, not the base rate: 250 + 500 + 1000 … reaches 3s in far fewer
-    // attempts than 3000/250 = 12.
-    assert.ok(calls < 12, `spun ${calls} times instead of backing off`);
+  it("keeps polling a 422 when eligibility says the wallet should be able to mint", () => {
+    // Eligible with allowance left and still refused: the cause is supply or
+    // balance, neither of which is settled, so the poll continues.
+    const action = planNextPoll(422, 1, {
+      pollMs: 250,
+      rand: MID,
+      endpoint: "mint",
+      eligibility: { isEligible: true, maxMintable: 5, mintedSoFar: 1 },
+    });
+    assert.equal(action.kind, "retry");
+  });
+
+  it("does not need an eligibility answer to keep polling a bare 422", () => {
+    // No hint supplied is the common case, and must not become a stop by default.
+    const action = planNextPoll(422, 1, { pollMs: 250, rand: MID, endpoint: "mint" });
+    assert.equal(action.kind, "retry");
   });
 });
 
@@ -380,57 +301,6 @@ describe("DeferredEmitter", () => {
     emitter.flush();
     emitter.flush();
     assert.equal(seen.length, 1);
-  });
-});
-
-describe("describeArm", () => {
-  // A real key, so the assertion is about the code and not about a fixture that
-  // happens to contain nothing.
-  const KEY = `0x${"ab".repeat(32)}`;
-
-  const armed: ArmedRace = {
-    chainId: 8453,
-    armedAtMs: 1_773_576_000_000,
-    gas: {
-      maxFeePerGas: 1_500_000_000n,
-      maxPriorityFeePerGas: 100_000_000n,
-      gasLimit: 250_000n,
-    } as GasSettings,
-    wallets: [
-      {
-        wallet: { index: 0, address: "0x1111111111111111111111111111111111111111", key: KEY },
-        nonce: 7,
-      },
-      {
-        wallet: { index: 1, address: "0x2222222222222222222222222222222222222222", key: KEY },
-        nonce: 3,
-      },
-    ],
-  };
-
-  it("carries no key material into its serialised form", () => {
-    const json = JSON.stringify(describeArm(armed));
-    assert.doesNotMatch(json, /ab{2,}/i, "key bytes reached the snapshot");
-    assert.ok(!json.includes(KEY), "the key itself reached the snapshot");
-    assert.doesNotMatch(json, /0x[0-9a-fA-F]{64}/, "something key-shaped reached the snapshot");
-    assert.doesNotMatch(json, /"key"/, "a key field reached the snapshot");
-  });
-
-  it("keeps what an operator needs to audit the arm", () => {
-    const described = describeArm(armed);
-    assert.equal(described.chainId, 8453);
-    assert.equal(described.wallets.length, 2);
-    assert.equal(described.wallets[0]!.nonce, 7);
-    assert.equal(described.wallets[1]!.address, "0x2222222222222222222222222222222222222222");
-  });
-
-  it("serialises gas as strings, since JSON has no bigint", () => {
-    const described = describeArm(armed);
-    assert.equal(described.gas.maxFeePerGas, "1500000000");
-    assert.equal(described.gas.gasLimit, "250000");
-    // And the whole thing must actually survive JSON.stringify — a bigint here
-    // throws at exactly the wrong moment, in the crash-recovery write.
-    assert.doesNotThrow(() => JSON.stringify(described));
   });
 });
 

@@ -16,7 +16,7 @@ import { planRpcs, resolveRpcsForChain, maskRpc, toRpcUrl } from "../core/rpc";
 import { planWarnings } from "../core/seadrop";
 import { EngineEvent, runMint, resolveFireTime } from "../core/engine";
 import { DryRunReport, dryRunVerdict } from "../core/dryrun";
-import { runAllowlistMint, withNonces } from "../core/allowlist";
+import { PreArmed, preArmAllowlist, runAllowlistMint } from "../core/allowlist";
 import {
   AmbiguousChainError,
   PrepareOptions,
@@ -29,8 +29,16 @@ import {
 import { StageContext } from "../core/stagetable";
 import { orderCandidates } from "../core/detect";
 import { shortAddress } from "../core/target";
+import { PRE_ARM_LEAD_MS } from "../core/race";
 import { waitForPublicStage, waitForScheduledStage } from "../core/watcher";
-import { fetchDropSchedule, liveStage, nextStage } from "../core/opensea";
+import { DropStage, fetchDropSchedule, liveStage, nextStage } from "../core/opensea";
+import { authManagerFrom } from "../core/openseaauth";
+import { EligibilityHint } from "../core/failures";
+import {
+  hintForStage,
+  mintTerms,
+  tryFetchWalletEligibility,
+} from "../core/openseaeligibility";
 import {
   checkBalances,
   formatEth,
@@ -660,6 +668,141 @@ async function cmdAllowlist(
     const schedule = await fetchDropSchedule(slug, apiKey);
     const now = Date.now();
     const open = liveStage(schedule, now);
+
+    // Preparation that does not need OpenSea's signature: nonces, warm sockets, a
+    // measured clock offset, and — the reason for doing any of it early — the
+    // wallet's eligibility, which OpenSea answers before the stage opens. Held in
+    // a box rather than a bare `let` because it is assigned from the watcher's
+    // callback, and a closure assignment is not something the compiler's flow
+    // analysis can follow to the read below.
+    const arm: { value: PreArmed | null } = { value: null };
+
+    // Per wallet, never shared. Two wallets on the same drop routinely differ, and
+    // one wallet's allowance must never be used to explain another's refusal.
+    const eligibility = new Map<string, EligibilityHint>();
+    const loaded = new Set(wallets.map((w) => w.address.toLowerCase()));
+    const { manager: auth, reason: noAuth } = authManagerFrom({
+      apiKey,
+      scopedToken: defaults.openseaScopedToken,
+      walletToken: defaults.openseaWalletToken,
+    });
+
+    /**
+     * Ask OpenSea what the wallet may mint, before the stage opens.
+     *
+     * This replaces inferring eligibility from a refusal, which meant a wallet
+     * that was never on the list found out by being told no at T-0 — the one
+     * moment nothing can be done about it. Asking a minute early also collapses
+     * the mint endpoint's 422 from four possible causes to one.
+     *
+     * Advisory by design. A failure here degrades the 422 back to ambiguous and is
+     * reported, but never stops the mint: eligibility is information, nonces are
+     * machinery. The scoped token is bound to a single wallet, so in a multi-wallet
+     * run only that wallet gets an answer and the rest stay honestly unknown.
+     */
+    const learnEligibility = async (stage: DropStage | null): Promise<void> => {
+      if (!auth) {
+        writeOut(info(`Eligibility not checked — ${noAuth}. A refusal at T-0 will not say why.\n`));
+        return;
+      }
+      try {
+        const { snapshot, failure } = await tryFetchWalletEligibility({
+          slug,
+          auth,
+          stages: schedule.stages,
+          ...(signal ? { signal } : {}),
+        });
+        if (!snapshot) {
+          writeOut(warn(`Eligibility unknown — ${failure?.message ?? "the check did not complete"}.\n`));
+          return;
+        }
+        // Who the answer is about is decided in core, where it is tested.
+        const verdict = hintForStage(snapshot, stage, loaded);
+        if (verdict.kind === "foreign") {
+          writeOut(
+            warn(
+              `OPENSEA_SCOPED_TOKEN answers for ${shortAddress(verdict.wallet)}, which is not a wallet loaded from .env. Eligibility left unknown.\n`,
+            ),
+          );
+          return;
+        }
+        if (verdict.kind === "ambiguous") {
+          writeOut(
+            warn(
+              `OpenSea did not name the wallet and ${verdict.candidates} are loaded, so the answer cannot be attributed to one. Eligibility left unknown.\n`,
+            ),
+          );
+          return;
+        }
+        if (verdict.kind === "no-row") {
+          writeOut(
+            info(
+              stage?.uuid
+                ? `Eligibility has no row for "${stage.label}" (${verdict.answered} stage(s) answered).\n`
+                : "This stage carries no OpenSea stage id, so eligibility cannot be joined to it.\n",
+            ),
+          );
+          return;
+        }
+
+        eligibility.set(verdict.wallet, verdict.hint);
+        const row = verdict.row;
+        const price =
+          row.price === null ? "price unknown" : `${formatEth(row.price, run.chain.nativeSymbol)} each`;
+        const cap = row.maxMintable === null ? "no stated limit" : `up to ${row.maxMintable}`;
+        writeOut(
+          (row.isEligible ? ok : warn)(
+            `${shortAddress(verdict.wallet)} ${row.isEligible ? "is eligible" : "is NOT eligible"} for "${row.stageLabel}" (${row.stageType}) — ${price}, ${cap}.\n`,
+          ),
+        );
+        const terms = mintTerms(row, quantity);
+        if (terms && !terms.withinAllowance) {
+          writeOut(warn(`Requested ${quantity}, allowance is ${terms.allowance}. OpenSea will refuse.\n`));
+        }
+      } catch (err: unknown) {
+        // Advisory work must not take the mint down with it.
+        if (signal?.aborted) return;
+        writeOut(
+          warn(
+            `Eligibility check failed: ${redactKeys(err instanceof Error ? err.message : String(err))}\n`,
+          ),
+        );
+      }
+    };
+
+    /**
+     * @param inRace  true when there was no pre-open lead and this is happening
+     *                with the stage already open.
+     */
+    const runPreArm = async (stage: DropStage | null, inRace: boolean): Promise<void> => {
+      writeOut(info(`Pre-arming ${wallets.length} wallet(s): nonces, sockets, clock, eligibility.\n`));
+      // Started first so it overlaps the nonce fetch, but only waited for when there
+      // is time to spare. Eligibility is advisory: it sharpens a refusal into a
+      // reason, and a reason is not worth a round trip of delay on the signature
+      // request. It is still worth starting inside the race, because planNextPoll
+      // re-reads this map on every poll — an answer that lands two seconds late
+      // still explains the retries that follow it.
+      const learning = learnEligibility(stage);
+      const armed = await preArmAllowlist({
+        provider: run.rpc.provider,
+        wallets,
+        readUrls: run.rpc.plan.read,
+        blastUrls: run.rpc.plan.blast,
+        blockTimeSec: run.chain.blockTimeSec,
+        ...(signal ? { signal } : {}),
+      });
+      if (!inRace) await learning;
+      arm.value = armed;
+      const spare = stage === null ? null : stage.startMs - armed.completedAtMs;
+      writeOut(
+        ok(
+          spare === null
+            ? "Pre-armed. Only the signature round trip is left.\n"
+            : `Pre-armed with ${formatRemaining(spare)} to spare. Only the signature round trip is left.\n`,
+        ),
+      );
+    };
+
     if (!open) {
       const upcoming = nextStage(schedule, now);
       if (!upcoming) throw new Error("No stage is open and none is scheduled. Nothing was sent.");
@@ -669,6 +812,8 @@ async function cmdAllowlist(
       writeOut(info(`${formatUtc(upcoming.startMs)} UTC\n`));
       await waitForScheduledStage(slug, apiKey, {
         signal,
+        preArmLeadMs: PRE_ARM_LEAD_MS,
+        onPreArm: (stage) => runPreArm(stage, false),
         onUpdate: (update) => writeOut(info(`${update.message}\n`)),
       });
     } else {
@@ -679,7 +824,15 @@ async function cmdAllowlist(
       info("Requesting signatures. OpenSea will not issue one before the stage opens, so this round trip is inside the race.\n"),
     );
 
-    const nonced = await withNonces(run.rpc.provider, wallets);
+    // Already open on arrival, or the stage was rescheduled forward past the
+    // lead: there was no lead window to use, so the preparation happens here and
+    // the race pays for it. Stating it plainly beats silently being slower.
+    if (!arm.value) {
+      writeOut(warn("No pre-open lead was available — preparing inside the race.\n"));
+      await runPreArm(open ?? null, true);
+    }
+    const prearmed = arm.value!;
+    const nonced = prearmed.wallets;
     closePrompts();
 
     const report = createReporter({ chain: run.chain, addresses: wallets.map((w) => w.address) });
@@ -694,6 +847,8 @@ async function cmdAllowlist(
         readUrls: run.rpc.plan.read,
         blastUrls: run.rpc.plan.blast,
         gas: run.gas,
+        prearmed,
+        eligibility,
         receiptTimeoutMs: defaults.receiptTimeoutMs,
         signal,
       },

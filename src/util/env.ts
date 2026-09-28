@@ -32,6 +32,29 @@ export interface Defaults {
   priorityGwei: number | null;
   leadMs: number;
   openseaApiKey: string | null;
+  /**
+   * The durable credential exchanged for a short-lived wallet JWT.
+   *
+   * Kept separate from the API key because the two authorise different things
+   * and fail independently: the key identifies the integration, this identifies
+   * the wallet. null simply means wallet-scoped eligibility is unavailable, so
+   * intern reports eligibility as unknown until a stage opens rather than
+   * refusing to run.
+   */
+  openseaScopedToken: string | null;
+  /**
+   * A wallet access token already issued, used in place of the exchange.
+   *
+   * OpenSea currently answers the token-exchange endpoint with 403 "Token
+   * exchange is not available" — for any caller, with or without credentials —
+   * and its own guidance points at `opensea login` or an OAuth 2.1 PKCE flow
+   * instead. This is where the resulting token goes.
+   *
+   * It is short-lived, so it is read at start and held in memory; nothing writes
+   * it back. Setting it makes OPENSEA_SCOPED_TOKEN unnecessary, and setting both
+   * is harmless — this one wins, and the exchange resumes the moment it is unset.
+   */
+  openseaWalletToken: string | null;
   telegramToken: string | null;
   telegramAllowedIds: number[];
   receiptTimeoutMs: number;
@@ -155,6 +178,8 @@ function idsFrom(raw: string | undefined): number[] {
 
 export function readDefaults(env: NodeJS.ProcessEnv = process.env): Defaults {
   const apiKey = env.OPENSEA_API_KEY?.trim();
+  const scoped = env.OPENSEA_SCOPED_TOKEN?.trim();
+  const walletToken = env.OPENSEA_WALLET_TOKEN?.trim();
   const token = env.TELEGRAM_BOT_TOKEN?.trim();
   return {
     chain: (env.CHAIN ?? "base").trim().toLowerCase(),
@@ -164,6 +189,8 @@ export function readDefaults(env: NodeJS.ProcessEnv = process.env): Defaults {
     priorityGwei: numberFrom(env.MAX_PRIORITY_FEE, null),
     leadMs: Math.max(0, Math.floor(numberFrom(env.LEAD_MS, 0) ?? 0)),
     openseaApiKey: apiKey && apiKey.length > 0 ? apiKey : null,
+    openseaScopedToken: scoped && scoped.length > 0 ? scoped : null,
+    openseaWalletToken: walletToken && walletToken.length > 0 ? walletToken : null,
     telegramToken: token && token.length > 0 ? token : null,
     telegramAllowedIds: idsFrom(env.TELEGRAM_ALLOWED_IDS),
     receiptTimeoutMs: Math.max(
@@ -220,9 +247,29 @@ LEAD_MS=0
 RECEIPT_TIMEOUT_MS=90000
 
 # ── OpenSea ─────────────────────────────────────────────────────────────────
-# Needed only for slug lookups and allowlist/FCFS stages. Public mints read
-# everything from the chain and need no key at all.
+# The API key identifies the integration. It is what slug lookups, drop schedules
+# and the mint builder authenticate with, and it says nothing about which wallet
+# is asking. Needed only for slug lookups and allowlist/FCFS stages; public mints
+# read everything from the chain and need no key at all.
 # OPENSEA_API_KEY=
+# The scoped token answers the wallet-scoped question: can THIS wallet mint THIS
+# stage, at what price, and up to what limit. That is answerable BEFORE the stage
+# opens, which is the whole reason it is worth configuring — without it intern
+# cannot tell you whether a wallet is on the list until the stage is already open
+# and the mint request either works or does not. Both OpenSea values are secrets:
+# keep this file mode 0600 and out of git.
+#
+# Create a personal access token in OpenSea developer settings with the
+# \`read:eligibility\` scope. Do not try to mint one with \`opensea login --scopes\`;
+# that path fails with "Requested scopes exceed account entitlement".
+#
+# intern never sends this token to an API as a credential. It POSTs it once to
+# /api/v2/auth/tokens/exchange and receives a short-lived wallet JWT, and the JWT
+# is what authorises the eligibility call. That JWT lives in memory only: it is
+# refreshed before it expires, re-minted from scratch after a restart, and never
+# written to disk. So this file holds the durable token and never the JWT — do
+# not paste a JWT in here, it would be stale within the hour.
+# OPENSEA_SCOPED_TOKEN=
 
 # ── Gated stages (allowlist / GTD / FCFS / team) ────────────────────────────
 # Off by default. Set to 1 to let intern fire at gated stages, so that a misread
@@ -262,6 +309,12 @@ RECEIPT_TIMEOUT_MS=90000
 # somewhere else, such as a group you share with a second operator.
 # HEARTBEAT_MINUTES=30
 # HEARTBEAT_CHAT_ID=
+
+# ── Diagnostics ───────────────────────────────────────────────────────
+# Print a stack trace when the CLI fails, instead of just the message. The trace
+# is passed through the same redaction as everything else, so keys and tokens do
+# not appear in it — but a trace names internal paths, so it is off by default.
+# INTERN_DEBUG=1
 `;
 
 /** Write a commented .env template. Never overwrites an existing file. */

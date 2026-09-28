@@ -9,9 +9,14 @@ It exists to be the place where intern says what it cannot do.
 
 ## The speed claim
 
-A gated mint (allowlist / GTD / FCFS backed by an OpenSea signature) is slower than a public mint and always will be. The signature is bound to one minter, one quantity and one salt, and OpenSea does not issue it before the stage opens — so one HTTP round trip is inside the race and cannot be moved out of it. intern removes everything else: nonce, fees, balance check and TLS handshakes are all completed before T-0, leaving request → verify → sign → broadcast. A Merkle allow-list is the exception: its proof is computed locally, so that path pre-signs exactly like a public mint and is as fast as one.
+A gated mint (allowlist / GTD / FCFS backed by an OpenSea signature) is slower than a public mint and always will be. The signature is bound to one minter, one quantity and one salt, and OpenSea does not issue it before the stage opens — so one HTTP round trip is inside the race and cannot be moved out of it. intern removes what it can: the nonce, the fees and the TLS handshakes are completed before T-0, leaving request → verify → sign → broadcast. The balance check stays inside the race, because the amount a wallet needs depends on the price the signature carries. A Merkle allow-list is the exception: its proof is computed locally, so that path pre-signs exactly like a public mint and is as fast as one.
 
-Pre-arm work completes 60 seconds before the stage opens.
+Pre-arm work — nonces, warm sockets, a measured clock offset — completes
+60 seconds before the stage opens, so the race pays for
+none of it. That lead exists only when intern is waiting for a scheduled stage.
+Start it against a stage that is already open and there is no lead to use: the
+same preparation then happens inside the race, and the run says so rather than
+quietly being slower.
 
 ## The matrix
 
@@ -26,7 +31,7 @@ OpenSea-held signature on the next, and those two have opposite capabilities.
 | Public | `mintPublic()` | yes | yes | yes | yes | pre-signed |
 | Allowlist — on-chain Merkle root | `mintAllowList()` | partial | yes | yes | yes | pre-signed |
 | Allowlist — signer held locally | `mintSigned()` | partial | yes | yes | yes | pre-signed |
-| Allowlist / GTD / FCFS — OpenSea-held signature | `mintSigned()` | partial | no | no | yes | api-bound |
+| Allowlist / GTD / FCFS — OpenSea-held signature | `mintSigned()` | partial | partial | no | yes | api-bound |
 | Team / reserve | `—` | partial | no | no | no | none |
 | Unclassified | `—` | partial | no | no | no | none |
 
@@ -87,8 +92,8 @@ These fire, but only once something is configured:
 **Mechanism:** `opensea-signed`  
 **Contract call:** `mintSigned()`
 
-- **Detect window: partial** — Read from OpenSea's drop configuration, which requires OPENSEA_API_KEY. There is no on-chain record of this stage's window or price before it opens, which is why its price column shows an em dash rather than a number.
-- **Precheck eligibility: no** — OpenSea publishes no eligibility endpoint. The only probe is the mint request itself, made as the wallet, and it answers only once the stage is open — 403 means not eligible. Before open, eligibility is genuinely unknown, and intern reports it as unknown rather than showing a tick it cannot justify.
+- **Detect window: partial** — Read from OpenSea's drop configuration, which requires OPENSEA_API_KEY. There is no on-chain record of this stage before it opens, so the window, the stated price and the stated per-wallet cap all come from OpenSea rather than from the contract. Those are the stage's published terms; this wallet's own terms can differ and need the eligibility endpoint.
+- **Precheck eligibility: partial** — OpenSea answers this before the stage opens, at /api/v2/drops/{slug}/eligibility, and intern asks during the pre-open lead rather than inferring a verdict from a refusal at T-0. It needs OPENSEA_SCOPED_TOKEN as well as the API key; without one, eligibility stays unknown and the run says so. The token authorises a single wallet, so in a multi-wallet run only that wallet gets an answer — the rest are reported unknown rather than assumed to match.
 - **Pre-sign: no** — mintSigned() carries a server signature bound to this minter, this quantity and one salt, and OpenSea does not issue it before the stage opens. The calldata therefore does not exist in advance. This is a property of OpenSea's design and no amount of engineering on this side removes it.
 - **Fire unattended: yes** — Requires OPENSEA_API_KEY and ALLOWLIST_MINTING=1. intern polls for the signature from T-60s and broadcasts the instant one is issued.
 

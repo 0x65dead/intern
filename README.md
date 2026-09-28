@@ -312,7 +312,7 @@ intern allowlist <target>   # needs OPENSEA_API_KEY
 ```
 
 <!-- BEGIN GENERATED: speed-statement -->
-> **The speed claim, stated once.** A gated mint (allowlist / GTD / FCFS backed by an OpenSea signature) is slower than a public mint and always will be. The signature is bound to one minter, one quantity and one salt, and OpenSea does not issue it before the stage opens — so one HTTP round trip is inside the race and cannot be moved out of it. intern removes everything else: nonce, fees, balance check and TLS handshakes are all completed before T-0, leaving request → verify → sign → broadcast. A Merkle allow-list is the exception: its proof is computed locally, so that path pre-signs exactly like a public mint and is as fast as one.
+> **The speed claim, stated once.** A gated mint (allowlist / GTD / FCFS backed by an OpenSea signature) is slower than a public mint and always will be. The signature is bound to one minter, one quantity and one salt, and OpenSea does not issue it before the stage opens — so one HTTP round trip is inside the race and cannot be moved out of it. intern removes what it can: the nonce, the fees and the TLS handshakes are completed before T-0, leaving request → verify → sign → broadcast. The balance check stays inside the race, because the amount a wallet needs depends on the price the signature carries. A Merkle allow-list is the exception: its proof is computed locally, so that path pre-signs exactly like a public mint and is as fast as one.
 >
 > This paragraph is generated from `SPEED_STATEMENT` in `src/core/race.ts` and is
 > rendered identically in [CAPABILITY.md](CAPABILITY.md). Run `npm run docs` after

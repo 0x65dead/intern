@@ -75,6 +75,7 @@ function defaults(): Defaults {
     priorityGwei: null,
     leadMs: 0,
     openseaApiKey: null,
+    openseaScopedToken: null,
     telegramToken: "test-token",
     telegramAllowedIds: [ALLOWED, ALLOWED_GROUP],
     receiptTimeoutMs: 60_000,

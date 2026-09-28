@@ -107,6 +107,37 @@ const secrets = new Set<string>();
 const publicHashes = new Set<string>();
 const MAX_PUBLIC_HASHES = 4096;
 
+/**
+ * Registered secrets in their verbatim form, for the ones no shape can catch.
+ *
+ * The hex set above works because a private key has a shape a regex can find.
+ * The OpenSea credentials do not: an API key, a scoped PAT and a wallet JWT are
+ * opaque strings whose character class overlaps ordinary prose and ordinary
+ * URLs. Nothing about `read:eligibility` or a base64url run distinguishes a
+ * credential from a slug, so shape-matching them would either miss the secret or
+ * redact half the log.
+ *
+ * Identity is the only reliable answer for those, so the verbatim string is kept
+ * and struck by exact substring match. That covers the case that actually
+ * happens — a credential this process loaded appearing in an error, a header
+ * dump or a Telegram message — while {@link JWT_PATTERN} and friends below cover
+ * a token we never held, such as one quoted back at us in an API error body.
+ */
+const literalSecrets = new Set<string>();
+
+/**
+ * Below this length a "secret" is too short to strike safely.
+ *
+ * A registered value is replaced wherever it appears, so registering a short
+ * string would censor unrelated text: a 4-character token would blank every
+ * incidental occurrence of those 4 characters in every log line. Every real
+ * credential here clears this comfortably — an OpenSea API key is 32 characters,
+ * a scoped PAT is far longer, a private key is 64 hex — so the floor costs
+ * nothing and stops a misconfigured one-character value from redacting the whole
+ * output.
+ */
+const MIN_LITERAL_SECRET_LENGTH = 12;
+
 /** Strip an optional `0x` and case, so the two spellings of a value collide. */
 function normalizeHex(value: string): string {
   const trimmed = value.trim();
@@ -121,10 +152,36 @@ function normalizeHex(value: string): string {
  * secret is hidden no matter what else claims it is safe to print — which is what
  * stops a poisoned resume journal from laundering a key through
  * {@link markPublicHash}.
+ *
+ * Both forms are recorded. The hex set catches a private key however it is spelled
+ * (`0x`-prefixed or bare, upper or lower case), because normalising collapses
+ * those spellings onto one another. The literal set catches everything that is not
+ * hex — the OpenSea API key, the scoped PAT, a wallet JWT — where there is no
+ * canonical form to normalise to and case is significant.
  */
 export function registerSecret(value: string): void {
   const normal = normalizeHex(value);
   if (normal !== "") secrets.add(normal);
+
+  // Kept verbatim as well: a JWT is base64url, a PAT is opaque, and lowercasing
+  // either of them would produce a string that never appears in the output we are
+  // trying to censor.
+  //
+  // Key-shaped hex is the deliberate exception. A 64-hex run is already covered by
+  // the shape patterns below, and covered better than an exact-match pass could
+  // manage: they collapse both spellings onto one another, they still fire when a
+  // stray character is appended to the run, and they label what they strike
+  // `⟨redacted-key⟩`. That label is diagnostic — an operator reading a log can see
+  // *which kind* of credential escaped into it, which is the difference between
+  // rotating one key and rotating everything. Sending a private key down the
+  // literal path instead would still redact it, but anonymously, losing that
+  // signal for no gain. Shorter hex stays in the literal set: an API key that
+  // happens to be all hex is below the 64 characters the shape patterns look for,
+  // so identity is the only thing that would catch it.
+  const trimmed = value.trim();
+  if (trimmed.length < MIN_LITERAL_SECRET_LENGTH) return;
+  if (/^[a-f0-9]{64,}$/.test(normal)) return;
+  literalSecrets.add(trimmed);
 }
 
 /**
@@ -161,6 +218,7 @@ export function markPublicHash(hash: string): string {
 export function resetRedactionRegistry(): void {
   secrets.clear();
   publicHashes.clear();
+  literalSecrets.clear();
 }
 
 /** Hide a key-shaped run unless this process vouched for it as a tx hash. */
@@ -169,6 +227,67 @@ function hideUnlessPublic(match: string): string {
   const normal = normalizeHex(match);
   if (!secrets.has(normal) && publicHashes.has(normal)) return match;
   return prefixed ? "0x⟨redacted-key⟩" : "⟨redacted-key⟩";
+}
+
+/**
+ * A wallet JWT, by shape.
+ *
+ * Every JWT this bot handles is a JOSE compact serialisation, and the header is
+ * almost always `{"alg":…` — which base64url-encodes to a literal `eyJ` prefix.
+ * Anchoring on that rather than on "three dot-separated base64url runs" is what
+ * keeps the pattern from eating ordinary dotted identifiers such as a filename or
+ * a package name.
+ *
+ * This is the backstop for a token we never registered: one quoted back inside an
+ * OpenSea error body, or read from an environment we did not load. A token the
+ * auth manager fetched is already covered by identity.
+ */
+const JWT_PATTERN = /\beyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}/g;
+
+/**
+ * An API-key or authorization header, in the HTTP spelling or a JSON/object dump.
+ *
+ * `x-api-key: abc`, `"x-api-key":"abc"` and `X-API-KEY=abc` all reach a log along
+ * some path — a fetch error that quotes its own init object, a config dump in a
+ * debug line — and the key is the whole value, so the whole value goes.
+ *
+ * The value run deliberately extends to the end of the line, stopping only at a
+ * quote or a structural delimiter. A tighter class that stopped at the first space
+ * would match only the word `Bearer` in `Authorization: Bearer <token>` and leave
+ * the token itself sitting in the log — the precise failure this pattern exists to
+ * prevent. Over-redacting the tail of a header line costs nothing; under-redacting
+ * it costs the credential.
+ */
+const API_KEY_HEADER_PATTERN =
+  /\b(x-api-key|authorization|opensea[_-]?scoped[_-]?token|opensea[_-]?api[_-]?key)(["']?\s*[:=]\s*["']?)([^\r\n"',;}]{4,})/gi;
+
+/**
+ * A bearer credential with no header name in front of it.
+ *
+ * Matched separately because the header pattern above needs a header to anchor on,
+ * and a bearer token reaches output without one often enough to matter: inside a
+ * quoted curl invocation, or in an SDK error that prints the scheme and the
+ * credential but not the field. Anything following `Bearer` on the same line is a
+ * credential by definition, whatever it looks like.
+ */
+const BEARER_PATTERN = /\b(bearer)\s+[A-Za-z0-9._~+/=-]{8,}/gi;
+
+/**
+ * Strike every registered secret by exact match, longest first.
+ *
+ * Longest first matters when one credential contains another — a bearer header
+ * registered whole alongside the token inside it — because replacing the short
+ * one first would leave a mangled remainder of the long one that no later pass
+ * recognises. Done with split/join rather than a built regex so a credential
+ * containing regex metacharacters cannot alter the pattern's meaning.
+ */
+function redactLiterals(text: string): string {
+  if (literalSecrets.size === 0) return text;
+  let out = text;
+  for (const secret of [...literalSecrets].sort((a, b) => b.length - a.length)) {
+    if (out.includes(secret)) out = out.split(secret).join("⟨redacted-credential⟩");
+  }
+  return out;
 }
 
 /**
@@ -186,12 +305,20 @@ function hideUnlessPublic(match: string): string {
  * are both word characters, so `\b` does not hold and the token used to survive
  * every transport error verbatim. The lookbehind still refuses to start partway
  * through a longer digit run, which is what the `\b` was there for.
+ *
+ * Registered secrets are struck first, before any shape pattern runs. A
+ * credential this process loaded is hidden by identity, which is the only
+ * mechanism that works for the OpenSea API key, the scoped PAT and the wallet
+ * JWT — none of which have a shape distinguishable from ordinary text.
  */
 export function redactKeys(text: string): string {
-  return redactMnemonics(text)
+  return redactMnemonics(redactLiterals(text))
+    .replace(JWT_PATTERN, "⟨redacted-jwt⟩")
     .replace(/0[xX][a-fA-F0-9]{64,}/g, hideUnlessPublic)
     .replace(/\b[a-fA-F0-9]{64,}\b/g, hideUnlessPublic)
-    .replace(/(?<!\d)\d{6,10}:[A-Za-z0-9_-]{30,}/g, "⟨redacted-bot-token⟩");
+    .replace(/(?<!\d)\d{6,10}:[A-Za-z0-9_-]{30,}/g, "⟨redacted-bot-token⟩")
+    .replace(API_KEY_HEADER_PATTERN, (_m, name: string, sep: string) => `${name}${sep}⟨redacted⟩`)
+    .replace(BEARER_PATTERN, (_m, scheme: string) => `${scheme} ⟨redacted⟩`);
 }
 
 function toWallet(raw: string, position: number): Wallet {
@@ -315,6 +442,73 @@ export async function checkBalances(
       shortfall: balance !== null && balance < required ? required - balance : 0n,
     };
   });
+}
+
+/**
+ * Which wallets a balance report clears to sign, and which it does not.
+ *
+ * This exists because {@link checkBalances} answers *positionally* — element i
+ * describes wallets[i] — and every caller is one careless subscript away from
+ * pairing a report with the wrong wallet. That mistake is not symmetric. A
+ * missing element reads as `undefined`, `undefined?.sufficient !== false` is
+ * true, and the wallet is therefore treated as funded: a gate whose entire job
+ * is to stop a doomed broadcast passes everything instead, silently. Pairing on
+ * the address removes the subscript, and with it the whole class of bug.
+ *
+ * A wallet with no report at all is blocked rather than allowed. That is a
+ * different judgement from the one inside `checkBalances`, which deliberately
+ * treats an *unreadable* balance as sufficient so a flaky RPC read cannot cost
+ * the mint. The distinction is what the absence means: a null balance is a
+ * network that did not answer, while a missing report is a caller that passed
+ * mismatched arrays, and the safe response to "this gate was never evaluated"
+ * is not to assume it passed. `verified` says which of the two happened, so the
+ * operator sees "underfunded" or "funding unverified" and not one word covering
+ * both.
+ */
+export interface FundingSplit {
+  funded: LoadedWallet[];
+  blocked: {
+    wallet: LoadedWallet;
+    /** True when a report actually said insufficient; false when none existed. */
+    verified: boolean;
+  }[];
+}
+
+export function splitByFunding(
+  wallets: LoadedWallet[],
+  reports: readonly BalanceReport[],
+): FundingSplit {
+  const byAddress = new Map(reports.map((r) => [r.address.toLowerCase(), r]));
+  const split: FundingSplit = { funded: [], blocked: [] };
+  for (const wallet of wallets) {
+    const report = byAddress.get(wallet.address.toLowerCase());
+    if (report === undefined) {
+      split.blocked.push({ wallet, verified: false });
+    } else if (report.sufficient) {
+      split.funded.push(wallet);
+    } else {
+      split.blocked.push({ wallet, verified: true });
+    }
+  }
+  return split;
+}
+
+/**
+ * Pair positional per-wallet values with the wallets they were computed for.
+ *
+ * The companion to {@link splitByFunding}, for {@link fetchNonces} and anything
+ * else that answers one value per wallet in order. Keyed by lowercase address
+ * because that is the only identifier that survives being handed a subset.
+ */
+export function pairByAddress<T>(
+  wallets: LoadedWallet[],
+  values: readonly T[],
+): Map<string, T> {
+  const out = new Map<string, T>();
+  wallets.forEach((wallet, i) => {
+    if (i < values.length) out.set(wallet.address.toLowerCase(), values[i] as T);
+  });
+  return out;
 }
 
 /** Highest fee ceiling this balance can sustain, for a useful error message. */

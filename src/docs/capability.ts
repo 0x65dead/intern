@@ -185,7 +185,12 @@ It exists to be the place where intern says what it cannot do.`);
 
 ${SPEED_STATEMENT}
 
-Pre-arm work completes ${PRE_ARM_LEAD_MS / 1000} seconds before the stage opens.`);
+Pre-arm work — nonces, warm sockets, a measured clock offset — completes
+${PRE_ARM_LEAD_MS / 1000} seconds before the stage opens, so the race pays for
+none of it. That lead exists only when intern is waiting for a scheduled stage.
+Start it against a stage that is already open and there is no lead to use: the
+same preparation then happens inside the race, and the run says so rather than
+quietly being slower.`);
 
   sections.push(`## The matrix
 

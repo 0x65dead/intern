@@ -144,12 +144,12 @@ export const CAPABILITIES: readonly MechanismCapability[] = [
     detectWindow: {
       level: "warn",
       reason:
-        "Read from OpenSea's drop configuration, which requires OPENSEA_API_KEY. There is no on-chain record of this stage's window or price before it opens, which is why its price column shows an em dash rather than a number.",
+        "Read from OpenSea's drop configuration, which requires OPENSEA_API_KEY. There is no on-chain record of this stage before it opens, so the window, the stated price and the stated per-wallet cap all come from OpenSea rather than from the contract. Those are the stage's published terms; this wallet's own terms can differ and need the eligibility endpoint.",
     },
     precheckEligibility: {
-      level: "no",
+      level: "warn",
       reason:
-        "OpenSea publishes no eligibility endpoint. The only probe is the mint request itself, made as the wallet, and it answers only once the stage is open — 403 means not eligible. Before open, eligibility is genuinely unknown, and intern reports it as unknown rather than showing a tick it cannot justify.",
+        "OpenSea answers this before the stage opens, at /api/v2/drops/{slug}/eligibility, and intern asks during the pre-open lead rather than inferring a verdict from a refusal at T-0. It needs OPENSEA_SCOPED_TOKEN as well as the API key; without one, eligibility stays unknown and the run says so. The token authorises a single wallet, so in a multi-wallet run only that wallet gets an answer — the rest are reported unknown rather than assumed to match.",
     },
     preSign: {
       level: "no",

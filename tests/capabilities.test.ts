@@ -90,12 +90,23 @@ describe("the OpenSea signature constraint is stated, not hidden", () => {
     assert.match(row.preSign.level === "no" ? row.preSign.reason : "", /does not issue it before/i);
   });
 
-  it("refuses to claim eligibility is knowable in advance", () => {
-    assert.equal(row.precheckEligibility.level, "no");
-    assert.match(
-      row.precheckEligibility.level === "no" ? row.precheckEligibility.reason : "",
-      /403|unknown/i,
-    );
+  it("never claims eligibility unconditionally", () => {
+    // This assertion used to read `level === "no"`, on the belief that OpenSea
+    // published no eligibility endpoint and the only probe was the mint request
+    // itself — "403 means not eligible". Both halves were wrong. The endpoint
+    // exists, and a 403 is a statement about the API key, not the wallet.
+    //
+    // The guard is still worth having, so it is re-aimed rather than removed:
+    // the answer costs a second credential and covers exactly one wallet, so a
+    // plain "yes" would overclaim in precisely the direction that hurts — a run
+    // reporting a tick for wallets it never asked about. "warn" is the ceiling,
+    // and the conditions have to be in writing.
+    assert.equal(row.precheckEligibility.level, "warn");
+    const reason = row.precheckEligibility.level === "warn" ? row.precheckEligibility.reason : "";
+    assert.match(reason, /OPENSEA_SCOPED_TOKEN/);
+    assert.match(reason, /unknown/i);
+    assert.match(reason, /single wallet|one wallet/i);
+    assert.doesNotMatch(reason, /403 means not eligible/i);
   });
 
   it("says in writing that it is slower than a public mint", () => {

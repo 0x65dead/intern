@@ -24,22 +24,57 @@
 // the field. It simply means a gated mint is not a public mint and must not be
 // described as one.
 //
-// What this file does is make everything *else* zero. At T-0 the nonce is known,
-// the fees are decided, the balance is checked, the TLS sessions to both OpenSea
-// and the RPC endpoints are already open, and the only awaits remaining are the
-// signature request, the local sign, and the broadcast.
+// What the pre-arm makes zero is everything *else*. At T-0 the nonce is known, the
+// fees are decided, and the TLS sessions to both OpenSea and the RPC endpoints are
+// already open, so the only awaits remaining are the signature request, the local
+// sign, and the broadcast.
+//
+// The balance check is not among them, and earlier versions of this comment and of
+// SPEED_STATEMENT claimed it was. It cannot be: the amount a wallet needs is the
+// stage price plus the gas ceiling, and the price arrives with the signature. So
+// the check happens after the signature and inside the race, by construction. (The
+// eligibility endpoint does report a stage price, so a pre-open check against that
+// is possible in principle — but it is not implemented, and until it is, nothing
+// here should say it is.)
 //
 // A Merkle allow-list is the exception and is worth choosing when it is offered:
 // the proof is computed locally, so that path pre-signs exactly like a public
 // mint and is as fast as one.
+//
+// ── What this file no longer contains ───────────────────────────────────────
+//
+// It once held a second, parallel mint pipeline — preArm, pollForSignature,
+// fireSigned and describeArm — which nothing in src/ ever called. The live path
+// is core/allowlist.ts, reached from cli/index.ts. Keeping a fully-tested unused
+// duplicate of a mint path is not free, for three reasons:
+//
+//   pollForSignature *was* the probe-and-infer architecture: it asked the mint
+//   endpoint for a signature and read the refusal as a verdict on the wallet, so
+//   a 403 became "not eligible". A 403 is a statement about the caller's API key.
+//   Eligibility has exactly one source of truth — the eligibility endpoint — and
+//   a retry loop is not it. A tested function with a dependency-injection seam is
+//   not dormant; it is ready, and what it was ready to do was reintroduce that.
+//
+//   preArm duplicated work allowlist.ts already does, and did it correctly, which
+//   is worse than doing it wrong: two implementations that agree today diverge
+//   silently later, and only one of them is the one that runs.
+//
+//   describeArm's own documentation claimed its output reached the crash-recovery
+//   file. It did not — core/runstate.ts writes that, and tests/unattended.test.ts
+//   is what proves no key material reaches it.
+//
+// What survives here is scheduling policy and notification deferral: how long to
+// wait after a given answer, and how to avoid spending the race on a status
+// message. The pre-arm itself now lives where it can actually run — preArmAllowlist
+// in core/allowlist.ts, invoked from the lead window in core/watcher.ts.
 
-import { JsonRpcProvider, Wallet } from "ethers";
-import { ChainProfile } from "./chains";
-import { CorrectedClock } from "./clock";
-import { BlastOutcome, Endpoint, blast, prepare, warmConnections, wasAccepted } from "./blast";
 import { EngineEvent } from "./engine";
-import { GasSettings, LoadedWallet, fetchNonces } from "./wallets";
-import { OpenSeaError, RawMintTx, VerifyContext, requestMintTx, verifyAllowlistTx } from "./opensea";
+import {
+  EligibilityHint,
+  Failure,
+  OpenSeaEndpoint,
+  classifyOpenSeaFailure,
+} from "./failures";
 
 /**
  * The speed statement, in one place, so the docs and the code cannot drift.
@@ -50,9 +85,10 @@ export const SPEED_STATEMENT =
   "than a public mint and always will be. The signature is bound to one minter, " +
   "one quantity and one salt, and OpenSea does not issue it before the stage " +
   "opens — so one HTTP round trip is inside the race and cannot be moved out of " +
-  "it. intern removes everything else: nonce, fees, balance check and TLS " +
-  "handshakes are all completed before T-0, leaving request → verify → sign → " +
-  "broadcast. A Merkle allow-list is the exception: its proof is computed " +
+  "it. intern removes what it can: the nonce, the fees and the TLS handshakes are " +
+  "completed before T-0, leaving request → verify → sign → broadcast. The balance " +
+  "check stays inside the race, because the amount a wallet needs depends on the " +
+  "price the signature carries. A Merkle allow-list is the exception: its proof is computed " +
   "locally, so that path pre-signs exactly like a public mint and is as fast as one.";
 
 /** How long before the stage opens the pre-arm work must be finished. */
@@ -115,14 +151,15 @@ const MAX_BACKOFF_MS = 8_000;
 export type PollAction =
   | { kind: "fire" }
   | { kind: "retry"; delayMs: number }
-  | { kind: "stop"; reason: string };
+  | { kind: "stop"; reason: string; failure: Failure };
 
 /**
  * Exponential backoff, capped.
  *
- * Only applied to 429 and to transport failures. A 409 — "not open yet" — is the
- * expected answer for the whole pre-open window and must keep polling at the
- * base interval, because backing off there means arriving late to the open.
+ * Only applied to the answers that mean "the endpoint is unwell or annoyed". A
+ * 409 — "not open yet" — is the expected answer for the whole pre-open window and
+ * must keep polling at the base interval, because backing off there means
+ * arriving late to the open.
  */
 export function backoffDelayMs(attempt: number, baseMs: number, capMs = MAX_BACKOFF_MS): number {
   const exponent = Math.max(0, attempt - 1);
@@ -146,286 +183,65 @@ export function withJitter(delayMs: number, rand: () => number = Math.random): n
 /**
  * What to do about one poll outcome.
  *
- * `null` status means the payload arrived. The three terminal statuses are the
- * ones that will not fix themselves within a mint window: 401 (our key), 403
- * (this wallet is refused), 404 (no such drop). Everything else retries, because
- * everything else is either expected before the open or transient during it.
+ * `null` status means the payload arrived. Everything else is classified once, by
+ * failures.ts, and scheduled from the result — this function deliberately holds no
+ * opinion of its own about what a status means.
+ *
+ * It used to hold one, and it was wrong in a way that mattered: it read a 403 as
+ * "OpenSea refused this wallet — it is not eligible for this stage". A 403 is a
+ * statement about the caller's permissions, never a verdict on a wallet's place on
+ * a list, and printing that sentence sent an operator looking for an allowlist
+ * problem when the real fault was a key without drop permissions. Eligibility has
+ * exactly one source of truth (the eligibility endpoint), and a retry scheduler is
+ * not it.
+ *
+ * The scheduling rule, in priority order:
+ *
+ *   terminal          → stop, carrying the code so the caller can act on it
+ *   pre-open answer   → retry at the base rate; this is the window the signature
+ *                       is expected to appear in, and slowing down here loses it
+ *   Retry-After       → obey it, or our own backoff if that is longer
+ *   anything else     → back off; the endpoint is unwell or we are unexplained
  */
 export function planNextPoll(
   status: number | null,
   attempt: number,
-  opts: { pollMs: number; retryAfterMs?: number | null; rand?: () => number },
+  opts: {
+    pollMs: number;
+    retryAfterMs?: number | null;
+    rand?: () => number;
+    /** Which endpoint answered. Only the mint endpoint is polled today. */
+    endpoint?: OpenSeaEndpoint;
+    /** Resolves an ambiguous 422 when a real eligibility answer is held. */
+    eligibility?: EligibilityHint | null;
+  },
 ): PollAction {
   if (status === null) return { kind: "fire" };
 
   const base = Math.max(MIN_POLL_MS, opts.pollMs);
   const rand = opts.rand ?? Math.random;
-
-  switch (status) {
-    case 401:
-      return { kind: "stop", reason: "OpenSea rejected the API key (401). Polling cannot succeed." };
-    case 403:
-      return {
-        kind: "stop",
-        reason: "OpenSea refused this wallet (403) — it is not eligible for this stage.",
-      };
-    case 404:
-      return { kind: "stop", reason: "OpenSea has no such drop (404). Polling cannot succeed." };
-    case 429: {
-      // Retry-After wins over our own backoff whenever it is longer. Racing it
-      // just extends the limit.
-      const ours = backoffDelayMs(attempt, base);
-      const theirs = opts.retryAfterMs ?? 0;
-      return { kind: "retry", delayMs: withJitter(Math.max(ours, theirs), rand) };
-    }
-    case 409:
-    case 422:
-      // The pre-open answers. Poll at the base rate — this is the window the
-      // signature is expected to appear in, and slowing down here loses the race.
-      return { kind: "retry", delayMs: withJitter(base, rand) };
-    default:
-      // 5xx, and status 0 for a transport failure. Back off; the endpoint is
-      // unwell and hammering it does not help.
-      return { kind: "retry", delayMs: withJitter(backoffDelayMs(attempt, base), rand) };
-  }
-}
-
-// ── Pre-arm ─────────────────────────────────────────────────────────────────
-
-export interface ArmedWallet {
-  wallet: LoadedWallet;
-  nonce: number;
-}
-
-export interface ArmedRace {
-  wallets: ArmedWallet[];
-  gas: GasSettings;
-  chainId: number;
-  armedAtMs: number;
-}
-
-export interface PreArmOptions {
-  provider: JsonRpcProvider;
-  chain: ChainProfile;
-  wallets: LoadedWallet[];
-  gas: GasSettings;
-  /** RPC endpoints to open sockets to, plus the OpenSea origin. */
-  warmUrls: string[];
-  clock: CorrectedClock;
-}
-
-const OPENSEA_ORIGIN = "https://api.opensea.io";
-
-/**
- * Do every slow thing now, so T-0 has none of it left.
- *
- * Warming is deliberately included: a cold TLS handshake to OpenSea is two round
- * trips before the request that matters even starts, and the same to each RPC
- * endpoint on the way out. Both are free to pay a minute early and expensive to
- * pay at T-0.
- */
-export async function preArm(opts: PreArmOptions): Promise<ArmedRace> {
-  const nonces = await fetchNonces(opts.provider, opts.wallets);
-
-  const armed: ArmedWallet[] = opts.wallets.map((wallet, i) => {
-    const nonce = nonces[i];
-    if (nonce === undefined) {
-      throw new Error(`Missing nonce for wallet ${wallet.index} (${wallet.address}).`);
-    }
-    return { wallet, nonce };
-  });
-
-  // Warming is best-effort: a refused pre-connect is not a reason to abort a
-  // mint, only a reason to pay the handshake later.
-  await warmConnections([...opts.warmUrls, OPENSEA_ORIGIN]).catch(() => undefined);
-
-  return {
-    wallets: armed,
-    gas: opts.gas,
-    chainId: opts.chain.chainId,
-    armedAtMs: opts.clock.now(),
-  };
-}
-
-/**
- * A serialisable snapshot of the armed state.
- *
- * Used by the crash-recovery state file and by any log line describing the arm.
- * It carries no key material and must never carry any — `LoadedWallet.key` is
- * deliberately not reachable from the returned shape, and a test asserts that the
- * JSON of a real arm contains nothing key-shaped.
- */
-export function describeArm(armed: ArmedRace): {
-  chainId: number;
-  armedAtMs: number;
-  gas: { maxFeePerGas: string; maxPriorityFeePerGas: string; gasLimit: string };
-  wallets: { index: number; address: string; nonce: number }[];
-} {
-  return {
-    chainId: armed.chainId,
-    armedAtMs: armed.armedAtMs,
-    gas: {
-      maxFeePerGas: armed.gas.maxFeePerGas.toString(),
-      maxPriorityFeePerGas: armed.gas.maxPriorityFeePerGas.toString(),
-      gasLimit: armed.gas.gasLimit.toString(),
+  const failure = classifyOpenSeaFailure(
+    { status, retryAfterMs: opts.retryAfterMs ?? null },
+    {
+      endpoint: opts.endpoint ?? "mint",
+      ...(opts.eligibility !== undefined ? { eligibility: opts.eligibility } : {}),
     },
-    wallets: armed.wallets.map((a) => ({
-      index: a.wallet.index,
-      address: a.wallet.address,
-      nonce: a.nonce,
-    })),
-  };
-}
+  );
 
-// ── The poll loop ───────────────────────────────────────────────────────────
-
-export type PollResult =
-  | { kind: "payload"; raw: RawMintTx; attempts: number }
-  | { kind: "refused"; reason: string; attempts: number }
-  | { kind: "timeout"; attempts: number };
-
-export interface PollOptions {
-  slug: string;
-  apiKey: string;
-  minter: string;
-  quantity: number;
-  pollMs: number;
-  /** Corrected-clock instant to give up at. */
-  deadlineMs: number;
-  clock: CorrectedClock;
-  rand?: () => number;
-  signal?: AbortSignal;
-  /** Injected in tests so the loop runs without real time. */
-  sleep?: (ms: number) => Promise<void>;
-  /** Injected in tests so the loop runs without network. */
-  request?: typeof requestMintTx;
-}
-
-const realSleep = (ms: number): Promise<void> =>
-  new Promise((resolve) => setTimeout(resolve, ms));
-
-/**
- * Ask OpenSea for a signature until it gives one, refuses, or time runs out.
- *
- * Nothing is emitted from in here. The caller owns notification and does it after
- * the transaction is away — see DeferredEmitter.
- */
-export async function pollForSignature(opts: PollOptions): Promise<PollResult> {
-  const sleep = opts.sleep ?? realSleep;
-  const send = opts.request ?? requestMintTx;
-  let attempt = 0;
-
-  for (;;) {
-    if (opts.signal?.aborted) return { kind: "refused", reason: "Cancelled.", attempts: attempt };
-    if (opts.clock.now() >= opts.deadlineMs) return { kind: "timeout", attempts: attempt };
-
-    attempt += 1;
-    let status: number | null = null;
-    let retryAfterMs: number | null = null;
-    let payload: RawMintTx | null = null;
-
-    try {
-      payload = await send(opts.slug, opts.apiKey, opts.minter, opts.quantity);
-    } catch (err: unknown) {
-      if (err instanceof OpenSeaError) {
-        status = err.status;
-        retryAfterMs = err.retryAfterMs;
-      } else {
-        // A non-OpenSeaError is a bug or a parse failure, not a transport blip.
-        // Treated as a 500 so it backs off rather than spinning.
-        status = 500;
-      }
-    }
-
-    if (payload) return { kind: "payload", raw: payload, attempts: attempt };
-
-    const action = planNextPoll(status, attempt, {
-      pollMs: opts.pollMs,
-      retryAfterMs,
-      ...(opts.rand ? { rand: opts.rand } : {}),
-    });
-    if (action.kind === "stop") return { kind: "refused", reason: action.reason, attempts: attempt };
-    if (action.kind === "fire") {
-      // `status === null` with no payload — `requestMintTx` resolved to nothing
-      // while promising a transaction. Unreachable while it honours its own
-      // return type, and the `!` that used to stand here asserted exactly that:
-      // the compiler has narrowed `payload` to `null` on this line, because the
-      // truthy case returned three lines up.
-      //
-      // Reported as a refusal rather than handed back as `raw: null`, which the
-      // caller would carry into the fire path and try to broadcast.
-      return {
-        kind: "refused",
-        reason: "OpenSea returned neither a transaction nor an error.",
-        attempts: attempt,
-      };
-    }
-
-    // Never sleep past the deadline — waking up after it wastes the remainder.
-    const remaining = opts.deadlineMs - opts.clock.now();
-    if (remaining <= 0) return { kind: "timeout", attempts: attempt };
-    await sleep(Math.min(action.delayMs, remaining));
-  }
-}
-
-// ── Fire ────────────────────────────────────────────────────────────────────
-
-export interface FireOptions {
-  armed: ArmedWallet;
-  /** The raw response from OpenSea. Verified here before it is ever signed. */
-  payload: RawMintTx;
-  chain: ChainProfile;
-  gas: GasSettings;
-  verify: VerifyContext;
-  endpoints: Endpoint[];
-}
-
-export type FireResult =
-  | { ok: true; txHash: string; endpoints: string[] }
-  | { ok: false; error: string };
-
-/**
- * Verify, sign and broadcast, with no avoidable await in between.
- *
- * The verify step is not optional and is not a formality: these bytes came from
- * an HTTP response and are about to be signed by the operator's key. They are
- * checked against the chain, contract, minter and quantity we already knew before
- * the signature was requested.
- *
- * The broadcast goes to every endpoint at once rather than in order. One slow
- * endpoint must not decide when the transaction reaches the mempool, and the
- * duplicates are rejected harmlessly as already-known.
- */
-export async function fireSigned(opts: FireOptions): Promise<FireResult> {
-  let raw: string;
-  try {
-    const verified = verifyAllowlistTx(opts.payload, opts.verify);
-    raw = await new Wallet(opts.armed.wallet.key).signTransaction({
-      to: verified.to,
-      data: verified.data,
-      value: verified.value,
-      nonce: opts.armed.nonce,
-      maxFeePerGas: opts.gas.maxFeePerGas,
-      maxPriorityFeePerGas: opts.gas.maxPriorityFeePerGas,
-      gasLimit: opts.gas.gasLimit,
-      type: 2,
-      chainId: opts.chain.chainId,
-    });
-  } catch (err: unknown) {
-    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  if (failure.terminal) {
+    return { kind: "stop", reason: `${failure.message} (HTTP ${status})`, failure };
   }
 
-  const prepared = prepare(raw);
-  const handle = blast(prepared, opts.endpoints);
-  const outcomes: BlastOutcome[] = await handle.outcomes;
+  // The pre-open answers. A closed drop and the ambiguous 422 are both what a
+  // healthy endpoint says before a stage opens, so neither is a reason to slow
+  // down — the poll rate here is the difference between arriving at T-0 and
+  // arriving after it.
+  const preOpen =
+    failure.code === "DROP_NOT_ACTIVE" || failure.code === "STAGE_NOT_ACTIVE" || status === 422;
+  if (preOpen) return { kind: "retry", delayMs: withJitter(base, rand) };
 
-  if (!wasAccepted(outcomes)) {
-    const first = outcomes.find((o) => o.error !== null);
-    return { ok: false, error: first?.error ?? "No endpoint accepted the transaction." };
-  }
-  return {
-    ok: true,
-    txHash: prepared.txHash,
-    endpoints: outcomes.filter((o) => o.error === null).map((o) => o.label),
-  };
+  // Racing a limiter extends the limit, so the longer of the two waits wins.
+  const ours = backoffDelayMs(attempt, base);
+  const theirs = failure.retryAfterMs ?? 0;
+  return { kind: "retry", delayMs: withJitter(Math.max(ours, theirs), rand) };
 }

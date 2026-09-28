@@ -12,9 +12,13 @@
 //
 //     sign in advance → stage opens → broadcast
 //
-// The API round trip therefore lands *inside* the race, and the only things that
-// can be moved out of it are the socket warm-up, the balance check, the nonce
-// fetch and the fee decision — all of which are.
+// The API round trip therefore lands *inside* the race. What can be lifted out of
+// it is the socket warm-up, the nonce fetch and the clock offset, and preArmAllowlist
+// does exactly that, running them during the watcher's lead window before the stage
+// opens rather than after. What cannot be lifted out is the signature and the
+// balance check that depends on the price the signature carries — that check is
+// only possible once OpenSea has answered, so it stays inside the race by
+// construction, and no wording here should suggest otherwise.
 //
 // The other difference is trust. A public mint's calldata is built locally from
 // contract reads, so it cannot be tampered with. Here the bytes come from an HTTP
@@ -25,7 +29,7 @@
 import { JsonRpcProvider, Wallet } from "ethers";
 import { ChainProfile } from "./chains";
 import { EngineEvent, EngineResult } from "./engine";
-import { syncClock } from "./clock";
+import { ClockSync, syncClock } from "./clock";
 import {
   Endpoint,
   blast,
@@ -45,6 +49,8 @@ import {
   requiredBalance,
 } from "./wallets";
 import { OpenSeaError, VerifiedMintTx, requestMintTx, verifyAllowlistTx } from "./opensea";
+import { EligibilityHint, FailureCode, localFailure } from "./failures";
+import { planNextPoll } from "./race";
 
 export interface AllowlistOptions {
   chain: ChainProfile;
@@ -56,9 +62,35 @@ export interface AllowlistOptions {
   readUrls: string[];
   blastUrls: string[];
   gas: GasSettings;
-  /** Retry a 409/422 for this long before giving up. */
+  /** Keep retrying the transient rejections for this long before giving up. */
   retryWindowMs?: number;
+  /** Base poll interval. Backoff and jitter are applied on top of it. */
   retryIntervalMs?: number;
+  /**
+   * What the eligibility endpoint said about each wallet, when it was asked.
+   *
+   * Present only to disambiguate a 422, which on its own covers four different
+   * causes. With a real eligibility answer beside it the same status resolves to
+   * exactly one — and that is the whole reason for fetching eligibility early
+   * rather than inferring it from a refusal.
+   *
+   * Keyed by lowercased address, and deliberately not a single hint shared across
+   * the run: eligibility is per wallet, and two wallets on the same drop routinely
+   * differ. One shared hint would let a 422 for wallet B be explained by wallet
+   * A's allowance — a wrong code, stated confidently, which is the failure this
+   * whole classification layer exists to avoid. A wallet with no entry gets null
+   * and the 422 stays ambiguous, which is the honest answer.
+   */
+  eligibility?: ReadonlyMap<string, EligibilityHint> | null;
+  /**
+   * Work already completed during the pre-open lead window.
+   *
+   * When present, the socket warm-up and clock sync are not repeated — they were
+   * done before the stage opened, which is the entire point of having a lead.
+   * When absent (the stage was already open on arrival, so there was no lead to
+   * use) the same work happens here instead, and the race pays for it.
+   */
+  prearmed?: PreArmed | null;
   receiptTimeoutMs?: number;
   signal?: AbortSignal;
 }
@@ -78,7 +110,21 @@ export type NoncedWallet = LoadedWallet & { nonce: number };
  * 409 and 422 both mean "not right now" and both are common in the first seconds
  * of a stage: the drop's state is propagating, and an allowlist check can lag the
  * stage opening by a block or two. Retrying briefly converts a lost mint into a
- * slightly later one. 401/403/404 are not retried — they will not fix themselves.
+ * slightly later one.
+ *
+ * Which answers are worth retrying, and how long to wait, is not decided here —
+ * planNextPoll decides it from the classified failure. This loop previously had its
+ * own policy and it was wrong in two ways that only show up under load. It waited a
+ * flat 1.5s regardless, so several wallets retried in lockstep and looked precisely
+ * like the burst a rate limiter exists to stop; and it retried only 409/422/429, so
+ * a 503 or a dropped connection — both entirely ordinary in the first seconds of a
+ * contested drop — ended the wallet's mint outright instead of being tried again a
+ * moment later.
+ *
+ * What is decided here is that a verification failure is never retried. Everything
+ * below verifyAllowlistTx has been checked against values we hold independently; a
+ * response that fails those checks is refused, and asking again is not a remedy for
+ * calldata that did not say what it should have.
  */
 async function buildForWallet(
   opts: AllowlistOptions,
@@ -86,10 +132,24 @@ async function buildForWallet(
   emit: (event: EngineEvent) => void,
 ): Promise<BuiltTx | null> {
   const deadline = Date.now() + (opts.retryWindowMs ?? 20_000);
-  const interval = opts.retryIntervalMs ?? 1_500;
+  const pollMs = opts.retryIntervalMs ?? 1_500;
+  let attempt = 0;
+
+  const giveUp = (message: string, code?: FailureCode): null => {
+    emit({
+      type: "simulation",
+      ok: false,
+      index: wallet.index,
+      address: wallet.address,
+      error: message,
+      ...(code !== undefined ? { code } : {}),
+    });
+    return null;
+  };
 
   for (;;) {
     if (opts.signal?.aborted) return null;
+    attempt += 1;
     try {
       const raw = await requestMintTx(opts.slug, opts.apiKey, wallet.address, opts.quantity);
 
@@ -116,21 +176,37 @@ async function buildForWallet(
       });
       return { wallet, verified, raw: signed };
     } catch (err: unknown) {
-      const retryable = err instanceof OpenSeaError && err.retryable;
       const message = err instanceof Error ? err.message : String(err);
 
-      if (!retryable || Date.now() >= deadline) {
-        emit({
-          type: "simulation",
-          ok: false,
-          index: wallet.index,
-          address: wallet.address,
-          error: message,
-        });
-        return null;
+      // Not an HTTP failure: either verifyAllowlistTx refused the response or the
+      // local sign failed. Neither is a "try again" — the first is the security
+      // boundary doing its job and the second is a configuration fault.
+      if (!(err instanceof OpenSeaError)) {
+        return giveUp(message, localFailure("SIMULATION_REVERT").code);
       }
-      emit({ type: "warning", message: `[W${wallet.index}] ${message} Retrying.` });
-      await new Promise((resolve) => setTimeout(resolve, interval));
+
+      const action = planNextPoll(err.status, attempt, {
+        pollMs,
+        retryAfterMs: err.retryAfterMs,
+        endpoint: "mint",
+        eligibility: opts.eligibility?.get(wallet.address.toLowerCase()) ?? null,
+      });
+
+      if (action.kind === "stop") return giveUp(action.reason, action.failure.code);
+      // `fire` requires a null status, which an OpenSeaError never carries.
+      if (action.kind === "fire") return giveUp(message);
+
+      // Waiting past the deadline is the same as giving up, but reporting it as a
+      // wait that was never taken is clearer than reporting it as a refusal.
+      if (Date.now() + action.delayMs >= deadline) {
+        return giveUp(`${message} Retry window exhausted.`);
+      }
+
+      emit({
+        type: "warning",
+        message: `[W${wallet.index}] ${message} Retrying in ${action.delayMs}ms.`,
+      });
+      await new Promise((resolve) => setTimeout(resolve, action.delayMs));
     }
   }
 }
@@ -149,12 +225,20 @@ export async function runAllowlistMint(
   try {
     emit({ type: "phase", name: "prepare", detail: `${wallets.length} wallet(s), allowlist stage` });
 
-    // Everything that can be done before the signature request is done now, so
-    // the API round trip is the only thing left inside the race.
-    const [, clockSync] = await Promise.all([
-      warmConnections(blastUrls, opts.signal ? { signal: opts.signal } : {}),
-      syncClock(readUrls, chain.blockTimeSec, { rounds: 2 }),
-    ]);
+    // Everything that does not need the signature is done before the signature
+    // request, so the API round trip is the only thing left inside the race.
+    // Ideally it was done before the stage even opened — see preArmAllowlist.
+    let clockSync: ClockSync;
+    if (opts.prearmed) {
+      assertPreArmCovers(opts.prearmed, wallets);
+      clockSync = opts.prearmed.clock;
+    } else {
+      const [, measured] = await Promise.all([
+        warmConnections(blastUrls, opts.signal ? { signal: opts.signal } : {}),
+        syncClock(readUrls, chain.blockTimeSec, { rounds: 2 }),
+      ]);
+      clockSync = measured;
+    }
     emit({ type: "clock", sync: clockSync });
 
     emit({ type: "phase", name: "sign", detail: "requesting signatures from OpenSea" });
@@ -297,4 +381,68 @@ export async function withNonces(
     }
     return { ...wallet, nonce };
   });
+}
+
+/** Work finished before the stage opens, so the race does not have to pay for it. */
+export interface PreArmed {
+  /** Wallets with their pending nonce attached, ready to sign. */
+  wallets: NoncedWallet[];
+  /** The clock offset measured during the lead, to be reused rather than re-measured. */
+  clock: ClockSync;
+  /** When the preparation finished, so an operator can see the lead actually achieved. */
+  completedAtMs: number;
+}
+
+/**
+ * Do everything the mint needs that does not depend on OpenSea's signature.
+ *
+ * This exists because the module header above claims the socket warm-up, the
+ * nonce fetch and the fee decision are moved out of the race — and until this
+ * function was called from the watcher's lead window, that claim was false. The
+ * work was happening, but it was happening after the stage had already opened,
+ * which is the one moment it is expensive. Three RPC round trips and a TLS
+ * handshake cost the same number of milliseconds wherever they run; the only
+ * question is whether a contested mint is waiting on them.
+ *
+ * What cannot be moved is the signature itself, and the balance check that
+ * depends on the price it carries. Those stay inside the race by construction.
+ *
+ * One consequence worth stating: nonces fetched during the lead are a snapshot.
+ * If the same wallet sends another transaction between the lead and the mint,
+ * the snapshot is stale and the mint will be rejected as a duplicate nonce. For
+ * a single operator with a wallet dedicated to the drop that is not a real risk,
+ * and it is the same exposure the pre-signing public path already accepts — but
+ * it is a reason not to widen the lead much beyond a minute.
+ */
+export async function preArmAllowlist(opts: {
+  provider: JsonRpcProvider;
+  wallets: LoadedWallet[];
+  readUrls: string[];
+  blastUrls: string[];
+  blockTimeSec: number;
+  signal?: AbortSignal;
+}): Promise<PreArmed> {
+  const [wallets, , clock] = await Promise.all([
+    withNonces(opts.provider, opts.wallets),
+    warmConnections(opts.blastUrls, opts.signal ? { signal: opts.signal } : {}),
+    syncClock(opts.readUrls, opts.blockTimeSec, { rounds: 2 }),
+  ]);
+  return { wallets, clock, completedAtMs: Date.now() };
+}
+
+/**
+ * Refuse a pre-arm that does not cover every wallet about to mint.
+ *
+ * Passing `prearmed` from one wallet set and `wallets` from another would mint
+ * with a nonce belonging to a different account, which the network discards
+ * silently — the same failure mode withNonces refuses to default into.
+ */
+function assertPreArmCovers(prearmed: PreArmed, wallets: NoncedWallet[]): void {
+  const armed = new Set(prearmed.wallets.map((w) => w.address.toLowerCase()));
+  const missing = wallets.find((w) => !armed.has(w.address.toLowerCase()));
+  if (missing) {
+    throw new Error(
+      `Pre-arm does not cover wallet ${missing.index} (${missing.address}) — no nonce was fetched for it. Nothing was sent.`,
+    );
+  }
 }
