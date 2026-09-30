@@ -148,12 +148,29 @@ nothing to conceal, and silence reads as a broken button).
 ### Two locks, deliberately different
 
 ```ts
-private running: number | null = null;   // chatId holding the lock, or null
+private readonly scheduler = new TaskScheduler(() => this.clock.now());
 ```
 
-One mint run at a time **globally**, not per chat: the wallets come from a single
-`.env`, and two concurrent runs would sign different transactions with the same
-nonces. Only `fire()` takes this lock.
+One mint run at a time **per wallet**, across every chat. This was a single
+`running: number | null` chat id, which serialized every run against every other
+whatever wallets they used. That is the safe answer, but it is the safe answer
+arrived at by not asking the question: the collision belongs to a wallet — two runs
+signing with one key produce two transactions at one nonce and the network keeps
+exactly one — and two runs on disjoint keys cannot collide at all. A flag next to
+the wallet locks was also a second answer to "may this run start", and two answers
+drift.
+
+So `launch()` asks `scheduler.walletHolders()` which of its wallets are committed,
+refuses if any are, and otherwise submits the run as a task that holds those
+wallets until it settles. Contention refuses rather than queues, deliberately: a
+mint that waits for an unrelated run is usually a mint whose stage has closed, and
+firing it late and unattended at a price nobody re-confirmed is worse than not
+firing it. The refusal names the wallets.
+
+The bot has no per-run wallet selection yet, so every run asks for every loaded key
+and the observable behaviour is still one run at a time — which is why the change
+was safe to make before the selection exists. `--wallets` on the CLI is the narrower
+set today.
 
 Read-only panels — `check`, `stages`, `wallets`, `status` — never take it. They
 read; they cannot spend. Holding the run lock to display a countdown would mean one

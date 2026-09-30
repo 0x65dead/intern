@@ -8,7 +8,8 @@
 
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { ENV_TEMPLATE, readDefaults } from "../src/util/env";
+import { parseEther } from "ethers";
+import { ConfigError, ENV_TEMPLATE, readDefaults } from "../src/util/env";
 
 const BASE: NodeJS.ProcessEnv = {};
 
@@ -23,11 +24,30 @@ describe("ALLOWLIST_MINTING", () => {
     }
   });
 
-  it("treats anything else as off, including a typo", () => {
-    // The failure mode this guards: a value the operator believed was on,
-    // silently enabling nothing, is recoverable. The reverse is not.
-    for (const value of ["0", "false", "no", "off", "maybe", "ture", "", "  "]) {
+  it("reads the explicit noes as off", () => {
+    for (const value of ["0", "false", "no", "off", "FALSE", " Off "]) {
       assert.equal(readDefaults({ ALLOWLIST_MINTING: value }).allowlistMinting, false, value);
+    }
+  });
+
+  it("treats saying nothing as off — public-only needs no opt-out", () => {
+    for (const value of ["", "  "]) {
+      assert.equal(readDefaults({ ALLOWLIST_MINTING: value }).allowlistMinting, false, value);
+    }
+  });
+
+  it("refuses a value it cannot read rather than guessing at off", () => {
+    // This used to answer "off", on the reasoning that a flag the operator
+    // believed was on but silently was not costs a missed mint and no money.
+    // True for this flag — and the same helper reads DRY_RUN, where guessing
+    // "off" spends money. There is no direction that is safe for both, so the
+    // parser stops choosing one.
+    for (const value of ["maybe", "ture", "y", "n", "2"]) {
+      assert.throws(
+        () => readDefaults({ ALLOWLIST_MINTING: value }),
+        (err: unknown) => err instanceof ConfigError && /ALLOWLIST_MINTING/.test(err.message),
+        value,
+      );
     }
   });
 });
@@ -40,6 +60,111 @@ describe("DRY_RUN", () => {
 
   it("turns on for an unambiguous yes", () => {
     assert.equal(readDefaults({ DRY_RUN: "1" }).dryRun, true);
+    for (const value of ["true", "yes", "on", "TRUE", " On "]) {
+      assert.equal(readDefaults({ DRY_RUN: value }).dryRun, true, value);
+    }
+  });
+
+  it("stays off for an explicit no", () => {
+    for (const value of ["0", "false", "no", "off"]) {
+      assert.equal(readDefaults({ DRY_RUN: value }).dryRun, false, value);
+    }
+  });
+
+  it("refuses a typo instead of quietly minting for real", () => {
+    // The flag exists to stop money moving. Read as "off", a misspelling hands
+    // an operator who believed they were rehearsing a live mint — which is the
+    // one transition that must never happen by accident.
+    for (const value of ["ture", "flase", "yess", "enabled", "dry"]) {
+      assert.throws(
+        () => readDefaults({ DRY_RUN: value }),
+        (err: unknown) => err instanceof ConfigError && /DRY_RUN/.test(err.message),
+        value,
+      );
+    }
+  });
+});
+
+describe("QUANTITY", () => {
+  it("is one when unset or blank", () => {
+    assert.equal(readDefaults(BASE).quantity, 1);
+    assert.equal(readDefaults({ QUANTITY: "" }).quantity, 1);
+    assert.equal(readDefaults({ QUANTITY: "  " }).quantity, 1);
+  });
+
+  it("takes a whole number", () => {
+    assert.equal(readDefaults({ QUANTITY: "3" }).quantity, 3);
+    assert.equal(readDefaults({ QUANTITY: " 12 " }).quantity, 12);
+  });
+
+  it("refuses zero rather than buying one", () => {
+    // `Math.max(1, ...)` used to turn an operator who asked for nothing into an
+    // operator who bought one. There is no safe guess at how much to spend.
+    assert.throws(
+      () => readDefaults({ QUANTITY: "0" }),
+      (err: unknown) => err instanceof ConfigError && /QUANTITY/.test(err.message),
+    );
+  });
+
+  it("refuses anything else it cannot spend against", () => {
+    // Including the forms `Number()` would happily read as something far larger
+    // than they look: 0x2 is 2, and 1e3 is a thousand mints.
+    for (const value of ["-1", "abc", "1.5", "2.0", "1e400", "1e3", "NaN", "0x2", "+1", "1 000"]) {
+      assert.throws(
+        () => readDefaults({ QUANTITY: value }),
+        (err: unknown) => err instanceof ConfigError,
+        value,
+      );
+    }
+  });
+});
+
+describe("MAX_PRICE_PER_NFT", () => {
+  it("is null when unset or blank, meaning no ceiling", () => {
+    assert.equal(readDefaults(BASE).maxPricePerNftWei, null);
+    assert.equal(readDefaults({ MAX_PRICE_PER_NFT: "" }).maxPricePerNftWei, null);
+    assert.equal(readDefaults({ MAX_PRICE_PER_NFT: "   " }).maxPricePerNftWei, null);
+  });
+
+  it("reads whole native currency and converts to wei", () => {
+    // The unit is the one the drop is advertised in. Asking for wei would invite
+    // an eighteen-digit typo in the setting whose whole job is catching a price
+    // that is wrong by orders of magnitude.
+    assert.equal(readDefaults({ MAX_PRICE_PER_NFT: "0.05" }).maxPricePerNftWei, parseEther("0.05"));
+    assert.equal(readDefaults({ MAX_PRICE_PER_NFT: " 1 " }).maxPricePerNftWei, parseEther("1"));
+    assert.equal(readDefaults({ MAX_PRICE_PER_NFT: "0.000000000000000001" }).maxPricePerNftWei, 1n);
+  });
+
+  it("keeps a ceiling of zero as zero, not as unset", () => {
+    // An operator who writes 0 is asking for free mints only. Collapsing that to
+    // null would silently lift the strictest ceiling on offer.
+    assert.equal(readDefaults({ MAX_PRICE_PER_NFT: "0" }).maxPricePerNftWei, 0n);
+    assert.equal(readDefaults({ MAX_PRICE_PER_NFT: "0.0" }).maxPricePerNftWei, 0n);
+  });
+
+  it("refuses a value it cannot read as a price", () => {
+    // Same reasoning as QUANTITY, with more at stake: 1e3 and 0x2 are both
+    // numbers to JavaScript and neither means what it looks like. A ceiling
+    // silently a thousand times too high is not a ceiling.
+    for (const value of ["1e3", "0x2", "abc", "-1", "0.05 ETH", "1,5", ".5", "1.", "+1", "1e-3"]) {
+      assert.throws(
+        () => readDefaults({ MAX_PRICE_PER_NFT: value }),
+        (err: unknown) =>
+          err instanceof ConfigError && /MAX_PRICE_PER_NFT/.test(err.message),
+        value,
+      );
+    }
+  });
+
+  it("refuses an amount finer than wei rather than rounding it", () => {
+    assert.throws(
+      () => readDefaults({ MAX_PRICE_PER_NFT: "0.0000000000000000001" }),
+      (err: unknown) => err instanceof ConfigError && /MAX_PRICE_PER_NFT/.test(err.message),
+    );
+  });
+
+  it("is documented in the template it is read from", () => {
+    assert.match(ENV_TEMPLATE, /MAX_PRICE_PER_NFT/);
   });
 });
 

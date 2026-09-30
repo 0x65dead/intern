@@ -7,7 +7,7 @@
 
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { ArgError, parseArgs } from "../src/cli/args";
+import { ArgError, HELP, parseArgs } from "../src/cli/args";
 
 describe("parseArgs — commands", () => {
   it("leaves the command null when given nothing, which prints help", () => {
@@ -69,6 +69,41 @@ describe("parseArgs — values", () => {
   it("supports -h and -v shorthands", () => {
     assert.equal(parseArgs(["-h"]).help, true);
     assert.equal(parseArgs(["-v"]).version, true);
+  });
+});
+
+describe("parseArgs — --wallets", () => {
+  // Kept as text, not resolved here: turning "0,2" into wallets needs the loaded
+  // keyring, and this parser deliberately never sees a key.
+
+  it("is absent unless given, which means every loaded wallet", () => {
+    assert.equal(parseArgs(["mint", "x"]).wallets, undefined);
+  });
+
+  it("reads the spec verbatim, long and short, spaced and inline", () => {
+    assert.equal(parseArgs(["mint", "x", "--wallets", "0,2"]).wallets, "0,2");
+    assert.equal(parseArgs(["mint", "x", "--wallets=1-3"]).wallets, "1-3");
+    assert.equal(parseArgs(["mint", "x", "-w", "all"]).wallets, "all");
+  });
+
+  it("takes its value rather than reading it as the target", () => {
+    // The reason --wallets is in VALUE_FLAGS: without that, `--wallets 0,2`
+    // leaves "0,2" to be collected as a positional and minted as a slug.
+    const args = parseArgs(["mint", "tadaaaaaa", "--wallets", "0,2"]);
+    assert.equal(args.target, "tadaaaaaa");
+    assert.equal(args.wallets, "0,2");
+  });
+
+  it("refuses the flag without a value rather than selecting everything", () => {
+    assert.throws(() => parseArgs(["mint", "x", "--wallets"]), ArgError);
+  });
+
+  it("is documented in the help text, with the counting convention stated", () => {
+    // An operator who never learns the flag exists fires every wallet at every
+    // drop. One who assumes it counts from one fires the wrong key, so the help
+    // has to say which it is.
+    assert.match(HELP, /--wallets/);
+    assert.match(HELP, /zero/i);
   });
 });
 

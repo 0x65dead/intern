@@ -10,6 +10,14 @@ export interface CliArgs {
   chain?: string;
   target?: string;
   quantity?: number;
+  /**
+   * Which loaded wallets this run uses, unparsed. See `selectWallets`.
+   *
+   * Kept as the operator's own text rather than resolved here, because resolving
+   * it needs the loaded wallet set and this parser deliberately knows nothing
+   * about keys.
+   */
+  wallets?: string;
   rpc?: string[];
   maxFeeGwei?: number;
   priorityGwei?: number;
@@ -56,6 +64,7 @@ const VALUE_FLAGS = new Set([
   "target",
   "collection",
   "quantity",
+  "wallets",
   "rpc",
   "max-fee",
   "priority-fee",
@@ -130,6 +139,10 @@ export function parseArgs(argv: string[]): CliArgs {
       case "target":
       case "collection":
         args.target = takeValue().trim();
+        break;
+      case "w":
+      case "wallets":
+        args.wallets = takeValue().trim();
         break;
       case "q":
       case "quantity": {
@@ -272,6 +285,9 @@ OPTIONS
   -c, --chain <key>        ethereum | base | robinhood | ink | arbitrum |
                            optimism | polygon | zora        (default: base)
   -q, --quantity <n>       Tokens per wallet                 (default: 1)
+  -w, --wallets <spec>     Which wallets to use: 0,2 or 1-3 or all.
+                           Counts from zero, as W0/W1 in the output.
+                                                             (default: all)
       --rpc <url,...>      RPC URLs or an Alchemy key. Repeatable.
       --max-fee <gwei>     Fee ceiling. Derived from base fee when unset.
       --priority-fee <g>   Priority tip.
@@ -294,6 +310,7 @@ EXAMPLES
   intern dryrun tadaaaaaa --chain robinhood --quantity 2
   intern mint tadaaaaaa --chain robinhood --quantity 2
   intern mint 0xabc…def --chain base --at 21:00 --max-fee 0.05 -y
+  intern mint tadaaaaaa --chain base --wallets 0,2
   intern rpc --chain base
   intern bot
 

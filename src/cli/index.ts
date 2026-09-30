@@ -43,8 +43,10 @@ import {
   checkBalances,
   formatEth,
   gweiToWei,
+  LoadedWallet,
   redactKeys,
   requiredBalance,
+  selectWallets,
   walletsFromEnv,
 } from "../core/wallets";
 import { formatRemaining, formatUtc, parseTimeInput } from "../core/timing";
@@ -326,7 +328,7 @@ async function cmdCheck(args: CliArgs, defaults: ReturnType<typeof readDefaults>
   // Loaded before the prepare rather than at the balance check below, because the
   // stage table needs to know whether a configured SeaDrop signer is one of ours
   // — that is the difference between "must ask OpenSea" and "can sign it here".
-  const wallets = walletsFromEnv();
+  const wallets = runWallets(args);
 
   const run = await prepareResolvingChain({
     target,
@@ -476,8 +478,9 @@ async function cmdMint(
   }
 
   // Interactive when anything essential is missing; scripted when it is all given.
-  const envWallets = walletsFromEnv();
-  const interactive = !args.yes || envWallets.length === 0 || args.target === undefined;
+  // Named for what it holds: the env keyring *after* --wallets, not the keyring.
+  const selectedWallets = runWallets(args);
+  const interactive = !args.yes || selectedWallets.length === 0 || args.target === undefined;
 
   const config = interactive
     ? await collectTargetConfig(defaults, {
@@ -485,10 +488,17 @@ async function cmdMint(
         ...(args.chain ? { chainKey: args.chain } : {}),
         ...(args.quantity !== undefined ? { quantity: args.quantity } : {}),
         ...(args.rpc ? { manualRpcs: args.rpc } : {}),
-        ...(envWallets.length > 0 && args.yes ? { wallets: envWallets } : {}),
+        // Seeded when --wallets was given, not only under -y. The flag is
+        // already an answer to the question collectWallets asks, and asking it
+        // again offers the operator back the whole keyring they just narrowed —
+        // one Enter away from firing every wallet at a drop they had chosen two
+        // for. Without the flag the prompt is exactly as it was.
+        ...(selectedWallets.length > 0 && (args.yes || args.wallets !== undefined)
+          ? { wallets: selectedWallets }
+          : {}),
       })
     : {
-        wallets: envWallets,
+        wallets: selectedWallets,
         chainKey: args.chain ?? defaults.chain,
         target: requireTarget(args),
         quantity: args.quantity ?? defaults.quantity,
@@ -499,7 +509,12 @@ async function cmdMint(
     target: config.target,
     chainKey: config.chainKey,
     quantity: config.quantity,
-    walletAddresses: envWallets.map((w) => w.address),
+    // config.wallets, not the pre-wizard env set. Every other field in this call
+    // reads from `config`, and this one did not: an operator who pasted keys at
+    // the prompt — or declined "Use these wallets?" — had eligibility and the
+    // stage table resolved for the .env addresses while a different set signed.
+    // With .env empty it asked about nobody at all.
+    walletAddresses: config.wallets.map((w) => w.address),
     allowlistSource: defaults.allowlistSource,
     openseaAuth: eligibilityAuth(defaults),
     manualRpcs: config.manualRpcs,
@@ -602,6 +617,7 @@ async function cmdMint(
         skipSimulation: args.skipSimulation,
         requireSimulation: args.requireSimulation,
         receiptTimeoutMs: defaults.receiptTimeoutMs,
+        maxPricePerNftWei: defaults.maxPricePerNftWei,
         dryRun,
         // Advisory unless the operator configured a limit: they can read the
         // measured offset and decide. The bot, with nobody watching, enforces one.
@@ -647,7 +663,7 @@ async function cmdAllowlist(
   }
   const apiKey = defaults.openseaApiKey;
 
-  const wallets = walletsFromEnv();
+  const wallets = runWallets(args);
   if (wallets.length === 0) {
     writeErr(`${c.red("✗")} No wallets in .env. Set PRIVATE_KEY or PRIVATE_KEYS.\n`);
     process.exit(2);
@@ -878,6 +894,7 @@ async function cmdAllowlist(
         gas: run.gas,
         prearmed,
         eligibility,
+        maxPricePerNftWei: defaults.maxPricePerNftWei,
         receiptTimeoutMs: defaults.receiptTimeoutMs,
         signal,
       },
@@ -935,6 +952,46 @@ function requireChain(key: string) {
     process.exit(2);
   }
   return chain;
+}
+
+/**
+ * The wallets this run will use, after `--wallets`.
+ *
+ * Selection is applied here, at load, rather than deep down at the point of
+ * signing. Everything between the two asks questions about "the wallets" — the
+ * balance table, the addresses sent for an eligibility check, the stage table's
+ * question of whether a configured SeaDrop signer is one of ours — and all of
+ * those must be about the wallets that are going to fire, not about the whole
+ * keyring. Narrowing late would leave an operator reading a balance table for
+ * wallets this run is not touching.
+ *
+ * Exits rather than throwing, like `requireTarget` beside it: a bad selection is
+ * a typo in an argument, and a stack trace is not the right answer to a typo.
+ */
+function runWallets(args: CliArgs): LoadedWallet[] {
+  const loaded = walletsFromEnv();
+  let chosen: LoadedWallet[];
+  try {
+    chosen = selectWallets(loaded, args.wallets);
+  } catch (err: unknown) {
+    writeErr(`${c.red("✗")} ${redactKeys(err instanceof Error ? err.message : String(err))}\n`);
+    process.exit(2);
+  }
+  // Said out loud whenever a selection was asked for, even one that changed
+  // nothing. A spec can be a typo and still be valid — `--wallets 1` for `0,1`
+  // loads, selects, and fires half the intended set — and the narrowing
+  // otherwise leaves no trace anywhere before the confirmation. Printed only
+  // when the flag was given, so an unchanged command stays as quiet as it was.
+  if (args.wallets !== undefined && loaded.length > 0) {
+    const names = chosen.map((wallet) => `W${wallet.index}`).join(", ");
+    const addresses = chosen.map((wallet) => shortAddress(wallet.address)).join(", ");
+    writeOut(
+      ok(
+        `${chosen.length} of ${loaded.length} wallet(s) selected by --wallets: ${names} — ${addresses}\n`,
+      ),
+    );
+  }
+  return chosen;
 }
 
 function requireTarget(args: CliArgs): string {

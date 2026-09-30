@@ -46,6 +46,7 @@ import {
   checkBalances,
   fetchNonces,
   formatEth,
+  priceCeilingRefusal,
   requiredBalance,
 } from "./wallets";
 import { OpenSeaError, VerifiedMintTx, requestMintTx, verifyAllowlistTx } from "./opensea";
@@ -62,6 +63,13 @@ export interface AllowlistOptions {
   readUrls: string[];
   blastUrls: string[];
   gas: GasSettings;
+  /**
+   * The most one NFT may cost, in wei. null or absent means no ceiling.
+   *
+   * The one bound on this path's price that the operator set. Everything else
+   * about the value is checked against the response the value came in.
+   */
+  maxPricePerNftWei?: bigint | null;
   /** Keep retrying the transient rejections for this long before giving up. */
   retryWindowMs?: number;
   /** Base poll interval. Backoff and jitter are applied on top of it. */
@@ -162,6 +170,19 @@ async function buildForWallet(
         expectedQuantity: opts.quantity,
         allowTokenTarget: true,
       });
+
+      // The price gate. `verifyAllowlistTx` has proved the response agrees with
+      // itself; it cannot prove the price is one the operator meant to pay,
+      // because the mintPrice it compared against was decoded from that same
+      // response. Not retried — see `giveUp` below, and PRICE_TOO_HIGH's entry
+      // in FAILURE_META: asking again returns the same price.
+      const overCeiling = priceCeilingRefusal({
+        value: verified.value,
+        quantity: opts.quantity,
+        ceilingPerNftWei: opts.maxPricePerNftWei ?? null,
+        symbol: opts.chain.nativeSymbol,
+      });
+      if (overCeiling) return giveUp(`[W${wallet.index}] ${overCeiling}`, "PRICE_TOO_HIGH");
 
       const signed = await new Wallet(wallet.key).signTransaction({
         to: verified.to,

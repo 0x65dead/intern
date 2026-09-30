@@ -289,6 +289,16 @@ node dist/cli/index.js mint   <target> -c base -y
 is the safer way to rehearse an unattended run: the bot behaves exactly as it will
 on the night, and broadcasts nothing.
 
+Set `MAX_PRICE_PER_NFT` before the rehearsal rather than after it. It is the only
+ceiling on what a mint may **spend**: the balance check bounds what the wallet can
+reach, which is not a limit but a total; the gas settings bound the fee and not the
+purchase; and on a gated stage the price arrives inside the same OpenSea response
+intern checks it against, so that check proves the response is self-consistent and
+nothing about the price being one you agreed to. The value is per NFT and is
+multiplied by quantity, so it keeps its meaning when you change `QUANTITY`. A dry
+run reports the refusal beside every other one, which is how you find out the
+number is wrong on a night when nothing is at stake.
+
 What a dry run does **not** prove: simulation is an `eth_call` against the chain
 as it is right now, and a stage that has not opened yet reverts with `NotActive`
 whether or not the wallet is eligible. A pre-open dry run cannot tell "not on the
@@ -304,6 +314,12 @@ node dist/cli/index.js mint <target> --chain base --quantity 3 \
   --rpc https://base-mainnet.g.alchemy.com/v2/KEY \
   --max-fee 0.08 --at 2026-10-01T15:00:00Z --yes
 ```
+
+Every loaded key fires unless you say otherwise. `--wallets 0,2` narrows a run to
+the wallets named, counting from zero exactly as `W0`/`W1` do in the output; the
+selection is echoed back before anything is prepared. Worth knowing before the
+first live run rather than after it, because the default on a keyring of six is
+six wallets at the same drop.
 
 Gated stage — allowlist, GTD or FCFS. These are **off by default**, so that a
 misread drop cannot spend funds at a stage you did not choose to enter. Turning

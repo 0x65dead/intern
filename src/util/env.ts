@@ -18,6 +18,7 @@
 import fs from "fs";
 import path from "path";
 import dotenv from "dotenv";
+import { parseEther } from "ethers";
 
 export function loadEnv(cwd: string = process.cwd()): void {
   const envPath = path.resolve(cwd, ".env");
@@ -70,6 +71,18 @@ export interface Defaults {
   allowlistSource: string | null;
   /** Do everything except broadcast. */
   dryRun: boolean;
+  /**
+   * The most one NFT may cost, in wei. null means no ceiling was configured.
+   *
+   * Stated per NFT rather than per transaction because that is how a drop is
+   * advertised and how an operator holds the limit in their head — "it is 0.001,
+   * never pay more than 0.002 each" keeps its meaning when QUANTITY changes,
+   * where a total would silently become five times too tight and teach the
+   * operator to raise it.
+   *
+   * 0 is a real setting and is not the same as unset: it means free mints only.
+   */
+  maxPricePerNftWei: bigint | null;
   /** Minutes between unattended heartbeat edits. 0 disables the heartbeat. */
   heartbeatMinutes: number;
   /**
@@ -107,18 +120,96 @@ function stringFrom(raw: string | undefined): string | null {
   return value !== undefined && value.length > 0 ? value : null;
 }
 
+/** A setting whose value the parser will not guess at. Fatal at startup. */
+export class ConfigError extends Error {}
+
+const TRUE_WORDS = ["1", "true", "yes", "on"];
+const FALSE_WORDS = ["0", "false", "no", "off"];
+
 /**
- * Deliberately strict: only an unambiguous yes is a yes.
+ * A boolean setting, where a value that is neither a yes nor a no is refused.
  *
- * These flags unlock spending. `ALLOWLIST_MINTING=maybe` is off, not on, and a
- * typo in a .env file must never be the reason a wallet fires at a stage the
- * operator did not mean to enter.
+ * This used to answer "off" to anything it did not recognise, and the reasoning
+ * was sound for the flag it was written against: ALLOWLIST_MINTING=ture leaves
+ * the bot public-only, which costs a missed mint and no money. But the same
+ * helper reads DRY_RUN, where the polarity is reversed — DRY_RUN=ture read as
+ * "off" is a live mint by an operator who believed they were rehearsing, and
+ * the brief's rule is that a task never accidentally jumps from dry-run to
+ * live. A default direction that is safe for one flag is unsafe for the other,
+ * so there is no safe direction to pick and the parser stops picking one.
+ *
+ * Refusing costs nothing either way: both entry points read settings once, at
+ * startup, and both already print the message and exit non-zero. The operator
+ * learns about the typo immediately instead of inferring it from a wallet
+ * balance. Unset and blank still mean the documented default — that is an
+ * operator who said nothing, not one who said something unreadable.
  */
-function booleanFrom(raw: string | undefined, fallback = false): boolean {
+function booleanFrom(name: string, raw: string | undefined, fallback = false): boolean {
   if (raw === undefined) return fallback;
   const value = raw.trim().toLowerCase();
   if (value === "") return fallback;
-  return value === "1" || value === "true" || value === "yes" || value === "on";
+  if (TRUE_WORDS.includes(value)) return true;
+  if (FALSE_WORDS.includes(value)) return false;
+  throw new ConfigError(
+    `${name} is set to something I cannot read as a yes or a no. ` +
+      `Use one of ${TRUE_WORDS.join(", ")} — or ${FALSE_WORDS.join(", ")} — or remove the line.`,
+  );
+}
+
+/**
+ * How many to mint. Unset means one; an unreadable value means stop.
+ *
+ * The old reading was `Math.max(1, Math.floor(...))`, which turned QUANTITY=0
+ * into QUANTITY=1: an operator who asked to buy nothing bought one. Every other
+ * wrong value did the same, because a non-numeric fell through to the default.
+ * There is no safe guess for how much money to spend, so an explicitly bad
+ * value is refused rather than rounded into a purchase.
+ */
+function quantityFrom(raw: string | undefined): number {
+  if (raw === undefined || raw.trim() === "") return 1;
+  const text = raw.trim();
+  // Plain decimal digits only, rather than `Number()`. `Number` also reads hex
+  // and scientific notation, so QUANTITY=1e3 is a thousand mints from a line
+  // that looks like a typo for 13 — a value meaning something other than it
+  // looks is the whole class of mistake this function exists to stop. Nobody
+  // writes a mint count in hex.
+  if (!/^\d+$/.test(text) || Number(text) < 1) {
+    throw new ConfigError(
+      "QUANTITY must be a whole number of at least 1, written in plain digits. " +
+        "Remove the line to mint one, and use DRY_RUN=1 to rehearse without buying.",
+    );
+  }
+  return Number(text);
+}
+
+/**
+ * A price ceiling written in whole native currency, converted to wei.
+ *
+ * Written in ETH rather than wei because that is the unit a drop is advertised
+ * in and the unit every price intern prints. Asking for wei would invite an
+ * eighteen-digit typo in the one setting whose entire job is to catch a price
+ * that is wrong by orders of magnitude — a ceiling a thousand times too high is
+ * no ceiling, and it would look almost exactly like the right one.
+ *
+ * Plain decimal only, for the reason QUANTITY is: `0x…` and `1e…` are both
+ * numbers to JavaScript and neither means what it looks like.
+ */
+function weiFromEther(name: string, raw: string | undefined): bigint | null {
+  if (raw === undefined || raw.trim() === "") return null;
+  const text = raw.trim();
+  if (!/^\d+(\.\d+)?$/.test(text)) {
+    throw new ConfigError(
+      `${name} must be an amount of the chain's native currency written in plain ` +
+        `digits, such as 0.05. Remove the line to run with no price ceiling.`,
+    );
+  }
+  try {
+    return parseEther(text);
+  } catch {
+    throw new ConfigError(
+      `${name} is finer than wei can represent — eighteen decimal places is the limit.`,
+    );
+  }
 }
 
 /**
@@ -183,7 +274,7 @@ export function readDefaults(env: NodeJS.ProcessEnv = process.env): Defaults {
   const token = env.TELEGRAM_BOT_TOKEN?.trim();
   return {
     chain: (env.CHAIN ?? "base").trim().toLowerCase(),
-    quantity: Math.max(1, Math.floor(numberFrom(env.QUANTITY, 1) ?? 1)),
+    quantity: quantityFrom(env.QUANTITY),
     gasLimit: bigintFrom(env.GAS_LIMIT, 250_000n),
     maxFeeGwei: numberFrom(env.MAX_FEE_PER_GAS, null),
     priorityGwei: numberFrom(env.MAX_PRIORITY_FEE, null),
@@ -197,9 +288,10 @@ export function readDefaults(env: NodeJS.ProcessEnv = process.env): Defaults {
       5_000,
       Math.floor(numberFrom(env.RECEIPT_TIMEOUT_MS, 90_000) ?? 90_000),
     ),
-    allowlistMinting: booleanFrom(env.ALLOWLIST_MINTING),
+    allowlistMinting: booleanFrom("ALLOWLIST_MINTING", env.ALLOWLIST_MINTING),
     allowlistSource: stringFrom(env.ALLOWLIST_SOURCE),
-    dryRun: booleanFrom(env.DRY_RUN),
+    dryRun: booleanFrom("DRY_RUN", env.DRY_RUN),
+    maxPricePerNftWei: weiFromEther("MAX_PRICE_PER_NFT", env.MAX_PRICE_PER_NFT),
     heartbeatMinutes: heartbeatMinutesFrom(env.HEARTBEAT_MINUTES),
     heartbeatChatId: chatIdFrom(env.HEARTBEAT_CHAT_ID),
     // Floored at 100ms: OpenSea rate-limits, and a tighter loop earns a 429 that
@@ -233,6 +325,8 @@ CHAIN=base
 # EXTRA_RPC_URLS=
 
 # ── Mint ────────────────────────────────────────────────────────────────────
+# A whole number in plain digits. A value that cannot be read that way is
+# refused at startup rather than rounded into a purchase.
 QUANTITY=1
 GAS_LIMIT=250000
 # Fee ceiling in gwei. Left unset, it is derived from the live base fee, which is
@@ -293,6 +387,8 @@ RECEIPT_TIMEOUT_MS=90000
 # ── Gated stages (allowlist / GTD / FCFS / team) ────────────────────────────
 # Off by default. Set to 1 to let intern fire at gated stages, so that a misread
 # drop cannot spend funds at a stage you did not choose to enter.
+# Reads 1/true/yes/on and 0/false/no/off. Anything else stops the start, because
+# a typo in a flag that moves money must not be guessed at in either direction.
 # ALLOWLIST_MINTING=0
 
 # A local allow-list for Merkle (mintAllowList) stages: a file path, an https URL
@@ -308,7 +404,23 @@ RECEIPT_TIMEOUT_MS=90000
 # ── Safety ──────────────────────────────────────────────────────────────────
 # Prepare, check, and sign everything, then stop without broadcasting. Identical
 # to \`intern dryrun\`. Spends nothing.
+# Reads 1/true/yes/on and 0/false/no/off. A misspelling is refused at startup:
+# read as "off" it would be a live mint by someone who believed they were
+# rehearsing.
 # DRY_RUN=0
+
+# The most one NFT may cost, in whole native currency (0.05 means 0.05 ETH on
+# Ethereum or Base). Checked against the transaction value just before signing,
+# multiplied by QUANTITY, on both the public and the allowlist path.
+#
+# Worth setting even though the wallet balance already caps the damage, because
+# a balance is not a ceiling — it is everything the key can reach. This is the
+# only number in the whole pre-sign sequence that says what you INTENDED to pay:
+# gas settings bound the fee, not the purchase, and on the allowlist path the
+# price arrives in the same API response that intern checks it against.
+#
+# Unset means no ceiling. 0 is a real setting and means free mints only.
+# MAX_PRICE_PER_NFT=0.05
 
 # Refuse to fire when the clock offset cannot be measured to within this many ms.
 # Unset, this is advisory in the CLI (you see the warning and decide) and enforced

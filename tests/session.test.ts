@@ -16,13 +16,15 @@ import fs from "node:fs";
 import path from "node:path";
 import { describe, it } from "node:test";
 
+import { TaskScheduler } from "../src/core/tasks";
 import {
   PaintQueue,
   REFRESH_ALERT_AFTER,
   abortTargets,
   beginRefusal,
   enqueuePaint,
-  lockRefusal,
+  fireRefusal,
+  walletLockRefusal,
   planRefreshReport,
   planTeardown,
   refreshStillApplies,
@@ -34,46 +36,245 @@ const SESSION_SRC = fs.readFileSync(path.join(ROOT, "src", "bot", "session.ts"),
 const OWNER = 111;
 const GROUP = -100222;
 
-describe("lockRefusal", () => {
-  it("lets a run start when nothing holds the lock", () => {
-    assert.equal(lockRefusal(null, OWNER), null);
+describe("walletLockRefusal", () => {
+  // Ported from the global-lock version of this rule, assertion for assertion: two
+  // distinct refusals, both explaining themselves in terms of nonces, only the
+  // same-chat one pointing at a Cancel button, and the whole thing pure. What is
+  // new is that the unit is a wallet — the old rule refused a second run whatever
+  // wallets it used, which was the safe answer arrived at by not asking.
+  const mine = (index: number) => ({ walletIndex: index, chatId: OWNER });
+  const theirs = (index: number) => ({ walletIndex: index, chatId: GROUP });
+
+  it("lets a run start when none of its wallets are committed", () => {
+    assert.equal(walletLockRefusal([], OWNER), null);
   });
 
-  it("refuses a second run from the chat already holding the lock", () => {
-    // The regression. `this.running !== chatId` returned null here, and a
-    // double-tap of ✅ Send signed two sets of transactions at the same nonces.
-    const refusal = lockRefusal(OWNER, OWNER);
+  it("refuses a second run from the chat already using the wallet", () => {
+    // The regression this rule exists for. `this.running !== chatId` returned null
+    // here, and a double-tap of ✅ Send signed two sets of transactions at the same
+    // nonces.
+    const refusal = walletLockRefusal([mine(0)], OWNER);
     assert.notEqual(refusal, null);
     assert.match(refusal!.title, /already running/i);
   });
 
-  it("refuses a run while another chat is mid-run", () => {
-    const refusal = lockRefusal(GROUP, OWNER);
+  it("refuses a run whose wallet another chat is signing with", () => {
+    const refusal = walletLockRefusal([theirs(0)], OWNER);
     assert.notEqual(refusal, null);
-    assert.match(refusal!.title, /another chat/i);
+    assert.match(refusal!.title, /mid-run/i);
   });
 
   it("says why, in terms of nonces, whichever chat is refused", () => {
     // The operator has to be able to tell a deliberate refusal from a failure.
-    for (const holder of [OWNER, GROUP]) {
-      const refusal = lockRefusal(holder, OWNER);
-      assert.match(refusal!.body, /nonce/i);
-      assert.match(refusal!.body, /discarded/i);
+    for (const held of [[mine(1)], [theirs(1)]]) {
+      const refusal = walletLockRefusal(held, OWNER)!;
+      assert.match(refusal.body, /nonce/i);
+      assert.match(refusal.body, /discarded/i);
     }
   });
 
   it("distinguishes the two refusals, so the wording is never misleading", () => {
-    const same = lockRefusal(OWNER, OWNER)!;
-    const other = lockRefusal(GROUP, OWNER)!;
+    const same = walletLockRefusal([mine(0)], OWNER)!;
+    const other = walletLockRefusal([theirs(0)], OWNER)!;
     assert.notEqual(same.title, other.title);
     assert.notEqual(same.body, other.body);
     // Only the same-chat case can honestly point at this chat's own Cancel button.
     assert.match(same.body, /cancel/i);
+    assert.doesNotMatch(other.body, /cancel/i);
+  });
+
+  it("names the wallets that are the obstacle", () => {
+    // "The bot is busy" is not actionable; "W0, W2 are mid-run" is. With per-wallet
+    // locking the operator's next move depends on which wallets those are.
+    const refusal = walletLockRefusal([theirs(2), theirs(0)], OWNER)!;
+    assert.match(refusal.body, /W0, W2/, "sorted, and named rather than counted");
+  });
+
+  it("does not name a wallet that was free", () => {
+    // Asking about four wallets and being refused over one must not read as though
+    // all four were committed.
+    const refusal = walletLockRefusal([theirs(3)], OWNER)!;
+    assert.match(refusal.body, /W3/);
+    for (const absent of ["W0", "W1", "W2"]) {
+      assert.doesNotMatch(refusal.body, new RegExp(absent), `${absent} was free`);
+    }
+  });
+
+  it("treats a mixed set as another chat's run", () => {
+    // One wallet held elsewhere means pressing this chat's Cancel would not free
+    // it, so the message that points at Cancel would be a lie.
+    const refusal = walletLockRefusal([mine(0), theirs(1)], OWNER)!;
+    assert.match(refusal.title, /mid-run/i);
+    assert.doesNotMatch(refusal.body, /cancel/i);
+  });
+
+  it("treats an unidentified holder as another chat's run", () => {
+    // A task whose chat could not be resolved is the safer of the two readings:
+    // claiming it as this chat's would offer a Cancel button that does nothing.
+    const refusal = walletLockRefusal([{ walletIndex: 0, chatId: null }], OWNER)!;
+    assert.match(refusal.title, /mid-run/i);
   });
 
   it("is pure — no lock state is mutated by asking", () => {
-    assert.deepEqual(lockRefusal(GROUP, OWNER), lockRefusal(GROUP, OWNER));
-    assert.equal(lockRefusal(null, OWNER), null);
+    assert.deepEqual(walletLockRefusal([theirs(0)], OWNER), walletLockRefusal([theirs(0)], OWNER));
+    assert.equal(walletLockRefusal([], OWNER), null);
+  });
+});
+
+describe("fireRefusal", () => {
+  // The join between "which wallets are held" and "what to say about it". Both
+  // sides were tested and this was not, so the mapping could have been wrong in
+  // either direction with a green suite — which is how a mint gets refused for the
+  // wrong reason, or not refused at all.
+
+  const holders = (...pairs: [number, string][]) =>
+    pairs.map(([walletIndex, taskId]) => ({ walletIndex, taskId }));
+
+  it("lets a run start when the scheduler holds none of its wallets", () => {
+    assert.equal(fireRefusal([], () => undefined, OWNER), null);
+  });
+
+  it("carries the wallet indexes through to the message", () => {
+    const refusal = fireRefusal(holders([2, "T1"], [0, "T1"]), () => GROUP, OWNER)!;
+    assert.match(refusal.body, /W0, W2/);
+  });
+
+  it("resolves each holder's chat through the lookup it is given", () => {
+    const mine = fireRefusal(holders([0, "T1"]), () => OWNER, OWNER)!;
+    const theirs = fireRefusal(holders([0, "T1"]), () => GROUP, OWNER)!;
+    assert.match(mine.title, /already running/i);
+    assert.match(theirs.title, /mid-run/i);
+  });
+
+  it("reads an unknown task as another chat's run, not as this chat's", () => {
+    // The mapping that mattered: `undefined` becoming this chat's id would offer a
+    // ❌ Cancel button that cannot free the wallet, and would call someone else's
+    // live mint a double-tap of your own.
+    const refusal = fireRefusal(holders([0, "T-gone"]), () => undefined, OWNER)!;
+    assert.match(refusal.title, /mid-run/i);
+    assert.doesNotMatch(refusal.body, /cancel/i);
+  });
+
+  it("looks up by the task id the holder reported", () => {
+    const seen: string[] = [];
+    fireRefusal(holders([0, "T7"], [1, "T9"]), (taskId) => { seen.push(taskId); return OWNER; }, OWNER);
+    assert.deepEqual(seen, ["T7", "T9"], "not the wallet index, and not a guess");
+  });
+
+  it("is pure", () => {
+    const held = holders([1, "T1"]);
+    assert.deepEqual(fireRefusal(held, () => GROUP, OWNER), fireRefusal(held, () => GROUP, OWNER));
+  });
+});
+
+describe("the lock, composed the way launch composes it", () => {
+  // `walletLockRefusal` and `TaskScheduler` are each tested alone. What neither
+  // proves is that they fit: the refusal is only as good as the holder list it is
+  // handed, and `launch` is the one place those two meet. These drive the same
+  // sequence launch does — submit, ask who holds what, decide — so the seam is
+  // covered rather than assumed.
+
+  const flush = async () => new Promise<void>((resolve) => setImmediate(resolve));
+
+  /** Exactly launch's step: holders from the scheduler, chat ids from bookkeeping. */
+  const refusalFor = (
+    scheduler: TaskScheduler,
+    indexes: number[],
+    owner: (taskId: string) => number | null,
+    chatId: number,
+  ) =>
+    walletLockRefusal(
+      scheduler.walletHolders(indexes).map((held) => ({
+        walletIndex: held.walletIndex,
+        chatId: owner(held.taskId),
+      })),
+      chatId,
+    );
+
+  it("refuses a second run that shares a wallet with a live one", async () => {
+    const scheduler = new TaskScheduler(() => 1_700_000_000_000);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const first = scheduler.submit({
+      target: "0xaaa", chain: "base", walletIndexes: [0, 1],
+      run: async () => { await gate; },
+    });
+    await flush();
+
+    const refusal = refusalFor(scheduler, [1, 2], () => GROUP, OWNER);
+    assert.notEqual(refusal, null, "W1 is shared, so this must not start");
+    assert.match(refusal!.body, /W1/);
+    assert.doesNotMatch(refusal!.body, /W2/, "W2 was free and must not be blamed");
+
+    release();
+    await first.promise;
+  });
+
+  it("lets a run on entirely different wallets start alongside", async () => {
+    // The property the global flag could not express, and the reason for the
+    // change: two drops on disjoint wallets cannot collide on a nonce, so nothing
+    // is protected by making them wait for each other.
+    const scheduler = new TaskScheduler(() => 1_700_000_000_000);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const first = scheduler.submit({
+      target: "0xaaa", chain: "base", walletIndexes: [0, 1],
+      run: async () => { await gate; },
+    });
+    await flush();
+
+    assert.equal(refusalFor(scheduler, [2, 3], () => GROUP, OWNER), null);
+
+    let secondRan = false;
+    const second = scheduler.submit({
+      target: "0xbbb", chain: "base", walletIndexes: [2, 3],
+      run: async () => { secondRan = true; },
+    });
+    await second.promise;
+    assert.equal(secondRan, true, "and it actually runs rather than queueing");
+
+    release();
+    await first.promise;
+  });
+
+  it("still serializes every run while they all share one keyring", async () => {
+    // What the bot does today: every run takes every loaded wallet. So replacing
+    // the global flag with per-wallet locks changed no behaviour — a second run is
+    // refused exactly as before — and the concurrency above arrives only once a run
+    // can hold a narrower set. Pinned so that claim is checked, not just asserted
+    // in a comment.
+    const scheduler = new TaskScheduler(() => 1_700_000_000_000);
+    const everyWallet = [0, 1, 2];
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const first = scheduler.submit({
+      target: "0xaaa", chain: "base", walletIndexes: everyWallet,
+      run: async () => { await gate; },
+    });
+    await flush();
+
+    assert.notEqual(refusalFor(scheduler, everyWallet, () => GROUP, OWNER), null);
+    release();
+    await first.promise;
+    assert.equal(refusalFor(scheduler, everyWallet, () => GROUP, OWNER), null, "and frees up after");
+  });
+
+  it("calls the same chat's second attempt a double-tap, not a collision", async () => {
+    const scheduler = new TaskScheduler(() => 1_700_000_000_000);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const first = scheduler.submit({
+      target: "0xaaa", chain: "base", walletIndexes: [0],
+      run: async () => { await gate; },
+    });
+    await flush();
+
+    const refusal = refusalFor(scheduler, [0], () => OWNER, OWNER)!;
+    assert.match(refusal.title, /already running/i);
+    assert.match(refusal.body, /cancel/i, "this chat's own Cancel is the way out");
+
+    release();
+    await first.promise;
   });
 });
 
@@ -146,11 +347,27 @@ describe("abortTargets", () => {
 });
 
 describe("the run is detached from the update loop", () => {
-  it("never awaits fire()", () => {
+  it("never awaits the run from the update loop", () => {
     // The P0. `await this.fire(...)` meant handleUpdate did not return until the
     // run finished, so the bot issued no further getUpdates call for the whole
     // countdown and the ❌ Cancel button its own message offers was decorative.
-    assert.doesNotMatch(SESSION_SRC, /await\s+this\.fire\(/);
+    //
+    // `fire` is now awaited in exactly one place — inside the scheduler task body,
+    // which is itself detached — so "no await anywhere" stopped expressing the
+    // property. What matters is that the entry point from the update loop does not
+    // wait: `launch` is never awaited, and the one call to `fire` is inside the
+    // submit that hands it to the scheduler.
+    assert.doesNotMatch(SESSION_SRC, /await\s+this\.launch\(/);
+
+    const calls = [...SESSION_SRC.matchAll(/this\.fire\(/g)];
+    assert.equal(calls.length, 1, "fire has one caller, and it is launch's submit");
+    const submit = SESSION_SRC.indexOf("this.scheduler.submit({");
+    const registered = SESSION_SRC.indexOf("this.taskChat.set(");
+    assert.ok(submit !== -1 && registered > submit, "the submit call is where it is expected");
+    assert.ok(
+      calls[0]!.index! > submit && calls[0]!.index! < registered,
+      "the run is started inside the scheduler submit, not on the caller's stack",
+    );
   });
 
   it("starts runs through launch(), which returns void", () => {
@@ -167,13 +384,110 @@ describe("the run is detached from the update loop", () => {
   });
 
   it("catches the detached promise, so a failure cannot take the process down", () => {
-    assert.match(SESSION_SRC, /this\.fire\(session, mode, dryRun\)\s*\n?\s*\.catch\(/);
+    // The task's promise, now that the scheduler owns the run. Nothing awaits it,
+    // so an escaping rejection would be unhandled and a bot that dies mid-mint is
+    // worse than one that reports a failure.
+    assert.match(SESSION_SRC, /task\.promise\s*\n?\s*\.catch\(/);
   });
 
   it("releases the global handle when the run ends", () => {
     // A stale activeController would make the next /cancel abort an already
     // finished run and report "Aborting" while nothing was running.
     assert.match(SESSION_SRC, /this\.activeController = null;/);
+  });
+
+  it("drains every live task, not only the newest", () => {
+    // `activeRun` holds one promise. With more than one run possible, waiting on
+    // it alone would cut an older mint off mid-closing-line exactly as awaiting
+    // nothing used to cut off the only one.
+    assert.match(SESSION_SRC, /this\.runningTasks\.set\(/);
+    assert.match(SESSION_SRC, /\.\.\.this\.runningTasks\.values\(\)/);
+    assert.match(SESSION_SRC, /this\.runningTasks\.delete\(/);
+  });
+
+  it("holds no lock of its own beside the scheduler's", () => {
+    // The point of the change. A `running` chat id next to the wallet locks is a
+    // second answer to "may this run start", and the two would drift.
+    assert.doesNotMatch(SESSION_SRC, /private running\b/);
+    assert.doesNotMatch(SESSION_SRC, /this\.running\s*=/);
+    assert.doesNotMatch(SESSION_SRC, /private runningTarget\b/);
+  });
+
+  it("asks the scheduler for real holders, and refuses before it claims the lock", () => {
+    // The gap this closes: `launch` is private and needs a prepared plan, a chain
+    // and a provider, so no test reaches it — and neutering its refusal check left
+    // every test passing. What is checked here is that the call exists, is fed the
+    // scheduler's own holder list rather than a constant, and happens before the
+    // submit that takes the wallets.
+    const at = SESSION_SRC.indexOf("private launch(");
+    assert.notEqual(at, -1);
+    const body = SESSION_SRC.slice(at, SESSION_SRC.indexOf("\n  /**", at));
+
+    const gate = body.indexOf("fireRefusal(");
+    const claim = body.indexOf("this.scheduler.submit({");
+    assert.notEqual(gate, -1, "launch must consult the lock");
+    assert.notEqual(claim, -1, "launch must submit the run");
+    assert.ok(gate < claim, "the lock is consulted before the wallets are claimed");
+    assert.match(
+      body.slice(gate, claim),
+      /this\.scheduler\.walletHolders\(indexes\)/,
+      "fed the live holder list for this run's own wallets",
+    );
+    assert.match(body.slice(gate, claim), /return;/, "and a refusal actually returns");
+  });
+
+  it("reports phases to the task record, and does it through the tap", () => {
+    // How the statuses came to be dead: the task context was threaded into the run
+    // and then never called. `noUnusedParameters` is off, so nothing said so, and
+    // every task read DISCOVERING from start to finish while the scheduler's guard
+    // against re-signing after a broadcast sat permanently unarmed.
+    // The mapped value, under the condition that it is a phase at all. Asserting
+    // only that `ctx.phase(` appears somewhere passed while the tap reported a
+    // hardcoded phase whenever the mapping returned nothing — the exact inversion
+    // of what it should do.
+    assert.match(SESSION_SRC, /phaseForEvent\(event\)/, "phases come from the engine's events");
+    assert.match(SESSION_SRC, /next !== null/, "a non-phase must report nothing");
+    assert.match(SESSION_SRC, /ctx\.phase\(next\)/, "the mapped phase, not a literal");
+    // The tap, not the bare handler: passing reporter.handle straight through would
+    // paint the panel correctly and report nothing.
+    assert.match(SESSION_SRC, /^\s*report,\s*$/m, "runMint is given the tap");
+    assert.doesNotMatch(SESSION_SRC, /^\s*reporter\.handle,\s*$/m);
+  });
+
+  it("cannot let a phase report break a mint", () => {
+    // Reporting is bookkeeping and the mint is not. A throw from the tap would
+    // escape into the engine's own emit call, mid-dispatch.
+    const at = SESSION_SRC.indexOf("const report = (");
+    assert.notEqual(at, -1);
+    const body = SESSION_SRC.slice(at, SESSION_SRC.indexOf("\n    };", at));
+    assert.match(body, /try \{/, "the phase report is guarded");
+    assert.match(body, /catch/);
+    // Both indexes checked for presence before they are compared. `indexOf` returns
+    // -1 for something absent, and -1 is less than every real index, so the naive
+    // ordering assertion passed most convincingly at the moment the call it was
+    // meant to locate had been deleted outright.
+    const panel = body.indexOf("reporter.handle(event)");
+    const guard = body.indexOf("try {");
+    assert.notEqual(panel, -1, "the panel must still be told about the event");
+    assert.notEqual(guard, -1, "the phase report must still be guarded");
+    assert.ok(
+      panel < guard,
+      "the panel is told first, so a reporting bug cannot cost the operator the panel too",
+    );
+  });
+
+  it("cancels through the scheduler, so a cancel reaches every run", () => {
+    // Scoped to cancel's own body. Asserting the call appears *somewhere* in the
+    // file passed while cancel had lost it entirely, because shutdown calls it too
+    // — so the test proved only that the method name still existed.
+    const body = (name: string): string => {
+      const at = SESSION_SRC.indexOf(name);
+      assert.notEqual(at, -1, `${name} not found`);
+      const next = SESSION_SRC.indexOf("\n  private ", at + name.length);
+      return SESSION_SRC.slice(at, next === -1 ? undefined : next);
+    };
+    assert.match(body("private async cancel(session: Session)"), /this\.scheduler\.cancelAll\(\)/);
+    assert.match(body("shutdown(): void {"), /this\.scheduler\.cancelAll\(\)/);
   });
 });
 
@@ -418,29 +732,30 @@ describe("planRefreshReport", () => {
  * guard saw an idle chat while a mint was still signing.
  */
 describe("beginRefusal", () => {
-  it("refuses while this chat holds the lock", () => {
-    assert.equal(beginRefusal(42, 42, "menu")?.title, "A run is in progress");
+  it("refuses while this chat has a run of its own", () => {
+    assert.equal(beginRefusal(true, "menu")?.title, "A run is in progress");
   });
 
   it("still refuses after a view change has hidden the run", () => {
     // The actual bug: /status, 👛 Wallets or any other panel used to unlock this.
     for (const view of ["status", "wallets", "menu", "check", "stages"]) {
-      assert.notEqual(beginRefusal(42, 42, view), null, `view "${view}" defeated the guard`);
+      assert.notEqual(beginRefusal(true, view), null, `view "${view}" defeated the guard`);
     }
   });
 
   it("refuses while this chat is watching", () => {
-    assert.equal(beginRefusal(null, 42, "watching")?.title, "A watch is running");
+    assert.equal(beginRefusal(false, "watching")?.title, "A watch is running");
   });
 
-  it("allows setup while another chat runs", () => {
-    // Preparing a target sends nothing. The global lock is re-checked at fire
-    // time, which is where refusing actually protects the nonces.
-    assert.equal(beginRefusal(7, 42, "menu"), null);
+  it("allows setup while only another chat runs", () => {
+    // Preparing a target sends nothing, so the caller passes false for a run that
+    // is not this chat's. Wallet contention is re-checked at fire time, which is
+    // where refusing actually protects the nonces.
+    assert.equal(beginRefusal(false, "menu"), null);
   });
 
   it("allows setup when nothing is running", () => {
-    assert.equal(beginRefusal(null, 42, "menu"), null);
+    assert.equal(beginRefusal(false, "menu"), null);
   });
 });
 
@@ -455,7 +770,10 @@ describe("the watch is detached from the update loop too", () => {
 
   it("tracks the watch so shutdown can wait for it", () => {
     assert.match(SESSION_SRC, /activeWatch/);
-    assert.match(SESSION_SRC, /Promise\.allSettled\(\[this\.activeRun, this\.activeWatch\]\)/);
+    // The watch is drained alongside the runs. Matched loosely on purpose: drain
+    // also waits on every live task, and pinning the exact argument list made this
+    // test fail for the change that added them rather than for a lost watch.
+    assert.match(SESSION_SRC, /Promise\.allSettled\(\[this\.activeRun, this\.activeWatch/);
   });
 
   it("gives the watch its own abort handle", () => {

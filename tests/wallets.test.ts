@@ -6,7 +6,11 @@
 // key ends up in a Telegram chat.
 
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
 import { beforeEach, describe, it } from "node:test";
+import { parseEther } from "ethers";
+import { TelegramClient } from "../src/bot/api";
 import {
   BalanceReport,
   LoadedWallet,
@@ -16,10 +20,12 @@ import {
   loadWallets,
   markPublicHash,
   pairByAddress,
+  priceCeilingRefusal,
   redactKeys,
   registerSecret,
   requiredBalance,
   resetRedactionRegistry,
+  selectWallets,
   splitByFunding,
   suggestMaxFee,
   weiToGwei,
@@ -49,6 +55,328 @@ describe("requiredBalance", () => {
       gasLimit: 100_000n,
     };
     assert.equal(requiredBalance(0n, gas), 100_000n * gweiToWei(1));
+  });
+});
+
+describe("priceCeilingRefusal", () => {
+  const eth = (n: string) => parseEther(n);
+
+  it("allows a mint priced exactly at the ceiling", () => {
+    // The boundary belongs to the operator. "No more than 0.05" permits 0.05,
+    // and a ceiling that refuses the number written on it would be read as a
+    // bug and raised until it stopped complaining.
+    const refusal = priceCeilingRefusal({
+      value: eth("0.05"),
+      quantity: 1,
+      ceilingPerNftWei: eth("0.05"),
+    });
+    assert.equal(refusal, null);
+  });
+
+  it("refuses a single wei over", () => {
+    const refusal = priceCeilingRefusal({
+      value: eth("0.05") + 1n,
+      quantity: 1,
+      ceilingPerNftWei: eth("0.05"),
+    });
+    assert.ok(refusal, "one wei over the ceiling is over the ceiling");
+  });
+
+  it("scales with quantity, because the ceiling is per NFT", () => {
+    // The whole reason the setting is per NFT: it keeps its meaning when
+    // QUANTITY changes. A total would tighten five-fold behind the operator's
+    // back and teach them to raise it until it stopped refusing.
+    const ceiling = eth("0.01");
+    assert.equal(
+      priceCeilingRefusal({ value: eth("0.03"), quantity: 3, ceilingPerNftWei: ceiling }),
+      null,
+      "three at the ceiling price is three times the ceiling",
+    );
+    assert.ok(
+      priceCeilingRefusal({ value: eth("0.033"), quantity: 3, ceilingPerNftWei: ceiling }),
+      "and a tenth more each is refused",
+    );
+  });
+
+  it("treats a ceiling of zero as free-mints-only, not as unset", () => {
+    // The truthiness trap: `!0n` is true, so a ceiling of zero read with a
+    // falsy check disappears entirely — and it disappears for the operator who
+    // asked for the strictest possible limit.
+    assert.equal(
+      priceCeilingRefusal({ value: 0n, quantity: 1, ceilingPerNftWei: 0n }),
+      null,
+      "a free mint is within a ceiling of zero",
+    );
+    assert.ok(
+      priceCeilingRefusal({ value: 1n, quantity: 1, ceilingPerNftWei: 0n }),
+      "and one wei is not",
+    );
+  });
+
+  it("imposes no ceiling when none was configured", () => {
+    assert.equal(
+      priceCeilingRefusal({ value: eth("1000"), quantity: 1, ceilingPerNftWei: null }),
+      null,
+    );
+  });
+
+  it("states what it would have spent and what the limit was", () => {
+    // An operator reading this at 3am needs both numbers to decide whether the
+    // ceiling is wrong or the drop is. Neither number alone answers that.
+    const refusal = priceCeilingRefusal({
+      value: eth("0.6"),
+      quantity: 3,
+      ceilingPerNftWei: eth("0.05"),
+    });
+    assert.ok(refusal);
+    assert.match(refusal, /0\.6 ETH/, "the total it would have spent");
+    assert.match(refusal, /0\.2 ETH × 3/, "broken down per NFT");
+    assert.match(refusal, /0\.05 ETH/, "the ceiling that was set");
+    assert.match(refusal, /0\.15 ETH/, "and what that ceiling allowed in total");
+    assert.match(refusal, /MAX_PRICE_PER_NFT/, "named so it can be changed");
+    assert.match(refusal, /Nothing was signed/, "and says what did not happen");
+  });
+
+  it("omits the per-NFT figure rather than printing a rounded one", () => {
+    // 10 wei over 3 is not a number of wei. Printing a truncated per-NFT price
+    // beside the true total would put one false figure in a message whose only
+    // job is to say what something costs.
+    const refusal = priceCeilingRefusal({ value: 10n, quantity: 3, ceilingPerNftWei: 1n });
+    assert.ok(refusal);
+    assert.ok(!refusal.includes("×"), "no breakdown when it does not divide exactly");
+  });
+
+  it("refuses rather than permits when the quantity is nonsense", () => {
+    // Defence in depth: QUANTITY is parsed strictly elsewhere. If that ever
+    // fails open, a ceiling that multiplies by zero must not turn into a
+    // limitless budget.
+    assert.ok(priceCeilingRefusal({ value: 1n, quantity: 0, ceilingPerNftWei: eth("1") }));
+    assert.ok(priceCeilingRefusal({ value: 1n, quantity: -5, ceilingPerNftWei: eth("1") }));
+  });
+
+  it("uses the chain's own symbol", () => {
+    const refusal = priceCeilingRefusal({
+      value: eth("2"),
+      quantity: 1,
+      ceilingPerNftWei: eth("1"),
+      symbol: "POL",
+    });
+    assert.ok(refusal);
+    assert.match(refusal, /POL/);
+    assert.ok(!refusal.includes("ETH"), "naming the wrong currency misstates the amount");
+  });
+});
+
+describe("every path that signs is behind the price ceiling", () => {
+  // A correct gate that a signing path forgets to call is not a gate. This is
+  // the check that survives someone adding a third path in a new file, which is
+  // exactly when the omission would be easiest to miss and most expensive.
+  // Two levels up, not one: tests run from dist-tests/tests, and the point is to
+  // read the TypeScript source rather than the build output beside it.
+  const SRC = path.resolve(__dirname, "..", "..", "src");
+
+  const tsFiles = (dir: string): string[] =>
+    fs.readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) return tsFiles(full);
+      return entry.isFile() && entry.name.endsWith(".ts") ? [full] : [];
+    });
+
+  it("calls priceCeilingRefusal before signTransaction, in every file that signs", () => {
+    const signing = tsFiles(SRC)
+      .map((file) => ({ file, text: fs.readFileSync(file, "utf8") }))
+      .filter(({ text }) => text.includes("signTransaction("));
+
+    assert.ok(signing.length > 0, "the search itself must not silently find nothing");
+
+    for (const { file, text } of signing) {
+      const where = path.relative(SRC, file);
+      const gate = text.indexOf("priceCeilingRefusal(");
+      const sign = text.indexOf("signTransaction(");
+      assert.notEqual(gate, -1, `${where} signs without calling the price ceiling`);
+      assert.ok(gate < sign, `${where} calls the price ceiling after it has already signed`);
+    }
+  });
+});
+
+describe("selectWallets", () => {
+  // The spec an operator types is the last place their intent is stated before
+  // keys start signing. Every case below is one where a lenient reading would
+  // produce a run that looks successful and used the wrong wallets.
+
+  const set = (count: number): LoadedWallet[] =>
+    Array.from({ length: count }, (_, i) => ({
+      index: i,
+      address: `0x${String(i).repeat(40)}`,
+      key: `0x${"0".repeat(63)}${i + 1}`,
+    }));
+
+  const picked = (wallets: LoadedWallet[]): number[] => wallets.map((w) => w.index);
+
+  it("selects every wallet when no spec is given", () => {
+    // The default has to be the behaviour that existed before selection did,
+    // or adding this feature silently changes what an unchanged command does.
+    for (const spec of [undefined, null, "", "   "]) {
+      assert.deepEqual(picked(selectWallets(set(3), spec)), [0, 1, 2], String(spec));
+    }
+  });
+
+  it("selects every wallet for 'all', in any case", () => {
+    for (const spec of ["all", "ALL", " All "]) {
+      assert.deepEqual(picked(selectWallets(set(3), spec)), [0, 1, 2], spec);
+    }
+  });
+
+  it("counts from zero, because that is what the panel prints", () => {
+    // loadWallets numbers from zero and every display says W0. A one-based spec
+    // would read naturally and pick the wrong key every time, so this is pinned
+    // rather than left to the reader of the parser.
+    assert.deepEqual(picked(selectWallets(set(3), "0")), [0]);
+    assert.deepEqual(picked(selectWallets(set(3), "2")), [2]);
+  });
+
+  it("takes a list and a range, together and apart", () => {
+    assert.deepEqual(picked(selectWallets(set(5), "0,2")), [0, 2]);
+    assert.deepEqual(picked(selectWallets(set(5), "1-3")), [1, 2, 3]);
+    assert.deepEqual(picked(selectWallets(set(5), "0,2-4")), [0, 2, 3, 4]);
+    assert.deepEqual(picked(selectWallets(set(5), " 0 , 2 - 3 ")), [0, 2, 3]);
+  });
+
+  it("returns loaded order however the spec was written, and collapses repeats", () => {
+    // Order would otherwise be a silent second meaning of the spec, and nonce
+    // allocation is by index. `2,0` and `0,2` must be the same run.
+    assert.deepEqual(picked(selectWallets(set(3), "2,0")), [0, 2]);
+    assert.deepEqual(picked(selectWallets(set(3), "1,1,1")), [1]);
+    assert.deepEqual(picked(selectWallets(set(4), "1-3,2")), [1, 2, 3]);
+  });
+
+  it("returns the wallets themselves, not just their indexes", () => {
+    const wallets = set(3);
+    const chosen = selectWallets(wallets, "1");
+    assert.equal(chosen.length, 1);
+    assert.equal(chosen[0]!.address, wallets[1]!.address);
+    assert.equal(chosen[0]!.key, wallets[1]!.key);
+  });
+
+  it("refuses an index that is not loaded rather than skipping it", () => {
+    // The failure this prevents: an operator names five wallets, one index is a
+    // typo, four sign, and the run reports success. Nothing in that output says
+    // the fifth never took part.
+    assert.throws(
+      () => selectWallets(set(3), "0,5"),
+      (err: unknown) => err instanceof Error && /W5/.test(err.message),
+    );
+  });
+
+  it("says which wallets are loaded when it refuses one that is not", () => {
+    assert.throws(
+      () => selectWallets(set(3), "7"),
+      (err: unknown) => err instanceof Error && /W0, W1, W2/.test(err.message),
+    );
+    assert.throws(
+      () => selectWallets([], "0"),
+      (err: unknown) => err instanceof Error && /No wallets are loaded at all/.test(err.message),
+    );
+  });
+
+  it("refuses a backwards range rather than quietly reversing it", () => {
+    assert.throws(
+      () => selectWallets(set(5), "3-1"),
+      (err: unknown) => err instanceof Error && /backwards/.test(err.message),
+    );
+  });
+
+  it("refuses anything it cannot read as an index", () => {
+    // 0x2 and 1e1 are both numbers to JavaScript and neither means what it looks
+    // like — the same reasoning already applied to QUANTITY and MAX_PRICE_PER_NFT.
+    for (const spec of ["0x2", "1e1", "abc", "-1", "1.0", "0,", ",0", "0,,1", "1--2", "0 1"]) {
+      assert.throws(() => selectWallets(set(5), spec), (err: unknown) => err instanceof Error, spec);
+    }
+  });
+
+  it("never returns an empty selection", () => {
+    // A run with no wallets signs nothing, broadcasts nothing, and reports
+    // success. There is no spec that may produce it.
+    for (const spec of ["0", "all", "0-2", "1,2"]) {
+      assert.ok(selectWallets(set(3), spec).length > 0, spec);
+    }
+  });
+
+  it("does not let the caller mutate the loaded set through the result", () => {
+    // Both select-everything paths, not one. They are separate returns, and a
+    // test that exercises only "all" leaves the blank-spec path — the one every
+    // caller that passes nothing takes — free to hand back the live array.
+    for (const spec of [undefined, "all"] as const) {
+      const wallets = set(3);
+      selectWallets(wallets, spec).length = 0;
+      assert.equal(wallets.length, 3, `${String(spec)} must copy, not alias`);
+    }
+  });
+});
+
+describe("the wallets asked about are the wallets that sign", () => {
+  // `walletAddresses` decides who eligibility, the stage table and the allowlist
+  // proof get resolved for. When it drifts from the set that actually signs, the
+  // run answers every question about the wrong wallets and still reports success.
+  // That is not hypothetical: the mint command resolved eligibility for the .env
+  // addresses while a key pasted at the prompt did the signing, and with .env
+  // empty it asked about nobody at all.
+  //
+  // A file-scoped version of this check was tried first and was not worth having.
+  // Both "the selection" and "the config's wallets" are legitimately named in the
+  // one function — the first builds the second — so merely proving the receiver
+  // is *a* signing set somewhere passes for either. The invariant with teeth is
+  // narrower: within one flow, the set handed to prepare and the set handed to
+  // the run must be the same expression. Matching each run call to the nearest
+  // preceding walletAddresses is a heuristic, and the right one here, because
+  // preparing always precedes running in each of these flows.
+
+  const SRC = path.resolve(__dirname, "..", "..", "src");
+
+  const walk = (dir: string): string[] =>
+    fs.readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) return walk(full);
+      return entry.isFile() && entry.name.endsWith(".ts") ? [full] : [];
+    });
+
+  /** The `wallets:` value of the call object starting at `from`, shorthand included. */
+  const signingSet = (text: string, from: number): string | null => {
+    const window = text.slice(from, from + 3000);
+    const named = /\bwallets:\s*([A-Za-z_$][\w.$]*)/.exec(window);
+    const shorthand = /^\s*wallets,\s*$/m.exec(window);
+    if (named && (!shorthand || named.index <= shorthand.index)) return named[1]!;
+    return shorthand ? "wallets" : null;
+  };
+
+  it("hands the run the same wallet set it handed the prepare", () => {
+    let checked = 0;
+    for (const file of walk(SRC)) {
+      const text = fs.readFileSync(file, "utf8");
+      const where = path.relative(SRC, file);
+      for (const call of text.matchAll(/\b(runMint|runAllowlistMint)\(/g)) {
+        const before = text.slice(0, call.index);
+        const asked = [...before.matchAll(/walletAddresses:\s*([A-Za-z_$][\w.$]*)\.map/g)].pop();
+        if (!asked) continue; // a run with no prepare above it has nothing to compare
+        // A call handing over a pre-armed set is exempt, and deliberately so. Its
+        // wallets are the same selection with nonces attached, so the names
+        // legitimately differ — and `assertPreArmCovers` already refuses a
+        // pre-arm that does not cover every wallet about to mint, per address
+        // rather than per identifier. That is a strictly stronger check than
+        // matching a variable name, so requiring the name too would only force
+        // the exemption to be written somewhere less obvious.
+        if (/\bprearmed[,:]/.test(text.slice(call.index, call.index + 3000))) continue;
+        const signs = signingSet(text, call.index);
+        assert.notEqual(signs, null, `${where}: ${call[1]!} passes no wallets at all`);
+        checked++;
+        assert.equal(
+          asked[1]!,
+          signs,
+          `${where}: ${call[1]!} signs with \`${signs}\` but eligibility was resolved for \`${asked[1]!}\``,
+        );
+      }
+    }
+    assert.ok(checked > 0, "the search itself must not silently find nothing");
   });
 });
 
@@ -161,6 +489,33 @@ describe("redactKeys", () => {
   it("redacts a bot token", () => {
     const token = "123456789:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw";
     assert.ok(!redactKeys(`token ${token} rejected`).includes(token));
+  });
+
+  it("redacts every token the client is willing to connect with", () => {
+    // The invariant, rather than a sample. The redactor used to stop at a
+    // ten-digit id while TelegramClient accepted twelve, so an eleven-digit
+    // token was one this process would authenticate with and then print in full
+    // in every transport error. Whatever the validator admits, this must hide —
+    // and Telegram bot ids are user ids, which only get longer.
+    const secret = "AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw";
+    let accepted = 0;
+    for (let digits = 4; digits <= 16; digits++) {
+      const token = `${"1".repeat(digits)}:${secret}`;
+      let valid = true;
+      try {
+        new TelegramClient(token);
+      } catch {
+        valid = false;
+      }
+      if (!valid) continue;
+      accepted++;
+      const url = `https://api.telegram.org/bot${token}/sendMessage`;
+      assert.ok(
+        !redactKeys(`connect ECONNREFUSED ${url}`).includes(secret),
+        `a ${digits}-digit bot id is accepted by TelegramClient but survives redaction`,
+      );
+    }
+    assert.ok(accepted >= 5, "the sweep actually exercised some valid tokens");
   });
 
   it("redacts a bot token inside its own API URL", () => {

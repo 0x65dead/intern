@@ -83,6 +83,7 @@ function defaults(): Defaults {
     allowlistMinting: false,
     allowlistSource: null,
     dryRun: false,
+    maxPricePerNftWei: null,
     heartbeatMinutes: 30,
     heartbeatChatId: null,
     signaturePollMs: 250,
