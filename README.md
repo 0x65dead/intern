@@ -203,8 +203,13 @@ wallets in its own `.env`, on the machine it runs on. A key pasted into a chat h
 already been through Telegram's servers and is stored on every device signed into
 that account; deleting the message does not undo either. Use the CLI to enter keys.
 
-One run at a time across all chats: the wallets come from a single `.env`, and two
-concurrent runs would sign different transactions with the same nonces.
+Locking is per wallet rather than per bot. A run is refused when it wants a wallet
+another run is already signing with, because that is the actual collision: two
+transactions at one wallet's nonce, of which the network keeps exactly one. The
+refusal names the wallets, so you can see which one is in the way. The bot has no
+per-run wallet selection yet, so every run asks for every loaded key and this still
+comes to one run at a time — `--wallets 0,2` on the CLI is where a narrower set
+exists today.
 
 ### Running it as a daemon
 

@@ -23,11 +23,17 @@
 //   group must be listed. Skipping this check on callbacks would mean the ✅ Send
 //   button spends the owner's wallets for whoever can see it.
 //
-//   One run at a time across all chats. The wallet set comes from a single .env, so
-//   two concurrent runs would sign different transactions with the same nonces and
-//   one of them would be silently discarded by the network. Read-only panels
-//   (check, stages, status) do *not* take this lock — watching a drop must never be
-//   the reason a mint cannot start.
+//   One run at a time per wallet, across all chats. The collision being prevented
+//   belongs to a wallet, not to the bot: two runs signing with the same key produce
+//   two transactions at one nonce and the network silently discards one of them,
+//   while two runs on different keys cannot collide at all. So the lock is the
+//   TaskScheduler's per-wallet lock, and a run is refused only for the wallets it
+//   actually wants — named in the refusal, because "the bot is busy" tells an
+//   operator nothing they can act on. The bot has no per-run wallet selection yet,
+//   so every run asks for every loaded key and this still comes to one run at a
+//   time; nothing about the lock changes when that stops being true. Read-only
+//   panels (check, stages, status) take no lock — watching a drop must never be the
+//   reason a mint cannot start.
 //
 //   Nothing signs before ✅ Send. Preparation is idempotent and read-only; the
 //   confirm panel states chain, contract, wallet count and worst-case total spend,
@@ -35,6 +41,7 @@
 
 import { explorerAddress } from "../core/chains";
 import { CorrectedClock } from "../core/clock";
+import { TaskContext, TaskScheduler, phaseForEvent } from "../core/tasks";
 import { orderCandidates } from "../core/detect";
 import { resolveFireTime, runMint } from "../core/engine";
 import { BalanceReport, LoadedWallet, checkBalances, formatEth, redactKeys, requiredBalance } from "../core/wallets";
@@ -252,33 +259,83 @@ const HELP = [
 ].join("\n");
 
 /**
- * Whether a run may start, given who holds the global lock.
+ * Whether a run may start, given which of its wallets are already committed.
  *
- * HARD CONSTRAINT 6 is one mint run at a time, *globally*. The check used to read
- * `this.running !== chatId`, exempting the chat that already held the lock — which
- * was invisible only because the update loop was blocked for the whole run, so a
- * second ✅ Send could not be delivered until the first had finished. With the run
- * detached so ❌ Cancel can land, that exemption becomes a double-tap that signs
- * two sets of transactions at the same nonces, and the network keeps one.
+ * This replaced a global `running` chat id, and the difference is the whole point.
+ * Nonce safety is a property of a *wallet*, not of the bot: two runs on disjoint
+ * wallets cannot collide, and two runs sharing one wallet collide however few
+ * runs are in flight. A global flag got the safe answer for the wrong reason, and
+ * would have kept getting it after that stopped being true.
  *
- * Returns the refusal to show, or `null` to proceed. Pure, so the rule is testable
- * without standing up a chat, a wallet set and a chain.
+ * The rule it enforces is unchanged and still HARD CONSTRAINT 6's: a second run
+ * on a wallet that is already signing would reuse that wallet's nonces, and the
+ * network keeps exactly one of the two transactions. So a contended wallet
+ * refuses rather than queues — see `TaskScheduler.walletHolders` for why waiting
+ * is the wrong answer for a mint specifically.
+ *
+ * Both messages name the wallets, because "another run is using W1" is something
+ * an operator can act on and "the bot is busy" is not. Only the same-chat case
+ * points at this chat's ❌ Cancel, since that is the only case where the button in
+ * front of them is the one that would free the wallet.
+ *
+ * Pure, so the rule is testable without standing up a chat, a wallet set and a
+ * chain. `chatId: null` for a holder means the owning chat could not be
+ * identified, which reads as "someone else's" — the safer of the two.
  */
-export function lockRefusal(
-  holder: number | null,
+export function walletLockRefusal(
+  held: readonly { walletIndex: number; chatId: number | null }[],
   chatId: number,
 ): { title: string; body: string } | null {
-  if (holder === null) return null;
-  if (holder === chatId) {
+  if (held.length === 0) return null;
+  const names = [...new Set(held.map((entry) => entry.walletIndex))]
+    .sort((a, b) => a - b)
+    .map((index) => `W${index}`)
+    .join(", ");
+  const plural = held.length === 1 ? "is" : "are";
+
+  // Every contended wallet has to be this chat's own for this to be the
+  // double-tap case. One wallet held elsewhere makes it someone else's run, and
+  // telling the operator to press Cancel would point at a button that would not
+  // free it.
+  if (held.every((entry) => entry.chatId === chatId)) {
     return {
       title: "Already running",
-      body: "This chat already has a run in progress. Use ❌ Cancel to stop it; starting a second would reuse the same nonces and one would be silently discarded.",
+      body: `This chat is already minting with ${names}. Use ❌ Cancel to stop it; starting a second run on the same wallet would reuse the same nonces and one of the two would be silently discarded.`,
     };
   }
   return {
-    title: "Another chat is mid-run",
-    body: "The same wallets are already signing. Two runs would use the same nonces and one would be silently discarded, so this one is not starting.",
+    title: "Those wallets are mid-run",
+    body: `${names} ${plural} already signing in another run. Two runs on one wallet reuse the same nonces and one is silently discarded, so this one is not starting.`,
   };
+}
+
+/**
+ * The whole fire-time lock decision, as one pure function.
+ *
+ * Split out of `launch` because a private method reachable only through a prepared
+ * plan, a chain, a provider and a wallet set is a method no test reaches. Both
+ * halves of this decision were covered on their own — which wallets the scheduler
+ * holds, and what to say about a contended one — while the join between them was
+ * not, so the mapping below could have gone wrong in either direction with every
+ * test still passing. It is the join that decides whether a mint is refused.
+ *
+ * `chatOf` returns undefined for a task whose chat is not known, which becomes
+ * null and reads as another chat's run. That is the safer of the two readings: the
+ * alternative claims the run as this chat's and offers a ❌ Cancel that would not
+ * free the wallet.
+ */
+export function fireRefusal(
+  holders: readonly { walletIndex: number; taskId: string }[],
+  chatOf: (taskId: string) => number | undefined,
+  chatId: number,
+): { title: string; body: string } | null {
+  return walletLockRefusal(
+    holders.map((held) => ({
+      walletIndex: held.walletIndex,
+      chatId: chatOf(held.taskId) ?? null,
+    })),
+    chatId,
+  );
 }
 
 /**
@@ -392,18 +449,20 @@ export function enqueuePaint<T>(
  *
  * The guard used to read `session.view === "running"`, which is a *display* flag,
  * not the lock. Any view change cleared it — `/status` sets the view to "status",
- * and from then on the guard saw an idle chat while a mint was still signing. The
- * real lock is `running`, so that is what this reads.
+ * and from then on the guard saw an idle chat while a mint was still signing. So
+ * it reads the lock instead, which now means: does this chat have a live task.
+ *
+ * Takes the answer rather than the lock itself, so the caller resolves "is one of
+ * mine still running" and this stays a pure statement of what to say about it.
  *
  * Another chat's run is deliberately not refused here: preparing a target sends
- * nothing, and the global lock is re-checked at fire time, where it belongs.
+ * nothing, and wallet contention is re-checked at fire time, where it belongs.
  */
 export function beginRefusal(
-  running: number | null,
-  chatId: number,
+  hasOwnRun: boolean,
   view: string,
 ): { title: string; body: string } | null {
-  if (running === chatId) {
+  if (hasOwnRun) {
     return {
       title: "A run is in progress",
       body: "Cancel it before starting another.",
@@ -474,8 +533,37 @@ export function planRefreshReport(
 
 export class SessionManager {
   private readonly sessions = new Map<number, Session>();
-  /** chatId currently holding the run lock, or null. Mint runs only. */
-  private running: number | null = null;
+
+  /**
+   * The lock, and the only thing that decides whether a run may start.
+   *
+   * Runs are submitted here so that "one mint at a time per wallet" is enforced
+   * by the wallet locks rather than by a flag next to them. The flag this
+   * replaced — a single `running` chat id — got the safe answer for the wrong
+   * reason: it serialized every run against every other whatever wallets they
+   * used, and it would have gone on doing that after runs stopped sharing one
+   * keyring. Contention is refused rather than queued; `walletHolders` says why.
+   */
+  private readonly scheduler = new TaskScheduler(() => this.clock.now());
+
+  /**
+   * Which chat submitted each live task.
+   *
+   * Bookkeeping for phrasing and painting a refusal, not tenancy: there is one
+   * operator, who may reach the bot from a DM and a group. Entries are removed
+   * when the task settles, so this never grows with history.
+   */
+  private readonly taskChat = new Map<string, number>();
+
+  /**
+   * The unwinding promise of every live task, so shutdown can wait for all of them.
+   *
+   * Separate from `activeRun`, which holds only the most recent. Aborting is not
+   * the same as having stopped — a run still has to send its closing line — and
+   * with more than one run possible, waiting on the newest alone would cut the
+   * others off exactly as awaiting nothing used to cut off the only one.
+   */
+  private readonly runningTasks = new Map<string, Promise<void>>();
 
   /**
    * The live run's abort handle, held here rather than only on the session.
@@ -491,8 +579,6 @@ export class SessionManager {
 
   /** The detached watch. Holds no lock, but shutdown still waits for it. */
   private activeWatch: Promise<void> | null = null;
-  /** The contract the live run is firing at, for the heartbeat. null when idle. */
-  private runningTarget: string | null = null;
   private readonly clock: CorrectedClock;
   /**
    * The eligibility credential, built at most once for the process lifetime.
@@ -540,14 +626,29 @@ export class SessionManager {
     });
   }
 
-  /** Whether a mint run currently holds the global lock. For the heartbeat. */
+  /** Whether any mint run is live. For the heartbeat. */
   isRunning(): boolean {
-    return this.running !== null;
+    return this.scheduler.listActive().length > 0;
   }
 
-  /** The contract a live run is firing at, or null when idle. For the heartbeat. */
+  /**
+   * The contract a live run is firing at, or null when idle. For the heartbeat.
+   *
+   * The oldest live run when there is more than one, which is the one an operator
+   * reading a heartbeat is most likely asking about. `listActive` is already
+   * ordered by submission, so this is the first entry rather than a choice made
+   * here.
+   */
   currentTarget(): string | null {
-    return this.runningTarget;
+    return this.scheduler.listActive()[0]?.target ?? null;
+  }
+
+  /** The live tasks this chat submitted. */
+  private ownRuns(chatId: number): string[] {
+    return this.scheduler
+      .listActive()
+      .filter((task) => this.taskChat.get(task.id) === chatId)
+      .map((task) => task.id);
   }
 
   // ── authorization ──────────────────────────────────────────────────────────
@@ -955,7 +1056,7 @@ export class SessionManager {
   // ── setup flow ─────────────────────────────────────────────────────────────
 
   private async begin(session: Session, intent: Intent, target: string): Promise<void> {
-    const busy = beginRefusal(this.running, session.chatId, session.view);
+    const busy = beginRefusal(this.ownRuns(session.chatId).length > 0, session.view);
     if (busy !== null) {
       await this.paint(
         session,
@@ -1496,12 +1597,88 @@ export class SessionManager {
     mode: "stage" | "now" | { atMs: number },
     dryRun = false,
   ): void {
-    // A refused start resolves almost immediately. Installing it as `activeRun`
-    // anyway would replace the live run's promise with one that is already done,
-    // so `drain()` would return while the real mint was still signing and
-    // shutdown would cut it off mid-broadcast.
-    const refused = lockRefusal(this.running, session.chatId) !== null;
-    const run = this.fire(session, mode, dryRun)
+    // Nothing prepared means nothing to lock. Checked before submitting rather
+    // than inside the task, because a task that exists only to report "nothing is
+    // prepared" would still hold this run's wallets while it said so.
+    const prepared = session.draft.run;
+    if (!prepared?.plan) {
+      void this.paint(
+        session,
+        `${bold("Nothing is prepared")}\n${esc("Start with 🎯 Mint.")}`,
+        MAIN_MENU,
+      ).catch(() => {});
+      return;
+    }
+
+    // The wallets this run will sign with. Every loaded wallet today, which is
+    // why replacing the global flag with per-wallet locks changes no behaviour
+    // yet: identical sets contend on every wallet, so a second run is refused
+    // exactly as before. It becomes a real concurrency gain the moment a run can
+    // hold a narrower set, and needs no further change to the lock when it does.
+    const wallets = this.opts.wallets;
+    const indexes = wallets.map((wallet) => wallet.index);
+
+    // Asked and claimed in one tick. `submit` locks synchronously — submit, pump,
+    // start and lock all run before it returns — so as long as nothing is awaited
+    // between this check and that call, a second ✅ Send cannot read "free" and
+    // claim the same wallets. The paint below is deliberately not awaited for the
+    // same reason.
+    const refusal = fireRefusal(
+      this.scheduler.walletHolders(indexes),
+      (taskId) => this.taskChat.get(taskId),
+      session.chatId,
+    );
+    if (refusal !== null) {
+      void this.paint(
+        session,
+        [bold(refusal.title), "", esc(refusal.body)].join("\n"),
+        MAIN_MENU,
+      ).catch(() => {});
+      return;
+    }
+
+    const task = this.scheduler.submit({
+      target: prepared.contract,
+      chain: prepared.chain.key,
+      walletIndexes: indexes,
+      run: async (ctx) => {
+        await this.fire(session, mode, dryRun, task.controller, ctx);
+      },
+    });
+    this.taskChat.set(task.id, session.chatId);
+
+    // The task must have *started*, not queued. The contention check immediately
+    // above proved the wallets were free and `submit` locks synchronously, so this
+    // holds today by adjacency alone — which is a fragile thing for a money path
+    // to rest on. If an await ever lands between the two, `submit` would enqueue
+    // instead, and the run would fire whenever the other one finished: late,
+    // unattended, at a price nobody re-confirmed, against a stage that has very
+    // likely closed. Refusing is the only safe reading of that state.
+    if (this.scheduler.get(task.id)?.status === "CREATED") {
+      this.scheduler.cancel(task.id);
+      this.taskChat.delete(task.id);
+      void this.paint(
+        session,
+        [
+          bold("Not starting"),
+          "",
+          esc(
+            "Those wallets were taken between the check and the start. Nothing was sent. Try again.",
+          ),
+        ].join("\n"),
+        MAIN_MENU,
+      ).catch(() => {});
+      return;
+    }
+
+    // Installed synchronously, so a ❌ Cancel arriving before the body's first
+    // microtask still finds a handle to abort. The scheduler covers that window
+    // too — it refuses to enter the body of an aborted task — and this makes the
+    // cancel button's own path work rather than relying on that.
+    session.controller = task.controller;
+    this.activeController = task.controller;
+
+    const run = task.promise
       .catch(async (err: unknown) => {
         // Nothing awaits this promise, so an escape would be an unhandled
         // rejection — and a bot that dies mid-mint is worse than one that reports
@@ -1511,10 +1688,17 @@ export class SessionManager {
         await this.say(session.chatId, `${bold("Run stopped")}\n${esc(message)}`).catch(() => {});
       })
       .finally(() => {
+        this.taskChat.delete(task.id);
+        this.runningTasks.delete(task.id);
         // Only if it is still ours: a later run may already have replaced it.
         if (this.activeRun === run) this.activeRun = null;
       });
-    if (!refused) this.activeRun = run;
+    this.runningTasks.set(task.id, run);
+    // Unconditional now. A refused start returns above without creating a promise
+    // at all, so the hazard this used to guard against — installing an
+    // already-resolved promise as `activeRun`, letting `drain()` return while a
+    // real mint was still signing — is gone by construction rather than by check.
+    this.activeRun = run;
   }
 
   /**
@@ -1538,14 +1722,32 @@ export class SessionManager {
     this.activeWatch = task;
   }
 
+  /**
+   * Do the run. Called only as a scheduler task body, by `launch`.
+   *
+   * The wallet locks, the refusal and the abort handle all belong to the task by
+   * the time this is entered, which is why there is no lock check here any more:
+   * checking again would either duplicate a decision already made or — worse —
+   * reach a different one, and this function has no way to decline that would
+   * release the wallets it is holding.
+   *
+   * `controller` is the task's own, so ❌ Cancel, `scheduler.cancel` and shutdown
+   * all abort the same thing. `ctx` reports phases, which is what makes a task
+   * record say BROADCASTING rather than merely "running".
+   */
   private async fire(
     session: Session,
     mode: "stage" | "now" | { atMs: number },
-    dryRun = false,
+    dryRun: boolean,
+    controller: AbortController,
+    ctx: TaskContext,
   ): Promise<void> {
     const chatId = session.chatId;
     const run = session.draft.run;
     if (!run?.plan) {
+      // `launch` checked this before submitting, so reaching it here means the
+      // draft was discarded in the microtask between submit and body. Nothing has
+      // been signed; the task ends and the scheduler releases the wallets.
       await this.paint(
         session,
         `${bold("Nothing is prepared")}\n${esc("Start with 🎯 Mint.")}`,
@@ -1553,23 +1755,13 @@ export class SessionManager {
       );
       return;
     }
-    const refusal = lockRefusal(this.running, chatId);
-    if (refusal !== null) {
-      await this.paint(session, [bold(refusal.title), "", esc(refusal.body)].join("\n"), MAIN_MENU);
-      return;
-    }
 
     // A mint takes the panel out of live mode: the numbers are now fixed by the
     // transactions being signed, and a refresh loop editing the same message
     // would fight the run reporter for the rate limit.
     this.stopAuto(session);
-    this.running = chatId;
-    this.runningTarget = run.contract;
     session.view = "running";
     this.clearExpiry(session);
-    const controller = new AbortController();
-    session.controller = controller;
-    this.activeController = controller;
 
     const { fireAtMs } = resolveFireTime(run.plan, mode, this.opts.defaults.leadMs);
     // A null fire time means "as soon as everything is signed" — there is no
@@ -1595,6 +1787,26 @@ export class SessionManager {
 
     const reporter = createTelegramReporter(this.opts.client, chatId, run.chain, () => this.clock.now());
 
+    // The task record's phase, tapped off the same events the panel renders rather
+    // than guessed at from where the code has got to. Two things depend on it: an
+    // operator reading /tasks sees BROADCASTING instead of a task that claims to be
+    // DISCOVERING for its whole life, and — the one with money attached — the
+    // scheduler learns a broadcast happened, which is what lets it refuse a later
+    // report that would have something rebuild and re-sign at the same nonce.
+    //
+    // Reporting is advisory and must never be able to stop a mint: a refused phase
+    // changes the record, never the run, and a throw from this tap would escape
+    // into the engine's emit call.
+    const report = (event: Parameters<typeof reporter.handle>[0]): void => {
+      reporter.handle(event);
+      try {
+        const next = phaseForEvent(event);
+        if (next !== null) ctx.phase(next);
+      } catch {
+        // Nothing to do and nothing worth saying: the panel already has the event.
+      }
+    };
+
     try {
       const result = await runMint(
         {
@@ -1607,6 +1819,7 @@ export class SessionManager {
           fireAtMs,
           leadMs: this.opts.defaults.leadMs,
           receiptTimeoutMs: this.opts.defaults.receiptTimeoutMs,
+          maxPricePerNftWei: this.opts.defaults.maxPricePerNftWei,
           dryRun,
           // Enforced here, unlike in the CLI. Nobody is watching a bot run, so
           // there is no one to read a clock warning and decide it is acceptable.
@@ -1614,7 +1827,7 @@ export class SessionManager {
           target: run.contract,
           signal: controller.signal,
         },
-        reporter.handle,
+        report,
       );
       const landed = await reporter.settle();
 
@@ -1648,8 +1861,10 @@ export class SessionManager {
       const note = landed ? "" : `\n\n${esc(PANEL_STALE)}`;
       await this.say(chatId, `${bold("Run stopped")}\n${esc(message)}${note}`);
     } finally {
-      this.running = null;
-      this.runningTarget = null;
+      // The wallet locks are not released here: the scheduler drops them when the
+      // task settles, which happens whether this returned, threw or was aborted.
+      // Clearing them from here as well would be a second owner for the one piece
+      // of state that must have exactly one.
       this.activeController = null;
       // Only tear down what this run owned. Now that the run is detached, the
       // operator can prepare a *new* mint while this one is still in flight —
@@ -1791,7 +2006,8 @@ export class SessionManager {
     };
 
     // The lock is the truth; the view is a display flag any panel can overwrite.
-    const state = this.running === session.chatId ? "Running. Cancel to abort." : describe[was];
+    const own = this.ownRuns(session.chatId).length > 0;
+    const state = own ? "Running. Cancel to abort." : describe[was];
     const lines = [bold("📈 Status"), "", esc(state)];
     const run = session.draft.run;
     if (run) {
@@ -1803,9 +2019,20 @@ export class SessionManager {
     );
     lines.push(esc(`wallets: ${this.opts.wallets.length}`));
     if (this.isAuto(session)) lines.push(esc("auto-refresh: on"));
-    if (this.running !== null) {
+    // Named wallets rather than a yes/no, because with per-wallet locking "a run
+    // is in progress" no longer tells the operator whether theirs could start.
+    const active = this.scheduler.listActive();
+    if (active.length > 0) {
+      const committed = [...new Set(active.flatMap((task) => task.walletIndexes))]
+        .sort((a, b) => a - b)
+        .map((index) => `W${index}`)
+        .join(", ");
       lines.push(
-        esc(this.running === session.chatId ? "This chat holds the run lock." : "Another chat holds the run lock."),
+        esc(
+          own
+            ? `This chat is running: ${committed} committed.`
+            : `Another chat is running: ${committed} committed.`,
+        ),
       );
     }
     lines.push("", updatedFooter(this.now()));
@@ -1824,17 +2051,25 @@ export class SessionManager {
     const wasAuto = this.isAuto(session);
     this.stopAuto(session);
 
-    // Both handles, not just this chat's. The mint lock is global, so a run
-    // started from a group panel has to be stoppable from the operator's DM —
-    // and HARD CONSTRAINT 6 asks for one button that kills a live mint *and* a
-    // live panel loop, which for this chat may be two different controllers.
-    // Anything reaching here has already passed the authorization check.
+    // Both handles, not just this chat's. HARD CONSTRAINT 6 asks for one button
+    // that kills a live mint *and* a live panel loop, and a run started from a
+    // group panel has to be stoppable from the operator's DM. Anything reaching
+    // here has already passed the authorization check.
+    //
+    // Counted before cancelling, because `cancelAll` aborts the very controllers
+    // `abortTargets` reports on, and asking afterwards would find them spent and
+    // conclude there had been nothing to stop.
     const live = abortTargets(
       this.activeController,
       session.controller,
       session.watchController,
     );
-    if (live.length > 0) {
+    // Every live task, not just the one `activeController` happens to point at.
+    // That handle holds the most recent run; the scheduler holds all of them, and
+    // it also reaches a task cancelled in the window before its body starts —
+    // which has no controller installed anywhere else yet.
+    const cancelled = this.scheduler.cancelAll();
+    if (live.length > 0 || cancelled > 0) {
       for (const controller of live) controller.abort();
       await this.paint(
         session,
@@ -1910,14 +2145,20 @@ export class SessionManager {
    * simply went quiet.
    */
   async drain(): Promise<void> {
-    await Promise.allSettled([this.activeRun, this.activeWatch]);
+    // `activeRun` is the most recent run's promise; `runningTasks` covers every
+    // task still unwinding, including one started from another chat that a newer
+    // run has since displaced from `activeRun`. Waiting on only the newest would
+    // let the process exit while an older mint was still sending its closing line.
+    await Promise.allSettled([this.activeRun, this.activeWatch, ...this.runningTasks.values()]);
   }
 
   /** Abort everything in flight — used on shutdown. */
   shutdown(): void {
-    // The lock is global, so the handle is too: a run started from one chat used
-    // to survive SIGTERM because shutdown only walked per-session controllers,
-    // and `watch` had overwritten the one it looked at.
+    // Through the scheduler as well as the cached handle: a run started from one
+    // chat used to survive SIGTERM because shutdown only walked per-session
+    // controllers, and `watch` had overwritten the one it looked at. `cancelAll`
+    // is what makes that true for every live task rather than the newest.
+    this.scheduler.cancelAll();
     this.activeController?.abort();
     for (const session of this.sessions.values()) {
       session.controller?.abort();
