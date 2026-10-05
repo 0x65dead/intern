@@ -563,19 +563,29 @@ interface DecodedMintArgs {
  *
  * This is the security boundary of the allowlist path. The API response decides
  * what bytes get signed by the user's key, so every field is checked against a
- * value we know independently:
+ * value we know independently — with one exception, marked:
  *
  *   · the chain must be the one we selected      (else: wrong-network broadcast)
  *   · the target must be SeaDrop or the token    (else: arbitrary contract call)
  *   · the calldata must decode to a known mint   (else: transfer or approval)
  *   · the collection must be the one requested   (else: minting someone else's)
  *   · the recipient must be this wallet or zero  (else: minting to an attacker)
- *   · value must equal mintPrice × quantity      (else: overpayment)
+ *   · value must equal mintPrice × quantity      († see below)
  *   · the stage must be open right now           (else: guaranteed revert)
  *
  * Decoding is what makes this meaningful: an opaque `data` blob cannot be checked
  * at all, so anything that does not parse as a known mint function is refused
  * outright rather than passed through.
+ *
+ * † The value check is the exception, and it is worth being exact about what it
+ * buys. `mintPrice` is decoded from the same calldata the value arrives in, so
+ * the comparison proves the response is consistent with itself — that OpenSea has
+ * not asked for a value its own mint parameters contradict, which does catch a
+ * mangled or tampered response. It proves nothing about whether the price is one
+ * the operator agreed to pay, because both halves of it came from the thing being
+ * checked. The only figure within reach that did not is the operator's own
+ * MAX_PRICE_PER_NFT, which is why `priceCeilingRefusal` runs on this path after
+ * this function returns and before anything is signed.
  */
 export function verifyAllowlistTx(raw: RawMintTx, ctx: VerifyContext): VerifiedMintTx {
   const nowMs = ctx.nowMs ?? Date.now();

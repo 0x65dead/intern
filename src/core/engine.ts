@@ -60,6 +60,7 @@ import {
   pairByAddress,
   splitByFunding,
   formatEth,
+  priceCeilingRefusal,
   requiredBalance,
 } from "./wallets";
 
@@ -130,6 +131,13 @@ export interface EngineOptions {
   signal?: AbortSignal;
   /** Do every check and sign every transaction, then stop without broadcasting. */
   dryRun?: boolean;
+  /**
+   * The most one NFT may cost, in wei. null or absent means no ceiling.
+   *
+   * See `priceCeilingRefusal`: this is the only bound on what a mint may spend
+   * that does not come from the wallet's own balance.
+   */
+  maxPricePerNftWei?: bigint | null;
   /**
    * Refuse to fire when the clock offset could not be measured to within this.
    *
@@ -426,6 +434,18 @@ export async function runMint(
     for (const warning of planWarnings(plan, Date.now())) {
       emit({ type: "warning", message: warning });
     }
+
+    // The price ceiling, before any network work and long before anything is
+    // signed. On a live run `refuse` throws here, so nothing below this line
+    // happens at all; a dry run records it and carries on so that one rehearsal
+    // surfaces every refusal rather than only the first.
+    const overCeiling = priceCeilingRefusal({
+      value: plan.value,
+      quantity: plan.quantity,
+      ceilingPerNftWei: opts.maxPricePerNftWei ?? null,
+      symbol: chain.nativeSymbol,
+    });
+    if (overCeiling) refuse(overCeiling);
 
     const required = requiredBalance(plan.value, gas);
     const [, clockSync, nonces, balances] = await Promise.all([

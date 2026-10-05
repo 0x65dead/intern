@@ -299,6 +299,14 @@ function redactLiterals(text: string): string {
  * through a function whose whole purpose is that they do not. A run longer than 64
  * is never exempt, since an exemption is recorded at exactly 64.
  *
+ * The bot-token pattern has no upper bound on the id, and must not grow one. It
+ * used to stop at ten digits while `TelegramClient` accepted twelve, so an id of
+ * eleven or twelve was a token this process would connect with and then print
+ * verbatim in every transport error — the redactor was narrower than the
+ * validator, which is the one direction that leaks. Telegram bot ids are user
+ * ids and they get longer over time, so any ceiling here is a leak with a date
+ * on it. Over-matching only ever costs a redacted log line.
+ *
  * The bot-token pattern opens with a negative lookbehind rather than `\b`, because
  * the one place a bot token actually appears is inside its own API URL —
  * `https://api.telegram.org/bot123456789:AAA…/sendMessage` — and there `t` and `1`
@@ -316,7 +324,7 @@ export function redactKeys(text: string): string {
     .replace(JWT_PATTERN, "⟨redacted-jwt⟩")
     .replace(/0[xX][a-fA-F0-9]{64,}/g, hideUnlessPublic)
     .replace(/\b[a-fA-F0-9]{64,}\b/g, hideUnlessPublic)
-    .replace(/(?<!\d)\d{6,10}:[A-Za-z0-9_-]{30,}/g, "⟨redacted-bot-token⟩")
+    .replace(/(?<!\d)\d{6,}:[A-Za-z0-9_-]{30,}/g, "⟨redacted-bot-token⟩")
     .replace(API_KEY_HEADER_PATTERN, (_m, name: string, sep: string) => `${name}${sep}⟨redacted⟩`)
     .replace(BEARER_PATTERN, (_m, scheme: string) => `${scheme} ⟨redacted⟩`);
 }
@@ -367,6 +375,85 @@ export function loadWallets(rawKeys: string[]): LoadedWallet[] {
   return out;
 }
 
+/**
+ * The wallets one run should use, from an operator-supplied spec.
+ *
+ * Indexes are the ones this product prints — W0, W1, W2 — because those are the
+ * only wallet names an operator has ever seen. `loadWallets` numbers from zero,
+ * so a one-based spec would read perfectly naturally and select the wrong key
+ * every single time, which is the most expensive off-by-one available here.
+ *
+ * The spec is a comma-separated list of indexes and ranges: `0`, `0,2`, `1-3`,
+ * `0,2-4`. `all`, blank, and absent all mean every loaded wallet, so callers that
+ * pass nothing keep the behaviour that existed before selection did.
+ *
+ * Everything questionable is an error rather than a quiet adjustment. An index
+ * that is not loaded is refused rather than skipped, because a run that fires
+ * with four of the five wallets the operator named looks exactly like a run that
+ * worked. A backwards range is refused rather than normalised, for the same
+ * reason `--quantiy 5` is refused rather than read as one.
+ *
+ * Returns the selection in loaded order however it was written, so `2,0` and
+ * `0,2` are the same run and duplicates collapse. Error text names indexes only:
+ * never a key, and not an address either, since the caller already has both and
+ * a refusal is not the place to start printing wallet identity.
+ */
+export function selectWallets(
+  wallets: readonly LoadedWallet[],
+  spec: string | null | undefined,
+): LoadedWallet[] {
+  if (spec === undefined || spec === null || spec.trim() === "") return [...wallets];
+  const text = spec.trim();
+  if (text.toLowerCase() === "all") return [...wallets];
+
+  const available = new Map(wallets.map((wallet) => [wallet.index, wallet]));
+  const loaded =
+    wallets.length === 0
+      ? "No wallets are loaded at all."
+      : `Loaded: ${wallets.map((wallet) => `W${wallet.index}`).join(", ")}.`;
+  const chosen = new Set<number>();
+
+  const readIndex = (raw: string): number => {
+    // Not `Number()`, which reads 0x2 as 2 and 1e1 as ten. A wallet spec is one
+    // more place an operator must not be able to mean something they did not write.
+    if (!/^\d+$/.test(raw)) {
+      throw new Error(
+        `"${raw}" is not a wallet index. Use the numbers the panel shows — W0, W1, W2 — written as 0,2 or 1-3.`,
+      );
+    }
+    const index = Number(raw);
+    if (!available.has(index)) throw new Error(`No wallet W${index} is loaded. ${loaded}`);
+    return index;
+  };
+
+  for (const part of text.split(",")) {
+    const item = part.trim();
+    if (item === "") {
+      throw new Error(`"${text}" has an empty entry. Write the indexes as 0,2 or 1-3.`);
+    }
+    const range = /^(\d+)\s*-\s*(\d+)$/.exec(item);
+    if (range === null) {
+      chosen.add(readIndex(item));
+      continue;
+    }
+    const from = readIndex(range[1]!);
+    const to = readIndex(range[2]!);
+    if (from > to) throw new Error(`Range ${item} runs backwards. Write it as ${to}-${from}.`);
+    // Every index in the span is checked, not just the endpoints. Loaded indexes
+    // are contiguous today, so this cannot currently fire — and if that ever
+    // stops being true, a gap inside a range must fail loudly rather than hand
+    // back a selection quietly shorter than the one that was asked for.
+    for (let i = from; i <= to; i++) chosen.add(readIndex(String(i)));
+  }
+
+  // Not reachable through the parser above, which refuses a blank spec and every
+  // unknown index. Kept because an empty selection is the one outcome that must
+  // never reach a run: it would sign nothing, broadcast nothing, and report
+  // success.
+  if (chosen.size === 0) throw new Error(`"${text}" selected no wallets.`);
+  return wallets.filter((wallet) => chosen.has(wallet.index));
+}
+
 export interface GasSettings {
   maxFeePerGas: bigint;
   maxPriorityFeePerGas: bigint;
@@ -411,6 +498,62 @@ export function suggestMaxFee(baseFeeWei: bigint, priorityWei: bigint): bigint {
 /** What the node reserves per wallet, and therefore what it checks against. */
 export function requiredBalance(mintValue: bigint, gas: GasSettings): bigint {
   return mintValue + gas.gasLimit * gas.maxFeePerGas;
+}
+
+/**
+ * Refuse a mint that would spend more than the operator said they would pay.
+ *
+ * Every other check made before signing bounds something other than the price.
+ * The balance check bounds what the wallet can afford, which is not a ceiling —
+ * it is the entire balance. The gas settings bound the fee, not the purchase.
+ * The per-wallet cap bounds how many, not how much. Without this, the amount a
+ * mint may spend is bounded only by the funds within reach of the key.
+ *
+ * It matters most on the allowlist path, where `value` arrives in an HTTP
+ * response. `verifyAllowlistTx` checks that value equals mintPrice × quantity,
+ * but both of those numbers are decoded from that same response: the check
+ * proves the response is self-consistent, not that the price is one anybody
+ * agreed to. This ceiling is the only figure in that comparison that came from
+ * the operator rather than from the thing being checked.
+ *
+ * Returns the refusal instead of throwing, so a dry run can report it beside
+ * every other refusal rather than aborting at the first one.
+ *
+ * Stated per NFT and multiplied here. What that deliberately does not cover: a
+ * ceiling that scales with quantity does not bound the quantity itself. That is
+ * QUANTITY's own strict parse and the per-wallet mint cap, and this comment is
+ * here so nobody reads this gate as covering both.
+ */
+export function priceCeilingRefusal(opts: {
+  /** The transaction's value in wei: the whole purchase for one wallet. */
+  value: bigint;
+  quantity: number;
+  /** Per NFT, in wei. null means unconfigured; 0n is a ceiling meaning "free only". */
+  ceilingPerNftWei: bigint | null;
+  symbol?: string;
+}): string | null {
+  const { value, quantity, ceilingPerNftWei } = opts;
+  // Compared to null, not tested for truthiness: 0n is a configured ceiling that
+  // permits free mints and nothing else, and `!0n` would read it as "unset".
+  if (ceilingPerNftWei === null) return null;
+  // A nonsensical quantity leaves the budget at or below zero and so refuses,
+  // which is the direction to fail in when the caller is the thing that is wrong.
+  const budget = ceilingPerNftWei * BigInt(quantity);
+  if (value <= budget) return null;
+
+  const symbol = opts.symbol ?? "ETH";
+  // Shown only when it divides exactly. A truncated per-NFT figure printed
+  // beside the real total would be the one number on the line that is not true,
+  // in a message whose only purpose is to state what something costs.
+  const each =
+    quantity > 0 && value % BigInt(quantity) === 0n
+      ? ` (${formatEth(value / BigInt(quantity), symbol)} × ${quantity})`
+      : "";
+  return (
+    `this mint would spend ${formatEth(value, symbol)}${each}, ` +
+    `over the MAX_PRICE_PER_NFT ceiling of ${formatEth(ceilingPerNftWei, symbol)} ` +
+    `per NFT — ${formatEth(budget, symbol)} for ${quantity}. Nothing was signed.`
+  );
 }
 
 export interface BalanceReport {

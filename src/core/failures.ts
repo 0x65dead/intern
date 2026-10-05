@@ -47,6 +47,7 @@ export type FailureCode =
   | "INSUFFICIENT_BALANCE"
   | "INSUFFICIENT_GAS"
   | "GAS_TOO_HIGH"
+  | "PRICE_TOO_HIGH"
   // Execution
   | "SIMULATION_REVERT"
   | "NONCE_CONFLICT"
@@ -169,6 +170,18 @@ export const FAILURE_META: Record<FailureCode, FailureMeta> = {
     retryable: true,
     terminal: false,
     remedy: "Raise MAX_FEE_PER_GAS, or leave it unset to track the live base fee.",
+  },
+  PRICE_TOO_HIGH: {
+    title: "The mint costs more than the configured price ceiling",
+    // Not retryable, and the contrast with GAS_TOO_HIGH directly above is the
+    // point: a base fee falls again on its own, a drop's price does not. Asking
+    // a second time buys the same NFT at the same price the operator already
+    // said was too much, so the only thing that changes this answer is a person.
+    retryable: false,
+    terminal: true,
+    remedy:
+      "Check what the drop actually costs. Raise MAX_PRICE_PER_NFT only if that " +
+      "price is one you mean to pay.",
   },
   SIMULATION_REVERT: {
     title: "The mint reverted when simulated",
