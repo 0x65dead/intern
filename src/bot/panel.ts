@@ -26,8 +26,18 @@ import { StageTable, actionableStage, formatClock, formatCoarse } from "../core/
 import { StageContext, allStageCells, stageSummaryLines } from "../core/stagetable";
 import { MintPlan } from "../core/seadrop";
 import { LoadedWallet, formatEth, weiToGwei } from "../core/wallets";
+import { WalletEligibility, eligibilityIcon, eligibilityLabel } from "../core/eligibility";
 import { shortAddress } from "../core/target";
 import { InlineButton, bold, code, esc } from "./api";
+
+export interface SelectedGatedStage {
+  uuid: string;
+  label: string;
+  startMs: number;
+  endMs: number;
+  eligibleWallets: LoadedWallet[];
+  walletTerms: { wallet: LoadedWallet; priceWei: bigint; maxMintable: number | null }[];
+}
 
 /** Everything a button can ask for. Anything else is rejected. */
 export const PANEL_ACTIONS = [
@@ -42,6 +52,8 @@ export const PANEL_ACTIONS = [
   "chain",
   "qty",
   "send",
+  "gated",
+  "gateddryrun",
   "dryrun",
   "fire",
   "refresh",
@@ -274,6 +286,10 @@ export function renderConfirm(opts: {
   stages: StageTable;
   fireMode: string;
   nowMs: number;
+  eligibility?: WalletEligibility[];
+  allowlistMinting?: boolean;
+  allWallets?: LoadedWallet[];
+  selectedGatedStage?: SelectedGatedStage;
 }): string {
   const { plan, chain, quantity, wallets } = opts;
   const perWallet = plan.value;
@@ -291,9 +307,9 @@ export function renderConfirm(opts: {
     `${esc("contract:")}   ${code(plan.nftContract)}`,
     `${esc("variant:")}    ${esc(plan.variant === "v1-singleton" ? "SeaDrop v1 singleton" : "SeaDrop v2 (config on token)")}`,
     "",
-    `${esc("price:")}      ${esc(formatEth(plan.drop.mintPrice, symbol))} ${esc(`× ${quantity}`)}`,
-    `${esc("per wallet:")} ${bold(formatEth(perWallet, symbol))}`,
-    `${esc("cap:")}        ${esc(plan.drop.maxTotalMintableByWallet > 0 ? `${plan.drop.maxTotalMintableByWallet} per wallet` : "unlimited")}`,
+    `${esc(opts.selectedGatedStage ? "public price:" : "price:")}      ${esc(formatEth(plan.drop.mintPrice, symbol))} ${esc(`× ${quantity}`)}`,
+    `${esc(opts.selectedGatedStage ? "public per wallet:" : "per wallet:")} ${bold(formatEth(perWallet, symbol))}`,
+    `${esc(opts.selectedGatedStage ? "public cap:" : "cap:")}        ${esc(plan.drop.maxTotalMintableByWallet > 0 ? `${plan.drop.maxTotalMintableByWallet} per wallet` : "unlimited")}`,
   ];
 
   if (plan.supply.maxSupply !== null && plan.supply.totalSupply !== null) {
@@ -304,20 +320,119 @@ export function renderConfirm(opts: {
 
   lines.push(
     "",
-    `${esc("stage:")}      ${esc(open ? "open now" : `opens in ${formatCoarse(startMs - opts.nowMs)}`)}`,
-    `${esc("window:")}     ${esc(`${fmtShort(startMs)} → ${plan.drop.endTime > 0 ? fmtShort(plan.drop.endTime * 1000) : "no end"}`)}`,
+    `${esc(opts.selectedGatedStage ? "public stage:" : "stage:")}      ${esc(open ? "open now" : `opens in ${formatCoarse(startMs - opts.nowMs)}`)}`,
+    `${esc(opts.selectedGatedStage ? "public window:" : "window:")}     ${esc(`${fmtShort(startMs)} → ${plan.drop.endTime > 0 ? fmtShort(plan.drop.endTime * 1000) : "no end"}`)}`,
     `${esc("fire mode:")}  ${esc(opts.fireMode)}`,
     "",
     `${esc("gas ceiling:")} ${esc(`${weiToGwei(opts.maxFeeWei).toFixed(4)} gwei`)} ${esc("(a maximum, not a payment)")}`,
     `${esc("wallets:")}    ${esc(`${wallets.length} — ${wallets.map((w) => shortAddress(w.address)).join(", ")}`)}`,
     "",
-    `${esc("mint cost:")}  ${bold(formatEth(total, symbol))}`,
-    `${esc("worst case:")} ${esc(formatEth(total + worstGas, symbol))} ${esc("if every ceiling is fully used")}`,
+    `${esc(opts.selectedGatedStage ? "public mint cost:" : "mint cost:")}  ${bold(formatEth(total, symbol))}`,
+    `${esc(opts.selectedGatedStage ? "public worst case:" : "worst case:")} ${esc(formatEth(total + worstGas, symbol))} ${esc("if every ceiling is fully used")}`,
   );
 
   const next = actionableStage(opts.stages, opts.nowMs);
-  if (next && next.status === "upcoming") {
-    lines.push("", bold(`Time until start: ${formatClock(next.countdownMs)}`));
+  if (!opts.selectedGatedStage && next && next.status === "upcoming") {
+    lines.push("", bold(`Time until public start: ${formatClock(next.countdownMs)}`));
+  }
+
+  const eligibility = opts.eligibility ?? [];
+  const matrixWallets = opts.allWallets ?? wallets;
+  const scheduledRows = opts.stages.rows.filter((row) => row.kind !== "public");
+  if (scheduledRows.length > 0) {
+    lines.push("", bold("MINT STAGE ELIGIBILITY"));
+    for (const stage of opts.stages.rows) {
+      if (stage.kind === "public") {
+        lines.push(esc(`${stage.label} — ✅ Open to all wallets`));
+        continue;
+      }
+
+      const joined = stage.stageUuid
+        ? eligibility.filter((result) => result.stageUuid === stage.stageUuid)
+        : [];
+      if (joined.length === 0) {
+        lines.push(esc(`${stage.label} — ❔ Unknown (no verifiable stage UUID or eligibility result)`));
+        continue;
+      }
+
+      for (const wallet of matrixWallets) {
+        const result = joined.find(
+          (candidate) => candidate.address.toLowerCase() === wallet.address.toLowerCase(),
+        );
+        if (!result) {
+          lines.push(
+            esc(`${stage.label} — W${wallet.index} ${shortAddress(wallet.address)} ❔ Unknown`),
+          );
+          continue;
+        }
+        const terms = [
+          result.stagePriceWei === null || result.stagePriceWei === undefined
+            ? null
+            : `price ${formatEth(result.stagePriceWei, opts.chain.nativeSymbol)}`,
+          result.stageMaxMintable === null || result.stageMaxMintable === undefined
+            ? null
+            : `limit ${result.stageMaxMintable}`,
+        ].filter((term): term is string => term !== null);
+        const unknownReason = result.state === "unknown" ? ` — ${result.detail}` : "";
+        const teamNotice =
+          stage.kind === "team" ? " · collection-wallet-only; the bot cannot mint team reserve" : "";
+        lines.push(
+          esc(
+            `${stage.label} — W${wallet.index} ${shortAddress(wallet.address)} ${eligibilityIcon(result.state)} ${eligibilityLabel(result.state, result.mechanism)}${terms.length > 0 ? ` · ${terms.join(" · ")}` : ""}${unknownReason}${teamNotice}`,
+          ),
+        );
+      }
+    }
+
+    if (opts.selectedGatedStage) {
+      const selected = opts.selectedGatedStage;
+      const opens = selected.startMs <= opts.nowMs
+        ? "open now"
+        : `opens in ${formatClock(selected.startMs - opts.nowMs)}`;
+      const selectedTotal = selected.walletTerms.reduce(
+        (sum, term) => sum + term.priceWei * BigInt(quantity),
+        0n,
+      );
+      const selectedGas = opts.gasLimit * opts.maxFeeWei * BigInt(selected.eligibleWallets.length);
+      lines.push(
+        "",
+        bold(`READY TO MINT: ${selected.label}`),
+        esc(`eligible wallets: ${selected.eligibleWallets.map((wallet) => `W${wallet.index} ${shortAddress(wallet.address)}`).join(", ")}`),
+        ...selected.walletTerms.map((term) =>
+          esc(`W${term.wallet.index} stage price: ${formatEth(term.priceWei, symbol)} × ${quantity}${term.maxMintable === null ? " · no stated cap" : ` · limit ${term.maxMintable}`}`),
+        ),
+        esc(`stage window: ${fmtShort(selected.startMs)} → ${fmtShort(selected.endMs)}`),
+        esc(`selected-stage mint cost: ${formatEth(selectedTotal, symbol)}`),
+        esc(`selected-stage worst case: ${formatEth(selectedTotal + selectedGas, symbol)} if every gas ceiling is fully used`),
+        esc(`selected-stage timing: ${opens}`),
+        esc("The public-stage figures above are reference figures only. The signed quote, allowance, price ceiling and wallet balance are rechecked before any broadcast."),
+      );
+    } else if (opts.allowlistMinting === false) {
+      lines.push(
+        "",
+        bold("GATED MINT STATUS"),
+        esc("Automatic GTD/allowlist/FCFS minting is disabled. Set ALLOWLIST_MINTING=1 to enable it."),
+      );
+    } else {
+      const reason = opts.stages.apiNotice
+        ? `OpenSea schedule unavailable: ${opts.stages.apiNotice}`
+        : scheduledRows.length === 0
+          ? "OpenSea did not return any identifiable GTD/allowlist/FCFS stages."
+          : "No loaded wallet has a verified eligible result with a known stage price and sufficient allowance.";
+      lines.push(
+        "",
+        bold("GATED MINT STATUS"),
+        esc(reason),
+        esc("The Public mint buttons below target only the public SeaDrop stage; they do not fire FCFS or GTD."),
+      );
+    }
+  } else {
+    lines.push(
+      "",
+      bold("GATED MINT STATUS"),
+      esc(opts.stages.apiNotice ?? "No GTD/allowlist/FCFS stages were returned by OpenSea."),
+      esc("Only the explicitly labelled Public mint actions below target the public SeaDrop stage."),
+    );
   }
 
   lines.push("", esc("Nothing has been signed. ✅ Send is the point of no return."));

@@ -135,6 +135,8 @@ describe("countdownFor", () => {
 describe("stageKindOf", () => {
   it("reads the kind from the type field", () => {
     assert.equal(stageKindOf("public_sale", ""), "public");
+    assert.equal(stageKindOf("public_sale", "FCFS"), "fcfs");
+    assert.equal(stageKindOf("public_sale", "GTD"), "gtd");
     assert.equal(stageKindOf("presale", ""), "allowlist");
   });
 

@@ -16,6 +16,7 @@
 // the timing module.
 
 import { JsonRpcProvider } from "ethers";
+import { resolveChain } from "./chains";
 import {
   DropSchedule,
   DropStage,
@@ -171,7 +172,14 @@ export interface StageWatchResult {
 export async function waitForScheduledStage(
   slug: string,
   apiKey: string,
-  opts: WatchOptions & { includePublic?: boolean } = {},
+  opts: WatchOptions & {
+    includePublic?: boolean;
+    /** Restrict the watcher to the exact eligible stage UUIDs. */
+    stageUuids?: readonly string[];
+    /** Refuse a schedule served for another chain or collection deployment. */
+    expectedChain?: string;
+    expectedContract?: string;
+  } = {},
 ): Promise<StageWatchResult> {
   const deadline = opts.timeoutMs ? Date.now() + opts.timeoutMs : Infinity;
   const wantPublic = opts.includePublic ?? true;
@@ -196,17 +204,45 @@ export async function waitForScheduledStage(
       throw err;
     }
 
+    if (opts.expectedChain !== undefined) {
+      const expected = resolveChain(opts.expectedChain);
+      const actual = resolveChain(schedule.chain);
+      if (!expected || !actual || expected.chainId !== actual.chainId) {
+        throw new Error(
+          `OpenSea schedule changed to chain "${schedule.chain}" while watching ${opts.expectedChain}. Nothing was sent.`,
+        );
+      }
+    }
+    if (
+      opts.expectedContract !== undefined &&
+      schedule.contractAddress.toLowerCase() !== opts.expectedContract.toLowerCase()
+    ) {
+      throw new Error(
+        `OpenSea schedule contract changed to ${schedule.contractAddress} while watching ${opts.expectedContract}. Nothing was sent.`,
+      );
+    }
+
     const now = Date.now();
-    const open = liveStage(schedule, now);
-    if (open && (wantPublic || !open.isPublic)) {
+    const candidates =
+      opts.stageUuids !== undefined
+        ? schedule.stages.filter(
+            (stage) => stage.uuid !== undefined && opts.stageUuids!.includes(stage.uuid),
+          )
+        : schedule.stages.filter((stage) => wantPublic || !stage.isPublic);
+    const open = candidates.find(
+      (stage) => stage.startMs <= now && (stage.endMs <= 0 || now < stage.endMs),
+    );
+    if (open) {
       opts.onUpdate?.({ kind: "opened", message: `${open.label} is open.`, startsAtMs: open.startMs });
       return { schedule, stage: open };
     }
 
-    const upcoming = nextStage(schedule, now);
+    const upcoming = candidates.find((stage) => stage.startMs > now);
     if (!upcoming) {
       throw new Error(
-        "No further stages in OpenSea's schedule — nothing left to wait for. Nothing was sent.",
+        opts.stageUuids !== undefined
+          ? "The selected eligible stage is no longer scheduled or has already ended. Nothing was sent."
+          : "No further stages in OpenSea's schedule — nothing left to wait for. Nothing was sent.",
       );
     }
     if (announced !== upcoming.startMs) {

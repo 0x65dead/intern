@@ -43,7 +43,10 @@ import { explorerAddress } from "../core/chains";
 import { CorrectedClock } from "../core/clock";
 import { TaskContext, TaskScheduler, phaseForEvent } from "../core/tasks";
 import { orderCandidates } from "../core/detect";
-import { resolveFireTime, runMint } from "../core/engine";
+import { EngineEvent, resolveFireTime, runMint } from "../core/engine";
+import { PreArmed, preArmAllowlist, runAllowlistMint } from "../core/allowlist";
+import { EligibilityHint } from "../core/failures";
+import { PRE_ARM_LEAD_MS } from "../core/race";
 import { BalanceReport, LoadedWallet, checkBalances, formatEth, redactKeys, requiredBalance } from "../core/wallets";
 import {
   AmbiguousChainError,
@@ -56,8 +59,9 @@ import {
 } from "../core/prepare";
 import { OpenSeaAuthManager, authManagerFrom } from "../core/openseaauth";
 import { StageContext } from "../core/stagetable";
+import type { SelectedGatedStage } from "./panel";
 import { Defaults } from "../util/env";
-import { WatchUpdate, waitForPublicStage } from "../core/watcher";
+import { WatchUpdate, waitForPublicStage, waitForScheduledStage } from "../core/watcher";
 import { formatLocal, parseTimeInput } from "../core/timing";
 import { parseTarget, shortAddress } from "../core/target";
 import {
@@ -161,6 +165,8 @@ interface Draft {
   target?: string;
   chainKey?: string;
   quantity?: number;
+  /** UUID of the exact eligible OpenSea stage selected on the confirm panel. */
+  gatedStageUuid?: string;
   run?: PreparedRun;
   balances?: BalanceReport[];
   /** Candidate chains from an ambiguous detection, awaiting a pick. */
@@ -626,6 +632,97 @@ export class SessionManager {
     });
   }
 
+  /**
+   * Wallets that OpenSea explicitly marked eligible for this exact scheduled
+   * stage, and whose stated stage allowance covers the requested quantity.
+   * Unknown, missing, foreign-token and ineligible rows never enter this set.
+   */
+  private eligibleWalletsForStage(
+    run: PreparedRun,
+    stageUuid: string,
+    quantity: number,
+  ): LoadedWallet[] {
+    const stageResults = run.eligibility.results.filter(
+      (result) =>
+        result.mechanism === "opensea-signed" &&
+        result.stageUuid === stageUuid &&
+        result.state === "eligible",
+    );
+
+    return this.opts.wallets.filter((wallet) => {
+      const result = stageResults.find(
+        (candidate) => candidate.address.toLowerCase() === wallet.address.toLowerCase(),
+      );
+      return (
+        result !== undefined &&
+        result.stagePriceWei !== null &&
+        result.stagePriceWei !== undefined &&
+        (result.stageMaxMintable === null ||
+          result.stageMaxMintable === undefined ||
+          quantity <= result.stageMaxMintable)
+      );
+    });
+  }
+
+  /**
+   * Select the next actionable OpenSea-signed stage for which at least one loaded
+   * wallet has an explicit positive eligibility answer. Live stages win over
+   * future ones; overlapping live stages prefer the one that opened most recently.
+   * Team/reserve and unknown mechanisms are intentionally not auto-minted.
+   */
+  private nextEligibleGatedStage(
+    run: PreparedRun,
+    quantity: number,
+  ): SelectedGatedStage | null {
+    const candidates = run.stages.rows
+      .filter(
+        (stage) =>
+          stage.stageUuid !== undefined &&
+          ["gtd", "allowlist", "fcfs"].includes(stage.kind) &&
+          stage.status !== "ended",
+      )
+      .map((stage) => ({
+        uuid: stage.stageUuid!,
+        label: stage.label,
+        startMs: stage.startMs,
+        endMs: stage.endMs,
+        status: stage.status,
+        eligibleWallets: this.eligibleWalletsForStage(run, stage.stageUuid!, quantity),
+      }))
+      .map((stage) => ({
+        ...stage,
+        walletTerms: stage.eligibleWallets.flatMap((wallet) => {
+          const result = run.eligibility.results.find(
+            (candidate) =>
+              candidate.mechanism === "opensea-signed" &&
+              candidate.stageUuid === stage.uuid &&
+              candidate.address.toLowerCase() === wallet.address.toLowerCase() &&
+              candidate.state === "eligible",
+          );
+          if (!result || result.stagePriceWei === null || result.stagePriceWei === undefined) return [];
+          return [{
+            wallet,
+            priceWei: result.stagePriceWei,
+            maxMintable: result.stageMaxMintable ?? null,
+          }];
+        }),
+      }))
+      .filter((stage) =>
+        stage.eligibleWallets.length > 0 &&
+        stage.walletTerms.length === stage.eligibleWallets.length,
+      );
+
+    const live = candidates
+      .filter((stage) => stage.status === "live")
+      .sort((a, b) => b.startMs - a.startMs);
+    if (live[0]) return live[0];
+
+    const upcoming = candidates
+      .filter((stage) => stage.status === "upcoming")
+      .sort((a, b) => a.startMs - b.startMs);
+    return upcoming[0] ?? null;
+  }
+
   /** Whether any mint run is live. For the heartbeat. */
   isRunning(): boolean {
     return this.scheduler.listActive().length > 0;
@@ -1027,6 +1124,28 @@ export class SessionManager {
       case "send":
         this.launch(session, "stage");
         return;
+      case "gated":
+        if (!session.draft.gatedStageUuid) {
+          await this.ackCallback(session, queryId, "No verified eligible gated stage is selected. Refresh the stage check.", true);
+          return;
+        }
+        if (value !== session.draft.gatedStageUuid) {
+          await this.ackCallback(session, queryId, "That stage button is stale. Refresh the confirmation and choose again.", true);
+          return;
+        }
+        this.launch(session, "stage", false, session.draft.gatedStageUuid);
+        return;
+      case "gateddryrun":
+        if (!session.draft.gatedStageUuid) {
+          await this.ackCallback(session, queryId, "No verified eligible gated stage is selected. Refresh the stage check.", true);
+          return;
+        }
+        if (value !== session.draft.gatedStageUuid) {
+          await this.ackCallback(session, queryId, "That stage button is stale. Refresh the confirmation and choose again.", true);
+          return;
+        }
+        this.launch(session, "stage", true, session.draft.gatedStageUuid);
+        return;
       case "dryrun":
         this.launch(session, "stage", true);
         return;
@@ -1239,6 +1358,23 @@ export class SessionManager {
     } catch {
       return [];
     }
+  }
+
+  /** Check each eligible wallet against its own OpenSea stage price plus gas. */
+  private async readBalancesForGatedStage(
+    run: PreparedRun,
+    stage: SelectedGatedStage,
+    quantity: number,
+  ): Promise<BalanceReport[]> {
+    const reports = await Promise.all(
+      stage.walletTerms.map(async (term) => {
+        const required = requiredBalance(term.priceWei * BigInt(quantity), run.gas);
+        const [report] = await checkBalances(run.rpc.provider, [term.wallet], required);
+        if (!report) throw new Error("Balance check returned no result for a selected wallet.");
+        return report;
+      }),
+    );
+    return reports;
   }
 
   private balanceLines(reports: BalanceReport[], symbol: string): string[] {
@@ -1528,24 +1664,39 @@ export class SessionManager {
     this.armExpiry(session);
 
     const quantity = session.draft.quantity ?? this.opts.defaults.quantity;
-    const balances = await this.readBalances(run);
+    const selectedGatedStage =
+      this.opts.defaults.allowlistMinting && this.opts.defaults.openseaApiKey
+        ? this.nextEligibleGatedStage(run, quantity)
+        : null;
+    // The public SeaDrop price is not the selected gated-stage quote. Do not
+    // print a misleading public-price underfunding warning on an FCFS preflight;
+    // the signed-stage engine checks the actual quote and balance before send.
+    const balances = selectedGatedStage
+      ? await this.readBalancesForGatedStage(run, selectedGatedStage, quantity)
+      : await this.readBalances(run);
     session.draft.balances = balances;
 
     const fireMode = this.opts.defaults.leadMs > 0
       ? `at the stage opening, −${this.opts.defaults.leadMs}ms lead`
       : "at the stage opening (T-0)";
+    if (selectedGatedStage) session.draft.gatedStageUuid = selectedGatedStage.uuid;
+    else delete session.draft.gatedStageUuid;
 
     const body = renderConfirm({
       plan: run.plan,
       chain: run.chain,
       collectionName: run.collection?.name,
       quantity,
-      wallets: this.opts.wallets,
+      wallets: selectedGatedStage?.eligibleWallets ?? this.opts.wallets,
+      allWallets: this.opts.wallets,
       maxFeeWei: run.gas.maxFeePerGas,
       gasLimit: run.gas.gasLimit,
       stages: run.stages,
       fireMode,
       nowMs: this.now(),
+      eligibility: run.eligibility.results,
+      allowlistMinting: this.opts.defaults.allowlistMinting,
+      selectedGatedStage,
     });
 
     const blocks = [body];
@@ -1566,15 +1717,30 @@ export class SessionManager {
     const open = this.now() >= startMs;
     const buttons: InlineButton[][] = [
       [
-        { text: open ? "✅ Send now" : "✅ Send", callback_data: encodeCallback("send") },
+        {
+          text: open ? "✅ Public mint now" : "✅ Public mint",
+          callback_data: encodeCallback("send"),
+        },
         { text: "❌ Cancel", callback_data: encodeCallback("cancel") },
       ],
     ];
     buttons.push([dryRunButton()]);
+    if (selectedGatedStage) {
+      buttons.push([
+        {
+          text: `⚡ Arm ${selectedGatedStage.label}`,
+          callback_data: encodeCallback("gated", selectedGatedStage.uuid),
+        },
+        {
+          text: `🧪 Dry run ${selectedGatedStage.label}`,
+          callback_data: encodeCallback("gateddryrun", selectedGatedStage.uuid),
+        },
+      ]);
+    }
     if (!open) {
       buttons.push([
-        { text: "⚡ Fire now anyway", callback_data: encodeCallback("fire", "now") },
-        { text: "🕐 At a time…", callback_data: encodeCallback("fire", "custom") },
+        { text: "⚡ Public now anyway", callback_data: encodeCallback("fire", "now") },
+        { text: "🕐 Public at a time…", callback_data: encodeCallback("fire", "custom") },
       ]);
     }
 
@@ -1596,6 +1762,7 @@ export class SessionManager {
     session: Session,
     mode: "stage" | "now" | { atMs: number },
     dryRun = false,
+    gatedStageUuid?: string,
   ): void {
     // Nothing prepared means nothing to lock. Checked before submitting rather
     // than inside the task, because a task that exists only to report "nothing is
@@ -1610,12 +1777,54 @@ export class SessionManager {
       return;
     }
 
-    // The wallets this run will sign with. Every loaded wallet today, which is
-    // why replacing the global flag with per-wallet locks changes no behaviour
-    // yet: identical sets contend on every wallet, so a second run is refused
-    // exactly as before. It becomes a real concurrency gain the moment a run can
-    // hold a narrower set, and needs no further change to the lock when it does.
-    const wallets = this.opts.wallets;
+    const quantity = session.draft.quantity ?? this.opts.defaults.quantity;
+    if (gatedStageUuid && !this.opts.defaults.allowlistMinting) {
+      void this.paint(
+        session,
+        `${bold("Gated minting is disabled")}\n${esc("Set ALLOWLIST_MINTING=1 in the bot's .env, restart it, then prepare the mint again. Nothing was sent.")}`,
+        BACK_ONLY,
+      ).catch(() => {});
+      return;
+    }
+    if (gatedStageUuid && !this.opts.defaults.openseaApiKey) {
+      void this.paint(
+        session,
+        `${bold("OpenSea API key required")}\n${esc("Set OPENSEA_API_KEY before attempting an OpenSea-signed FCFS/GTD mint. Nothing was sent.")}`,
+        BACK_ONLY,
+      ).catch(() => {});
+      return;
+    }
+
+    // Gated runs lock only wallets whose explicit eligibility result matches this
+    // exact stage UUID and requested quantity. Public runs keep their existing
+    // all-wallet behaviour.
+    const wallets = gatedStageUuid
+      ? this.eligibleWalletsForStage(prepared, gatedStageUuid, quantity)
+      : this.opts.wallets;
+    if (gatedStageUuid && !dryRun) {
+      const underfunded = (session.draft.balances ?? []).filter((report) => !report.sufficient);
+      if (underfunded.length > 0) {
+        void this.paint(
+          session,
+          [
+            bold("Gated mint not armed"),
+            "",
+            esc("The selected FCFS/GTD wallet balance is below the stage price plus the full gas ceiling. Fund the wallet and prepare again. Nothing was signed or sent."),
+            ...underfunded.map((report) => esc(`W${report.index} ${shortAddress(report.address)} short ${formatEth(report.shortfall, prepared.chain.nativeSymbol)}`)),
+          ].join("\n"),
+          BACK_ONLY,
+        ).catch(() => {});
+        return;
+      }
+    }
+    if (wallets.length === 0) {
+      void this.paint(
+        session,
+        `${bold("No eligible wallets")}\n${esc("No loaded wallet has a verified positive eligibility result and sufficient stage allowance for this stage. Refresh Check before trying again. Nothing was sent.")}`,
+        BACK_ONLY,
+      ).catch(() => {});
+      return;
+    }
     const indexes = wallets.map((wallet) => wallet.index);
 
     // Asked and claimed in one tick. `submit` locks synchronously — submit, pump,
@@ -1642,7 +1851,7 @@ export class SessionManager {
       chain: prepared.chain.key,
       walletIndexes: indexes,
       run: async (ctx) => {
-        await this.fire(session, mode, dryRun, task.controller, ctx);
+        await this.fire(session, mode, dryRun, wallets, gatedStageUuid, quantity, task.controller, ctx);
       },
     });
     this.taskChat.set(task.id, session.chatId);
@@ -1739,6 +1948,9 @@ export class SessionManager {
     session: Session,
     mode: "stage" | "now" | { atMs: number },
     dryRun: boolean,
+    wallets: LoadedWallet[],
+    gatedStageUuid: string | undefined,
+    quantity: number,
     controller: AbortController,
     ctx: TaskContext,
   ): Promise<void> {
@@ -1763,18 +1975,28 @@ export class SessionManager {
     session.view = "running";
     this.clearExpiry(session);
 
-    const { fireAtMs } = resolveFireTime(run.plan, mode, this.opts.defaults.leadMs);
-    // A null fire time means "as soon as everything is signed" — there is no
-    // instant to print, and printing the current time would imply a schedule
-    // that does not exist.
-    const when = fireAtMs === null ? "immediately" : formatLocal(fireAtMs);
+    // OpenSea-signed stages have their own UUID and schedule window. Their
+    // watcher decides when to request the signature; the public SeaDrop start
+    // time must never be substituted for an FCFS/GTD start time.
+    const fireAtMs =
+      gatedStageUuid === undefined
+        ? resolveFireTime(run.plan, mode, this.opts.defaults.leadMs).fireAtMs
+        : null;
+    const gatedLabel = gatedStageUuid
+      ? run.stages.rows.find((row) => row.stageUuid === gatedStageUuid)?.label ?? "gated stage"
+      : null;
+    const when = gatedStageUuid
+      ? `waiting for ${gatedLabel} (OpenSea schedule)`
+      : fireAtMs === null
+        ? "immediately"
+        : formatLocal(fireAtMs);
     await this.paint(
       session,
       [
         bold(dryRun ? "Dry run" : "Running"),
         "",
         esc(`${run.chain.name} · ${shortAddress(run.contract)}`),
-        esc(`${this.opts.wallets.length} wallet(s) · ${when}`),
+        esc(`${wallets.length} wallet(s) · ${when}`),
         "",
         esc(
           dryRun
@@ -1808,27 +2030,38 @@ export class SessionManager {
     };
 
     try {
-      const result = await runMint(
-        {
-          chain: run.chain,
-          plan: run.plan,
-          wallets: this.opts.wallets,
-          readUrls: run.rpc.plan.read,
-          blastUrls: run.rpc.plan.blast,
-          gas: run.gas,
-          fireAtMs,
-          leadMs: this.opts.defaults.leadMs,
-          receiptTimeoutMs: this.opts.defaults.receiptTimeoutMs,
-          maxPricePerNftWei: this.opts.defaults.maxPricePerNftWei,
-          dryRun,
-          // Enforced here, unlike in the CLI. Nobody is watching a bot run, so
-          // there is no one to read a clock warning and decide it is acceptable.
-          driftLimitMs: this.opts.defaults.clockDriftLimitMs ?? DEFAULT_BOT_DRIFT_LIMIT_MS,
-          target: run.contract,
-          signal: controller.signal,
-        },
-        report,
-      );
+      const result =
+        gatedStageUuid !== undefined
+          ? await this.fireGatedMint(
+              run,
+              gatedStageUuid,
+              wallets,
+              quantity,
+              dryRun,
+              controller.signal,
+              report,
+            )
+          : await runMint(
+              {
+                chain: run.chain,
+                plan: run.plan,
+                wallets,
+                readUrls: run.rpc.plan.read,
+                blastUrls: run.rpc.plan.blast,
+                gas: run.gas,
+                fireAtMs,
+                leadMs: this.opts.defaults.leadMs,
+                receiptTimeoutMs: this.opts.defaults.receiptTimeoutMs,
+                maxPricePerNftWei: this.opts.defaults.maxPricePerNftWei,
+                dryRun,
+                // Enforced here, unlike in the CLI. Nobody is watching a bot run, so
+                // there is no one to read a clock warning and decide it is acceptable.
+                driftLimitMs: this.opts.defaults.clockDriftLimitMs ?? DEFAULT_BOT_DRIFT_LIMIT_MS,
+                target: run.contract,
+                signal: controller.signal,
+              },
+              report,
+            );
       const landed = await reporter.settle();
 
       // The dry-run report is the entire output, and the reporter has already
@@ -1883,6 +2116,201 @@ export class SessionManager {
       // closing summary is a separate message, so it is not lost either way.
       if (teardown.showMenu) await this.showMenu(session);
     }
+  }
+
+  /**
+   * Execute one OpenSea-signed GTD/FCFS stage after rechecking the exact
+   * wallet-stage pair. The stage UUID is carried through the watcher so a
+   * different stage opening first cannot redirect this run.
+   */
+  private async fireGatedMint(
+    run: PreparedRun,
+    stageUuid: string,
+    wallets: LoadedWallet[],
+    quantity: number,
+    dryRun: boolean,
+    signal: AbortSignal,
+    emit: (event: EngineEvent) => void,
+  ) {
+    const slug = run.slug;
+    const apiKey = this.opts.defaults.openseaApiKey;
+    if (!slug) {
+      throw new Error(
+        "An OpenSea-signed mint needs the collection slug. Prepare it using the OpenSea collection URL or slug, not only a contract address.",
+      );
+    }
+    if (!apiKey) {
+      throw new Error("OPENSEA_API_KEY is required for an OpenSea-signed GTD/FCFS mint.");
+    }
+    if (!this.opts.defaults.allowlistMinting) {
+      throw new Error("ALLOWLIST_MINTING is disabled. Nothing was signed or sent.");
+    }
+
+    emit({ type: "phase", name: "prepare", detail: `refreshing eligibility for ${wallets.length} wallet(s)` });
+    const fresh = await refreshRun(run, {
+      quantity,
+      openseaAuth: this.auth(),
+      walletAddresses: this.opts.wallets.map((wallet) => wallet.address),
+      apiKey,
+      maxFeeGwei: this.opts.defaults.maxFeeGwei,
+      priorityGwei: this.opts.defaults.priorityGwei,
+      gasLimit: this.opts.defaults.gasLimit,
+      nowMs: this.now(),
+    });
+
+    const scheduled = fresh.stages.rows.find((stage) => stage.stageUuid === stageUuid);
+    if (
+      !scheduled ||
+      scheduled.status === "ended" ||
+      !["gtd", "allowlist", "fcfs"].includes(scheduled.kind)
+    ) {
+      throw new Error("The selected stage is no longer a supported live GTD/allowlist/FCFS stage. Refresh the drop before trying again.");
+    }
+
+    // The preflight answer can age while the operator reads the confirmation.
+    // Re-check every wallet and refuse the whole selected set if any verdict has
+    // changed or become unknown; never turn a stale green tick into a signature.
+    const eligibility = new Map<string, EligibilityHint>();
+    const verifySelectedWallets = (source: PreparedRun): LoadedWallet[] => {
+      const confirmed = this.eligibleWalletsForStage(source, stageUuid, quantity);
+      const confirmedSet = new Set(confirmed.map((wallet) => wallet.address.toLowerCase()));
+      const changed = wallets.filter((wallet) => !confirmedSet.has(wallet.address.toLowerCase()));
+      if (changed.length > 0) {
+        throw new Error(
+          `Eligibility changed for ${changed.map((wallet) => `W${wallet.index} ${shortAddress(wallet.address)}`).join(", ")}. Refresh the panel and confirm again. Nothing was sent.`,
+        );
+      }
+      if (confirmed.length === 0) {
+        throw new Error("No selected wallet remains explicitly eligible for this stage. Nothing was sent.");
+      }
+
+      eligibility.clear();
+      for (const wallet of confirmed) {
+        const row = source.eligibility.results.find(
+          (candidate) =>
+            candidate.mechanism === "opensea-signed" &&
+            candidate.stageUuid === stageUuid &&
+            candidate.address.toLowerCase() === wallet.address.toLowerCase() &&
+            candidate.state === "eligible",
+        );
+        if (!row || row.stagePriceWei === null || row.stagePriceWei === undefined) {
+          throw new Error(`Eligibility result or exact stage price disappeared for W${wallet.index}. Refresh the drop; nothing was sent.`);
+        }
+        eligibility.set(wallet.address.toLowerCase(), {
+          isEligible: true,
+          maxMintable: row.stageMaxMintable ?? null,
+          pricePerTokenWei: row.stagePriceWei,
+        });
+      }
+      return confirmed;
+    };
+
+    const stillEligible = verifySelectedWallets(fresh);
+    let latestGas = fresh.gas;
+    let prearmed: PreArmed | null = null;
+    emit({
+      type: "phase",
+      name: "wait",
+      detail: `waiting for ${scheduled.label} by its OpenSea stage id`,
+    });
+
+    const opened = await waitForScheduledStage(slug, apiKey, {
+      signal,
+      includePublic: false,
+      stageUuids: [stageUuid],
+      expectedChain: fresh.chain.key,
+      expectedContract: fresh.contract,
+      preArmLeadMs: PRE_ARM_LEAD_MS,
+      onPreArm: async (stage) => {
+        if (stage.uuid !== stageUuid) {
+          throw new Error("The watcher tried to pre-arm a different stage. Nothing was sent.");
+        }
+        // A user may arm hours before FCFS. Re-query eligibility at the lead
+        // boundary while nonce and socket preparation runs concurrently, so a
+        // stale preflight tick cannot become the eligibility hint used at T-0.
+        const [latest, armed] = await Promise.all([
+          refreshRun(run, {
+            quantity,
+            openseaAuth: this.auth(),
+            walletAddresses: this.opts.wallets.map((wallet) => wallet.address),
+            apiKey,
+            maxFeeGwei: this.opts.defaults.maxFeeGwei,
+            priorityGwei: this.opts.defaults.priorityGwei,
+            gasLimit: this.opts.defaults.gasLimit,
+            nowMs: this.now(),
+          }),
+          preArmAllowlist({
+            provider: fresh.rpc.provider,
+            wallets: stillEligible,
+            readUrls: fresh.rpc.plan.read,
+            blastUrls: fresh.rpc.plan.blast,
+            blockTimeSec: fresh.chain.blockTimeSec,
+            signal,
+          }),
+        ]);
+        const latestStage = latest.stages.rows.find((row) => row.stageUuid === stageUuid);
+        if (
+          !latestStage ||
+          latestStage.status === "ended" ||
+          !["gtd", "allowlist", "fcfs"].includes(latestStage.kind)
+        ) {
+          throw new Error("The selected stage ended, disappeared, or changed to an unsupported stage type before its lead window. Nothing was sent.");
+        }
+        verifySelectedWallets(latest);
+        latestGas = latest.gas;
+        prearmed = armed;
+        emit({
+          type: "warning",
+          message: `Pre-armed ${stillEligible.length} wallet(s) for ${stage.label}: nonces, connections and clock are ready; wallet eligibility was rechecked.`,
+        });
+      },
+      onUpdate: (update) => {
+        if (update.kind !== "waiting") {
+          emit({ type: "warning", message: update.message });
+        }
+      },
+    });
+
+    if (opened.stage.uuid !== stageUuid) {
+      throw new Error("The schedule watcher returned a different stage than the one confirmed. Nothing was sent.");
+    }
+
+    // If the stage was already open when the user confirmed, there was no lead
+    // window. Do the same preparation now, while being explicit that it is inside
+    // the race rather than claiming it happened in advance.
+    const ready =
+      prearmed ??
+      (await preArmAllowlist({
+        provider: fresh.rpc.provider,
+        wallets: stillEligible,
+        readUrls: fresh.rpc.plan.read,
+        blastUrls: fresh.rpc.plan.blast,
+        blockTimeSec: fresh.chain.blockTimeSec,
+        signal,
+      }));
+
+    return runAllowlistMint(
+      {
+        chain: fresh.chain,
+        slug,
+        contract: fresh.contract,
+        apiKey,
+        quantity,
+        wallets: ready.wallets,
+        readUrls: fresh.rpc.plan.read,
+        blastUrls: fresh.rpc.plan.blast,
+        gas: latestGas,
+        prearmed: ready,
+        eligibility,
+        maxPricePerNftWei: this.opts.defaults.maxPricePerNftWei,
+        receiptTimeoutMs: this.opts.defaults.receiptTimeoutMs,
+        signal,
+        dryRun,
+        driftLimitMs:
+          this.opts.defaults.clockDriftLimitMs ?? DEFAULT_BOT_DRIFT_LIMIT_MS,
+      },
+      emit,
+    );
   }
 
   // ── watch ──────────────────────────────────────────────────────────────────

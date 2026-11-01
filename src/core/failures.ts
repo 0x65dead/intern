@@ -306,6 +306,8 @@ export interface EligibilityHint {
   readonly isEligible: boolean;
   /** null when OpenSea stated no limit. */
   readonly maxMintable: number | null;
+  /** Per-token wei quote from the wallet-scoped eligibility endpoint, when stated. */
+  readonly pricePerTokenWei?: bigint | null;
   readonly mintedSoFar?: number | null;
 }
 

@@ -41,7 +41,7 @@ import { EligibilityHint, Failure, classifyOpenSeaFailure, localFailure } from "
 
 /** One stage's terms for one wallet, normalised. */
 export interface WalletStageEligibility {
-  /** Checksummed where the source gave an address; "" when the JWT implied it. */
+  /** Address named by the caller or response; empty only when the JWT is the sole identity evidence. */
   readonly wallet: string;
   readonly dropSlug: string;
   /** OpenSea's stage identifier. The join key. Never empty. */
@@ -199,6 +199,11 @@ export function parseEligibilityResponse(
     expected !== "" && stated !== "" && stated.toLowerCase() !== expected.toLowerCase()
       ? stated
       : null;
+  // The endpoint may name its minter even when the caller did not supply an
+  // expected address (the bot holds one wallet-scoped token, not one token per
+  // loaded key). Preserve that identity so hintForStage can reject a token for
+  // another wallet instead of assuming it belongs to the only loaded wallet.
+  const subject = expected !== "" ? expected : stated;
 
   const byUuid = new Map<string, DropStage>();
   for (const stage of ctx.stages ?? []) {
@@ -236,7 +241,7 @@ export function parseEligibilityResponse(
         : "unknown";
 
     stages.push({
-      wallet: expected,
+      wallet: subject,
       dropSlug: ctx.dropSlug,
       stageUuid: uuid,
       stageType,
@@ -261,7 +266,7 @@ export function parseEligibilityResponse(
 
   return {
     dropSlug: ctx.dropSlug,
-    wallet: expected,
+    wallet: subject,
     checkedAt: ctx.nowMs,
     stages,
     unmatchedUuids,
@@ -589,6 +594,10 @@ export function hintForStage(
     kind: "recorded",
     wallet: subject,
     row,
-    hint: { isEligible: row.isEligible, maxMintable: row.maxMintable },
+    hint: {
+      isEligible: row.isEligible,
+      maxMintable: row.maxMintable,
+      pricePerTokenWei: row.price,
+    },
   };
 }

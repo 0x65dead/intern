@@ -18,6 +18,7 @@
 
 import { Interface, ZeroAddress, getAddress } from "ethers";
 import { resolveChain } from "./chains";
+import { stageKindOf } from "./stagekind";
 import { SEADROP_V1 } from "./seadrop";
 import { redactKeys } from "./wallets";
 
@@ -290,9 +291,14 @@ export async function resolveCollection(
   // silently target the wrong network.
   const wanted = preferredChain?.trim().toLowerCase();
   const picked = wanted
-    ? contracts.find((c) => c.chain?.toLowerCase() === wanted) ?? contracts[0]
+    ? contracts.find((c) => c.chain?.toLowerCase() === wanted)
     : contracts[0];
 
+  if (!picked && wanted) {
+    throw new Error(
+      `OpenSea does not list collection "${slug}" on selected chain "${wanted}". Choose a listed chain explicitly; no fallback contract was selected.`,
+    );
+  }
   if (!picked) {
     throw new Error(`cannot resolve target to a contract address: ${slug}`);
   }
@@ -436,6 +442,8 @@ export async function fetchDropSchedule(slug: string, apiKey: string): Promise<D
       throw new Error(`Stage ${i + 1} has an invalid time range.`);
     }
     const type = stage.stage_type ?? "unknown";
+    const label = stage.label || type;
+    const kind = stageKindOf(type, label);
     const uuid = firstNonEmpty(stage.uuid, stage.stage_uuid);
     const currency = typeof stage.price_currency_address === "string"
       ? stage.price_currency_address.trim().toLowerCase()
@@ -445,10 +453,11 @@ export async function fetchDropSchedule(slug: string, apiKey: string): Promise<D
     const cap = parseCount(stage.max_per_wallet);
     return {
       type,
-      label: stage.label || type,
+      label,
       startMs,
       endMs,
-      isPublic: type === "public_sale",
+      // FCFS/GTD labels override a broad "public_sale" API type.
+      isPublic: kind === "public",
       ...(uuid !== "" ? { uuid } : {}),
       ...(priceWei !== null ? { priceWei } : {}),
       ...(!native ? { priceCurrency: currency } : {}),

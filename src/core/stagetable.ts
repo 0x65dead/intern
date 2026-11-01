@@ -75,6 +75,8 @@ export interface StageContext {
   evidence?: MechanismEvidence;
   /** Per-mechanism eligibility summary, already computed — see summariseEligibility. */
   eligibility?: Partial<Record<MintMechanism, string>>;
+  /** OpenSea's wallet verdicts, keyed by the exact stage UUID. */
+  eligibilityByStageUuid?: Record<string, string>;
   /**
    * Mechanisms whose eligibility check could not run at all.
    *
@@ -105,6 +107,18 @@ function eligibilityCell(row: StageRow, ctx: StageContext): string {
   const fire = ctx.fire ?? PUBLIC_ONLY;
   const mechanism = mechanismFor(row.kind, evidence);
   const known = ctx.eligibility?.[mechanism];
+  const stageKnown =
+    row.stageUuid !== undefined ? ctx.eligibilityByStageUuid?.[row.stageUuid] : undefined;
+
+  // Wallet eligibility and whether this bot is configured to fire that
+  // mechanism are separate facts. Show the wallet's answer even when firing is
+  // disabled, then state the capability restriction beside it.
+  if (stageKnown !== undefined) {
+    if (!isFireable(mechanism, fire)) {
+      return `${stageKnown}; not fireable: ${firstSentence(notFireableReason(mechanism, fire))}`;
+    }
+    return stageKnown;
+  }
 
   if (!isFireable(mechanism, fire)) {
     // A stated cause beats a derived one. Both are true; only one tells the

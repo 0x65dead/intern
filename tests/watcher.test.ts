@@ -65,7 +65,7 @@ describe("pollInterval", () => {
 const OPEN_STAGE = "0x1111111111111111111111111111111111111111";
 
 /** A raw OpenSea drop payload with stages at the given absolute times. */
-function dropBody(stages: { startMs: number; endMs: number; label?: string }[]): unknown {
+function dropBody(stages: { startMs: number; endMs: number; label?: string; uuid?: string }[]): unknown {
   return {
     chain: "base",
     contract_address: OPEN_STAGE,
@@ -74,6 +74,7 @@ function dropBody(stages: { startMs: number; endMs: number; label?: string }[]):
       end_time: new Date(s.endMs).toISOString(),
       stage_type: "presale",
       label: s.label ?? "Allowlist",
+      ...(s.uuid ? { uuid: s.uuid } : {}),
     })),
   };
 }
@@ -90,6 +91,49 @@ function stubDrops(bodies: unknown[]): { calls: number } {
   }) as typeof globalThis.fetch;
   return state;
 }
+
+describe("waitForScheduledStage exact stage selection", () => {
+  it("waits for the requested FCFS UUID instead of the earlier live GTD stage", async () => {
+    const now = Date.now();
+    stubDrops([
+      dropBody([
+        { startMs: now - 30_000, endMs: now + 3_600_000, label: "GTD", uuid: "gtd-uuid" },
+        { startMs: now - 1_000, endMs: now + 3_600_000, label: "FCFS", uuid: "fcfs-uuid" },
+      ]),
+    ]);
+
+    const result = await waitForScheduledStage("muse-brokers", "k", {
+      includePublic: false,
+      stageUuids: ["fcfs-uuid"],
+    });
+
+    assert.equal(result.stage.uuid, "fcfs-uuid");
+    assert.equal(result.stage.label, "FCFS");
+  });
+
+  it("refuses a schedule on a chain other than the prepared chain", async () => {
+    stubDrops([dropBody([{ startMs: Date.now() - 1_000, endMs: Date.now() + 3_600_000, label: "FCFS", uuid: "fcfs" }])]);
+    await assert.rejects(
+      waitForScheduledStage("muse-brokers", "k", {
+        stageUuids: ["fcfs"],
+        expectedChain: "robinhood",
+      }),
+      /schedule changed to chain "base"/i,
+    );
+  });
+
+  it("refuses a schedule for another collection contract", async () => {
+    stubDrops([dropBody([{ startMs: Date.now() - 1_000, endMs: Date.now() + 3_600_000, label: "FCFS", uuid: "fcfs" }])]);
+    await assert.rejects(
+      waitForScheduledStage("muse-brokers", "k", {
+        stageUuids: ["fcfs"],
+        expectedChain: "base",
+        expectedContract: "0x2222222222222222222222222222222222222222",
+      }),
+      /schedule contract changed/i,
+    );
+  });
+});
 
 describe("waitForScheduledStage pre-arm lead", () => {
   const HOUR = 3_600_000;

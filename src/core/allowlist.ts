@@ -29,7 +29,7 @@
 import { JsonRpcProvider, Wallet } from "ethers";
 import { ChainProfile } from "./chains";
 import { EngineEvent, EngineResult } from "./engine";
-import { ClockSync, syncClock } from "./clock";
+import { ClockSync, driftGuard, syncClock } from "./clock";
 import {
   Endpoint,
   blast,
@@ -52,6 +52,7 @@ import {
 import { OpenSeaError, VerifiedMintTx, requestMintTx, verifyAllowlistTx } from "./opensea";
 import { EligibilityHint, FailureCode, localFailure } from "./failures";
 import { planNextPoll } from "./race";
+import { DryRunReport } from "./dryrun";
 
 export interface AllowlistOptions {
   chain: ChainProfile;
@@ -101,6 +102,10 @@ export interface AllowlistOptions {
   prearmed?: PreArmed | null;
   receiptTimeoutMs?: number;
   signal?: AbortSignal;
+  /** Do every signature, funding and verification check, then stop before broadcast. */
+  dryRun?: boolean;
+  /** Refuse to fire when clock uncertainty exceeds this bound. */
+  driftLimitMs?: number;
 }
 
 interface BuiltTx {
@@ -176,6 +181,17 @@ async function buildForWallet(
       // because the mintPrice it compared against was decoded from that same
       // response. Not retried — see `giveUp` below, and PRICE_TOO_HIGH's entry
       // in FAILURE_META: asking again returns the same price.
+      const eligibility = opts.eligibility?.get(wallet.address.toLowerCase()) ?? null;
+      if (
+        eligibility?.pricePerTokenWei !== undefined &&
+        eligibility.pricePerTokenWei !== null &&
+        verified.mintPrice !== eligibility.pricePerTokenWei
+      ) {
+        return giveUp(
+          `[W${wallet.index}] OpenSea's signed price ${formatEth(verified.mintPrice, opts.chain.nativeSymbol)} does not match the wallet eligibility quote ${formatEth(eligibility.pricePerTokenWei, opts.chain.nativeSymbol)}. Refusing to sign.`,
+        );
+      }
+
       const overCeiling = priceCeilingRefusal({
         value: verified.value,
         quantity: opts.quantity,
@@ -261,16 +277,62 @@ export async function runAllowlistMint(
       clockSync = measured;
     }
     emit({ type: "clock", sync: clockSync });
+    const drift = driftGuard(clockSync, opts.driftLimitMs ?? Number.POSITIVE_INFINITY);
+    if (!drift.ok) {
+      emit({ type: "warning", message: drift.detail });
+      if (opts.driftLimitMs !== undefined) {
+        throw new Error(`Refusing to request or broadcast an allowlist mint: ${drift.detail}`);
+      }
+    }
 
     emit({ type: "phase", name: "sign", detail: "requesting signatures from OpenSea" });
     const started = performance.now();
+    const buildFailures = new Map<number, string>();
+    const captureBuildEvent = (event: EngineEvent): void => {
+      if (event.type === "simulation" && !event.ok) {
+        buildFailures.set(event.index, event.error ?? "OpenSea did not provide a verified mint signature.");
+      }
+      emit(event);
+    };
     const built = (
       await Promise.all(
-        wallets.map((wallet: NoncedWallet) => buildForWallet(opts, wallet, emit)),
+        wallets.map((wallet: NoncedWallet) => buildForWallet(opts, wallet, captureBuildEvent)),
       )
     ).filter((b): b is BuiltTx => b !== null);
 
     if (built.length === 0) {
+      if (opts.dryRun) {
+        const report: DryRunReport = {
+          target: opts.slug,
+          chainName: chain.name,
+          chainId: chain.chainId,
+          nativeSymbol: chain.nativeSymbol,
+          to: opts.contract,
+          calldataBytes: 0,
+          valuePerWallet: 0n,
+          gas,
+          fireAtMs: null,
+          nowMs: Date.now(),
+          drift,
+          wallets: [],
+          endpoints: endpoints.map((endpoint) => endpoint.label),
+          skipped: wallets.map((wallet) => ({
+            address: wallet.address,
+            reason: buildFailures.get(wallet.index) ?? "OpenSea did not provide a verified mint signature.",
+          })),
+          refusals: [],
+        };
+        emit({ type: "dryRun", report });
+        emit({ type: "done", minted: 0, failed: 0 });
+        return {
+          minted: 0,
+          failed: 0,
+          timingErrorMs: 0,
+          dispatchMs: 0,
+          clock: clockSync,
+          txHashes: [],
+        };
+      }
       throw new Error(
         "OpenSea would not build a mint for any wallet. Common causes: not on the allowlist, per-wallet limit reached, supply exhausted, or the stage is closed. Nothing was sent.",
       );
@@ -288,13 +350,76 @@ export async function runAllowlistMint(
     );
     emit({ type: "balances", reports: balances, required, symbol: chain.nativeSymbol });
 
+    // Missing balance evidence is not permission to broadcast. A wallet is
+    // affordable only when its own balance check explicitly returned sufficient.
     const affordable = built.filter(
-      (b) => balances.find((r) => r.index === b.wallet.index)?.sufficient !== false,
+      (b) => balances.find((r) => r.index === b.wallet.index)?.sufficient === true,
     );
-    if (affordable.length === 0) {
+    if (affordable.length === 0 && !opts.dryRun) {
       throw new Error(
-        `Every wallet is short of ${formatEth(required, chain.nativeSymbol)} — nothing was sent.`,
+        `No wallet has a verified balance sufficient for ${formatEth(required, chain.nativeSymbol)} — nothing was sent.`,
       );
+    }
+
+    if (opts.dryRun) {
+      const affordableAddresses = new Set(affordable.map((b) => b.wallet.address.toLowerCase()));
+      const builtAddresses = new Set(built.map((b) => b.wallet.address.toLowerCase()));
+      const skipped = [
+        ...wallets
+          .filter((wallet) => !builtAddresses.has(wallet.address.toLowerCase()))
+          .map((wallet) => ({
+            address: wallet.address,
+            reason: buildFailures.get(wallet.index) ?? "OpenSea did not provide a verified mint signature.",
+          })),
+        ...built
+          .filter((b) => !affordableAddresses.has(b.wallet.address.toLowerCase()))
+          .map((b) => {
+            const balance = balances.find((r) => r.index === b.wallet.index);
+            return {
+              address: b.wallet.address,
+              reason: balance
+                ? `underfunded — needs ${formatEth(required, chain.nativeSymbol)}`
+                : "funding unverified — no balance report for this wallet",
+            };
+          }),
+      ];
+      const report: DryRunReport = {
+        target: opts.slug,
+        chainName: chain.name,
+        chainId: chain.chainId,
+        nativeSymbol: chain.nativeSymbol,
+        to: built[0]!.verified.to,
+        calldataBytes: (built[0]!.verified.data.length - 2) / 2,
+        valuePerWallet: built[0]!.verified.value,
+        gas,
+        fireAtMs: null,
+        nowMs: Date.now(),
+        drift,
+        wallets: affordable.map((bundle) => {
+          const prepared = prepare(bundle.raw);
+          return {
+            index: bundle.wallet.index,
+            address: bundle.wallet.address,
+            nonce: bundle.wallet.nonce,
+            txHash: prepared.txHash,
+            rawBytes: (prepared.raw.length - 2) / 2,
+            simulation: "skipped",
+          };
+        }),
+        endpoints: endpoints.map((endpoint) => endpoint.label),
+        skipped,
+        refusals: [],
+      };
+      emit({ type: "dryRun", report });
+      emit({ type: "done", minted: 0, failed: 0 });
+      return {
+        minted: 0,
+        failed: 0,
+        timingErrorMs: 0,
+        dispatchMs: 0,
+        clock: clockSync,
+        txHashes: [],
+      };
     }
 
     // Dispatch.

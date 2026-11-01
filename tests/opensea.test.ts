@@ -17,6 +17,7 @@ import {
   RawMintTx,
   allowlistInterface,
   fetchDropSchedule,
+  resolveCollection,
   isPublicMintCalldata,
   verifyAllowlistTx,
 } from "../src/core/opensea";
@@ -230,6 +231,26 @@ describe("isPublicMintCalldata", () => {
   });
 });
 
+describe("resolveCollection — selected-chain safety", () => {
+  it("refuses to fall back to a contract on a different chain", async () => {
+    const saved = globalThis.fetch;
+    globalThis.fetch = (async () =>
+      new Response(JSON.stringify({
+        name: "Minehood Miners",
+        collection: "minehoodrh",
+        contracts: [{ address: COLLECTION, chain: "base" }],
+      }), { status: 200 })) as typeof globalThis.fetch;
+    try {
+      await assert.rejects(
+        resolveCollection("minehoodrh", "k", "robinhood"),
+        /does not list collection .* on selected chain "robinhood"/i,
+      );
+    } finally {
+      globalThis.fetch = saved;
+    }
+  });
+});
+
 describe("fetchDropSchedule — the fields the live payload actually carries", () => {
   // Every case here is a mutation of the real /api/v2/drops/muse-brokers body,
   // captured 2026-09-28. It matters that the fixture is the real one, because
@@ -275,6 +296,33 @@ describe("fetchDropSchedule — the fields the live payload actually carries", (
   it("reads the uuid the live endpoint actually sends", async () => {
     const s = await fetchWith(drop(liveStageBody()));
     assert.equal(s.stages[0]!.uuid, "5732cec92ba2443988eeaa5ed53e8d6a");
+  });
+
+  it("keeps an FCFS-labeled stage gated when OpenSea's broad type says public_sale", async () => {
+    const s = await fetchWith(drop({
+      ...liveStageBody(),
+      stage_type: "public_sale",
+      label: "FCFS",
+    }));
+    assert.equal(s.stages[0]!.isPublic, false);
+  });
+
+  it("keeps a GTD-labeled stage gated when OpenSea's broad type says public_sale", async () => {
+    const s = await fetchWith(drop({
+      ...liveStageBody(),
+      stage_type: "public_sale",
+      label: "GTD",
+    }));
+    assert.equal(s.stages[0]!.isPublic, false);
+  });
+
+  it("recognises a genuinely public stage as public", async () => {
+    const s = await fetchWith(drop({
+      ...liveStageBody(),
+      stage_type: "public_sale",
+      label: "Public stage",
+    }));
+    assert.equal(s.stages[0]!.isPublic, true);
   });
 
   it("still reads the stage_uuid spelling the eligibility endpoint uses", async () => {

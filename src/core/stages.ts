@@ -27,6 +27,10 @@
 
 import { DropSchedule, DropStage } from "./opensea";
 import { MintPlan, PublicDrop, SupplyInfo } from "./seadrop";
+import { STAGE_ORDER, stageKindOf } from "./stagekind";
+import type { StageKind } from "./stagekind";
+export { STAGE_ORDER, stageKindOf } from "./stagekind";
+export type { StageKind } from "./stagekind";
 
 /**
  * Stage kinds, in the order they run in a drop.
@@ -45,10 +49,6 @@ import {
   mechanismFor,
 } from "./capabilities";
 
-export type StageKind = "gtd" | "team" | "allowlist" | "fcfs" | "public" | "unknown";
-
-export const STAGE_ORDER: StageKind[] = ["team", "gtd", "allowlist", "fcfs", "public", "unknown"];
-
 export type StageStatus = "ended" | "live" | "upcoming";
 
 /** Where a row's numbers came from. Printed in every renderer. */
@@ -59,6 +59,8 @@ export interface StageRow {
   /** Display name — the creator's label when there is one. */
   label: string;
   source: StageSource;
+  /** OpenSea's stable identifier, used to join wallet eligibility without relying on array order or labels. */
+  stageUuid?: string;
   /** null when the stage's price is not knowable before it opens. */
   priceWei: bigint | null;
   startMs: number;
@@ -110,24 +112,6 @@ export function countdownFor(
   return 0;
 }
 
-/**
- * Map an OpenSea stage type to a kind.
- *
- * OpenSea's `stage_type` is not a closed enum across drops — it has carried
- * "public_sale", "presale", "allowlist" and creator-defined values. The label is
- * checked too, because the distinction between GTD and FCFS usually lives there
- * rather than in the type field.
- */
-export function stageKindOf(type: string, label = ""): StageKind {
-  const haystack = `${type} ${label}`.toLowerCase();
-
-  if (/\bteam\b|founder|artist|reserve/.test(haystack)) return "team";
-  if (/\bgtd\b|guarantee/.test(haystack)) return "gtd";
-  if (/fcfs|first[- ]come|waitlist|raffle/.test(haystack)) return "fcfs";
-  if (/public/.test(haystack)) return "public";
-  if (/allow[- ]?list|presale|whitelist|\bwl\b/.test(haystack)) return "allowlist";
-  return "unknown";
-}
 
 /**
  * The on-chain public stage as a row.
@@ -193,6 +177,7 @@ export function apiStageRow(stage: DropStage, nowMs: number): StageRow {
     kind,
     label: stage.label || stage.type,
     source: "OpenSea API",
+    ...(stage.uuid !== undefined ? { stageUuid: stage.uuid } : {}),
     priceWei,
     startMs: stage.startMs,
     endMs: stage.endMs,
