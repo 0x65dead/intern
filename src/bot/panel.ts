@@ -26,6 +26,7 @@ import { StageTable, actionableStage, formatClock, formatCoarse } from "../core/
 import { StageContext, allStageCells, stageSummaryLines } from "../core/stagetable";
 import { MintPlan } from "../core/seadrop";
 import { LoadedWallet, formatEth, weiToGwei } from "../core/wallets";
+import { WalletEligibility, eligibilityIcon, eligibilityLabel } from "../core/eligibility";
 import { shortAddress } from "../core/target";
 import { InlineButton, bold, code, esc } from "./api";
 
@@ -42,6 +43,8 @@ export const PANEL_ACTIONS = [
   "chain",
   "qty",
   "send",
+  "gated",
+  "gateddryrun",
   "dryrun",
   "fire",
   "refresh",
@@ -274,6 +277,14 @@ export function renderConfirm(opts: {
   stages: StageTable;
   fireMode: string;
   nowMs: number;
+  eligibility?: WalletEligibility[];
+  allowlistMinting?: boolean;
+  selectedGatedStage?: {
+    uuid: string;
+    label: string;
+    startMs: number;
+    eligibleWallets: LoadedWallet[];
+  };
 }): string {
   const { plan, chain, quantity, wallets } = opts;
   const perWallet = plan.value;
@@ -291,9 +302,9 @@ export function renderConfirm(opts: {
     `${esc("contract:")}   ${code(plan.nftContract)}`,
     `${esc("variant:")}    ${esc(plan.variant === "v1-singleton" ? "SeaDrop v1 singleton" : "SeaDrop v2 (config on token)")}`,
     "",
-    `${esc("price:")}      ${esc(formatEth(plan.drop.mintPrice, symbol))} ${esc(`× ${quantity}`)}`,
-    `${esc("per wallet:")} ${bold(formatEth(perWallet, symbol))}`,
-    `${esc("cap:")}        ${esc(plan.drop.maxTotalMintableByWallet > 0 ? `${plan.drop.maxTotalMintableByWallet} per wallet` : "unlimited")}`,
+    `${esc(opts.selectedGatedStage ? "public price:" : "price:")}      ${esc(formatEth(plan.drop.mintPrice, symbol))} ${esc(`× ${quantity}`)}`,
+    `${esc(opts.selectedGatedStage ? "public per wallet:" : "per wallet:")} ${bold(formatEth(perWallet, symbol))}`,
+    `${esc(opts.selectedGatedStage ? "public cap:" : "cap:")}        ${esc(plan.drop.maxTotalMintableByWallet > 0 ? `${plan.drop.maxTotalMintableByWallet} per wallet` : "unlimited")}`,
   ];
 
   if (plan.supply.maxSupply !== null && plan.supply.totalSupply !== null) {
@@ -304,20 +315,87 @@ export function renderConfirm(opts: {
 
   lines.push(
     "",
-    `${esc("stage:")}      ${esc(open ? "open now" : `opens in ${formatCoarse(startMs - opts.nowMs)}`)}`,
-    `${esc("window:")}     ${esc(`${fmtShort(startMs)} → ${plan.drop.endTime > 0 ? fmtShort(plan.drop.endTime * 1000) : "no end"}`)}`,
+    `${esc(opts.selectedGatedStage ? "public stage:" : "stage:")}      ${esc(open ? "open now" : `opens in ${formatCoarse(startMs - opts.nowMs)}`)}`,
+    `${esc(opts.selectedGatedStage ? "public window:" : "window:")}     ${esc(`${fmtShort(startMs)} → ${plan.drop.endTime > 0 ? fmtShort(plan.drop.endTime * 1000) : "no end"}`)}`,
     `${esc("fire mode:")}  ${esc(opts.fireMode)}`,
     "",
     `${esc("gas ceiling:")} ${esc(`${weiToGwei(opts.maxFeeWei).toFixed(4)} gwei`)} ${esc("(a maximum, not a payment)")}`,
     `${esc("wallets:")}    ${esc(`${wallets.length} — ${wallets.map((w) => shortAddress(w.address)).join(", ")}`)}`,
     "",
-    `${esc("mint cost:")}  ${bold(formatEth(total, symbol))}`,
-    `${esc("worst case:")} ${esc(formatEth(total + worstGas, symbol))} ${esc("if every ceiling is fully used")}`,
+    `${esc(opts.selectedGatedStage ? "public mint cost:" : "mint cost:")}  ${bold(formatEth(total, symbol))}`,
+    `${esc(opts.selectedGatedStage ? "public worst case:" : "worst case:")} ${esc(formatEth(total + worstGas, symbol))} ${esc("if every ceiling is fully used")}`,
   );
 
   const next = actionableStage(opts.stages, opts.nowMs);
   if (next && next.status === "upcoming") {
     lines.push("", bold(`Time until start: ${formatClock(next.countdownMs)}`));
+  }
+
+  const eligibility = opts.eligibility ?? [];
+  const scheduledRows = opts.stages.rows.filter((row) => row.kind !== "public");
+  if (scheduledRows.length > 0) {
+    lines.push("", bold("MINT STAGE ELIGIBILITY"));
+    for (const stage of opts.stages.rows) {
+      if (stage.kind === "public") {
+        lines.push(esc(`${stage.label} — ✅ Open to all wallets`));
+        continue;
+      }
+
+      const joined = stage.stageUuid
+        ? eligibility.filter((result) => result.stageUuid === stage.stageUuid)
+        : [];
+      if (joined.length === 0) {
+        lines.push(esc(`${stage.label} — ❔ Unknown (no verifiable stage UUID or eligibility result)`));
+        continue;
+      }
+
+      for (const wallet of opts.wallets) {
+        const result = joined.find(
+          (candidate) => candidate.address.toLowerCase() === wallet.address.toLowerCase(),
+        );
+        if (!result) {
+          lines.push(
+            esc(`${stage.label} — W${wallet.index} ${shortAddress(wallet.address)} ❔ Unknown`),
+          );
+          continue;
+        }
+        const terms = [
+          result.stagePriceWei === null || result.stagePriceWei === undefined
+            ? null
+            : `price ${formatEth(result.stagePriceWei, opts.chain.nativeSymbol)}`,
+          result.stageMaxMintable === null || result.stageMaxMintable === undefined
+            ? null
+            : `limit ${result.stageMaxMintable}`,
+        ].filter((term): term is string => term !== null);
+        const unknownReason = result.state === "unknown" ? ` — ${result.detail}` : "";
+        const teamNotice =
+          stage.kind === "team" ? " · collection-wallet-only; the bot cannot mint team reserve" : "";
+        lines.push(
+          esc(
+            `${stage.label} — W${wallet.index} ${shortAddress(wallet.address)} ${eligibilityIcon(result.state)} ${eligibilityLabel(result.state, result.mechanism)}${terms.length > 0 ? ` · ${terms.join(" · ")}` : ""}${unknownReason}${teamNotice}`,
+          ),
+        );
+      }
+    }
+
+    if (opts.selectedGatedStage) {
+      const selected = opts.selectedGatedStage;
+      const opens = selected.startMs <= opts.nowMs ? "open now" : `opens ${fmtShort(selected.startMs)}`;
+      lines.push(
+        "",
+        bold(`READY TO MINT: ${selected.label}`),
+        esc(`eligible wallets: ${selected.eligibleWallets.map((wallet) => `W${wallet.index} ${shortAddress(wallet.address)}`).join(", ")}`),
+        esc(opens),
+        esc("The public-stage figures above are not this stage's quote. OpenSea's signed price and the actual wallet balance are checked again before broadcast; MAX_PRICE_PER_NFT is enforced when configured."),
+      );
+    } else if (opts.allowlistMinting === false && eligibility.some((result) => result.state === "eligible")) {
+      lines.push(
+        "",
+        esc("Gated mint eligibility was found, but automatic gated minting is disabled. Set ALLOWLIST_MINTING=1 to enable it."),
+      );
+    }
+  } else if (opts.stages.apiNotice) {
+    lines.push("", bold("MINT STAGE ELIGIBILITY"), esc("❔ OpenSea stage eligibility is unavailable until the collection schedule can be read."));
   }
 
   lines.push("", esc("Nothing has been signed. ✅ Send is the point of no return."));

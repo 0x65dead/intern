@@ -33,7 +33,7 @@ import { StageContext, firstSentence } from "./stagetable";
 import {
   WalletEligibility,
   checkMerkleEligibility,
-  openSeaEligibilityRows,
+  openSeaEligibilityRowsForStages,
   summariseEligibility,
 } from "./eligibility";
 import { loadAllowList } from "./allowlistsource";
@@ -656,10 +656,31 @@ async function readOpenSeaEligibility(opts: {
   nowMs: number;
 }): Promise<WalletEligibility[]> {
   const { slug, schedule, auth, addresses, nowMs } = opts;
-  if (!slug || !schedule || !auth || addresses.length === 0) return [];
+  if (!slug || !schedule || addresses.length === 0) return [];
 
-  const stage = gatedStageToAsk(schedule, nowMs);
-  if (stage === null) return [];
+  // Eligibility is a property of each wallet-stage pair, not of whichever
+  // stage happens to be open when the panel is prepared. Keep every gated stage
+  // in the report so an eligible FCFS row is not lost while GTD is live.
+  const gatedStages = schedule.stages.filter((stage) => !stage.isPublic);
+  if (gatedStages.length === 0) return [];
+
+  const unknownFor = (detail: string): WalletEligibility[] =>
+    gatedStages.flatMap((stage) =>
+      addresses.map((address) => ({
+        address,
+        state: "unknown" as const,
+        mechanism: "opensea-signed" as const,
+        detail: redactKeys(detail),
+        ...(stage.uuid !== undefined ? { stageUuid: stage.uuid } : {}),
+        stageLabel: stage.label || stage.type,
+      })),
+    );
+
+  if (!auth) {
+    return unknownFor(
+      "OpenSea wallet eligibility was not checked: configure OPENSEA_SCOPED_TOKEN or OPENSEA_WALLET_TOKEN.",
+    );
+  }
 
   const { snapshot, failure } = await tryFetchWalletEligibility({
     slug,
@@ -668,17 +689,12 @@ async function readOpenSeaEligibility(opts: {
     now: () => nowMs,
   });
   if (!snapshot) {
-    // The classifier's message, not a generic one: a 401 on the exchange and a
-    // 429 on the endpoint need different things done about them.
-    const why = failure?.message ?? "the eligibility check did not complete";
-    return addresses.map((address) => ({
-      address,
-      state: "unknown" as const,
-      mechanism: "opensea-signed" as const,
-      detail: redactKeys(why),
-    }));
+    // Keep the failure attached to every affected stage. A missing token or a
+    // rate limit is not evidence that a wallet is ineligible.
+    return unknownFor(failure?.message ?? "the eligibility check did not complete");
   }
-  return openSeaEligibilityRows(snapshot, stage, addresses);
+
+  return openSeaEligibilityRowsForStages(snapshot, gatedStages, addresses);
 }
 
 export function closeRun(run: Pick<PreparedRun, "rpc">): void {
@@ -739,7 +755,7 @@ export async function refreshRun(
   // Left exactly as-is when there is no credential or no wallet list, so a
   // caller that does not pass them loses nothing it had.
   const refreshedEligibility =
-    opts.openseaAuth && opts.walletAddresses
+    opts.walletAddresses !== undefined
       ? withOpenSeaRows(
           run.eligibility,
           await readOpenSeaEligibility({
@@ -803,7 +819,14 @@ export function stageContext(
   // the mechanism off its first row, so a mixed list would have silently
   // labelled every row with whichever happened to be first.
   const byMechanism = new Map<MintMechanism, WalletEligibility[]>();
+  const byStageUuid = new Map<string, WalletEligibility[]>();
   for (const row of report.results) {
+    if (row.mechanism === "opensea-signed" && row.stageUuid !== undefined) {
+      const bucket = byStageUuid.get(row.stageUuid);
+      if (bucket) bucket.push(row);
+      else byStageUuid.set(row.stageUuid, [row]);
+      continue;
+    }
     const bucket = byMechanism.get(row.mechanism);
     if (bucket) bucket.push(row);
     else byMechanism.set(row.mechanism, [row]);
@@ -813,6 +836,14 @@ export function stageContext(
   for (const [mechanism, rows] of byMechanism) {
     const summary = summariseEligibility(rows);
     if (summary) eligibility[mechanism] = summary;
+  }
+
+  // OpenSea results are wallet × stage. Summarising them together would count
+  // one wallet four times on a four-stage drop and could turn an FCFS verdict
+  // into a misleading aggregate for GTD. Keep one summary per stage UUID.
+  const eligibilityByStageUuid: Record<string, string> = {};
+  for (const [stageUuid, rows] of byStageUuid) {
+    eligibilityByStageUuid[stageUuid] = summariseEligibility(rows);
   }
 
   // The local allow-list check is the one that can fail as a whole, because it is
@@ -846,6 +877,7 @@ export function stageContext(
     },
     evidence: run.evidence,
     ...(Object.keys(eligibility).length > 0 ? { eligibility } : {}),
+    ...(Object.keys(eligibilityByStageUuid).length > 0 ? { eligibilityByStageUuid } : {}),
     // A configured list that did not load is not the same as no list, and the
     // table must not let the two read alike.
     ...(unavailable.length > 0 ? { eligibilityUnavailable: unavailable } : {}),

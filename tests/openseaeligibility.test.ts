@@ -35,7 +35,7 @@ import {
   tryFetchWalletEligibility,
 } from "../src/core/openseaeligibility";
 import { OpenSeaAuthManager } from "../src/core/openseaauth";
-import { openSeaEligibilityRows } from "../src/core/eligibility";
+import { openSeaEligibilityRows, openSeaEligibilityRowsForStages } from "../src/core/eligibility";
 import { localFailure } from "../src/core/failures";
 
 const NOW = 1_773_576_000_000;
@@ -315,10 +315,20 @@ describe("parseEligibilityResponse — untrusted input", () => {
     }
   });
 
-  it("flags a response that answers for a different wallet", () => {
+  it("flags a response that answers for a different wallet when an expected wallet was supplied", () => {
     const other = "0x2222222222222222222222222222222222222222";
     const snapshot = parse({ minter: other, stages: [] });
     assert.equal(snapshot.walletMismatch, other);
+  });
+
+  it("preserves the wallet named by OpenSea when the caller has no expected address", () => {
+    const other = "0x2222222222222222222222222222222222222222";
+    const snapshot = parse({ minter: other, ...liveResponse() }, { wallet: "" });
+    assert.equal(snapshot.walletMismatch, undefined);
+    assert.equal(snapshot.wallet, other);
+    const rows = openSeaEligibilityRows(snapshot, schedule()[1]!, [WALLET]);
+    assert.equal(rows[0]!.state, "unknown");
+    assert.match(rows[0]!.detail, /not one of the loaded wallets/);
   });
 
   it("does not call a checksum difference a mismatch", () => {
@@ -658,7 +668,11 @@ describe("hintForStage — who the answer is about", () => {
     assert.equal(hint.kind, "recorded");
     if (hint.kind !== "recorded") return;
     assert.equal(hint.wallet, WALLET.toLowerCase());
-    assert.deepEqual(hint.hint, { isEligible: true, maxMintable: 5 });
+    assert.deepEqual(hint.hint, {
+      isEligible: true,
+      maxMintable: 5,
+      pricePerTokenWei: 1_000_000_000_000_000n,
+    });
     assert.equal(hint.row.stageUuid, UUID_PUBLIC);
   });
 
@@ -768,6 +782,42 @@ describe("openSeaEligibilityRows — one token answers for one wallet", () => {
   const OTHER = "0x2222222222222222222222222222222222222222";
   const THIRD = "0x3333333333333333333333333333333333333333";
   const publicStage = () => schedule()[2]!;
+
+  it("retains wallet verdicts for GTD and FCFS even when GTD is the live stage", () => {
+    const snapshot = parse({
+      stages: [
+        {
+          stage_uuid: UUID_GTD,
+          is_eligible: false,
+          price: "3000000000000000",
+          max_total_mintable_by_wallet: "1",
+        },
+        {
+          stage_uuid: UUID_FCFS,
+          is_eligible: true,
+          price: "4510000000000000",
+          max_total_mintable_by_wallet: "1",
+        },
+        {
+          stage_uuid: UUID_PUBLIC,
+          is_eligible: true,
+          price: "5640000000000000",
+          max_total_mintable_by_wallet: "1",
+        },
+      ],
+    });
+    const rows = openSeaEligibilityRowsForStages(snapshot, schedule(), [WALLET]);
+
+    assert.equal(rows.length, 2, "public is open to all and is not a gated eligibility lookup");
+    const gtd = rows.find((row) => row.stageUuid === UUID_GTD)!;
+    const fcfs = rows.find((row) => row.stageUuid === UUID_FCFS)!;
+    assert.equal(gtd.state, "ineligible");
+    assert.equal(gtd.stageLabel, "GTD");
+    assert.equal(fcfs.state, "eligible");
+    assert.equal(fcfs.stageLabel, "FCFS");
+    assert.equal(fcfs.stagePriceWei, 4_510_000_000_000_000n);
+    assert.equal(fcfs.stageMaxMintable, 1);
+  });
 
   it("gives the answered wallet a verdict and says so in its own terms", () => {
     const rows = openSeaEligibilityRows(parse(liveResponse()), publicStage(), [WALLET]);

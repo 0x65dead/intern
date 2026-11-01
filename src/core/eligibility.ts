@@ -38,6 +38,12 @@ export interface WalletEligibility {
   mechanism: MintMechanism;
   /** Always populated. For `unknown` it states what stands in the way. */
   detail: string;
+  /** OpenSea stage identity. UUIDs, never array positions or labels, join eligibility to the schedule. */
+  stageUuid?: string;
+  stageLabel?: string;
+  /** Wallet-scoped terms returned by OpenSea for this exact stage. */
+  stagePriceWei?: bigint | null;
+  stageMaxMintable?: number | null;
   /** Path A and C only: everything needed to build calldata right now. */
   proof?: string[];
   params?: MintParams;
@@ -237,6 +243,50 @@ export function openSeaEligibilityRows(
       detail,
     };
   });
+}
+
+/**
+ * Produce wallet verdicts for every gated stage in one OpenSea response.
+ *
+ * The endpoint returns a collection of stage rows, but the older caller selected
+ * only the currently live (or next) stage before asking this function to render
+ * it. That threw away valid FCFS/GTD answers for every other stage. Keep each
+ * result keyed by the schedule UUID so renderers can show all stages without
+ * trusting response order or a non-unique label.
+ *
+ * Public stages are intentionally omitted: they are open to every wallet and
+ * their authoritative row is read from the SeaDrop contract.
+ */
+export function openSeaEligibilityRowsForStages(
+  snapshot: EligibilitySnapshot,
+  stages: readonly DropStage[],
+  addresses: readonly string[],
+): WalletEligibility[] {
+  const results: WalletEligibility[] = [];
+
+  for (const stage of stages) {
+    if (stage.isPublic) continue;
+
+    const stageResult = stage.uuid
+      ? snapshot.stages.find((candidate) => candidate.stageUuid === stage.uuid)
+      : undefined;
+
+    for (const wallet of openSeaEligibilityRows(snapshot, stage, addresses)) {
+      results.push({
+        ...wallet,
+        ...(stage.uuid !== undefined ? { stageUuid: stage.uuid } : {}),
+        stageLabel: stage.label || stage.type,
+        ...(stageResult !== undefined
+          ? {
+              stagePriceWei: stageResult.price,
+              stageMaxMintable: stageResult.maxMintable,
+            }
+          : {}),
+      });
+    }
+  }
+
+  return results;
 }
 
 export function summariseEligibility(results: WalletEligibility[]): string {

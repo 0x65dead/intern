@@ -59,6 +59,8 @@ export interface StageRow {
   /** Display name — the creator's label when there is one. */
   label: string;
   source: StageSource;
+  /** OpenSea's stable identifier, used to join wallet eligibility without relying on array order or labels. */
+  stageUuid?: string;
   /** null when the stage's price is not knowable before it opens. */
   priceWei: bigint | null;
   startMs: number;
@@ -193,6 +195,7 @@ export function apiStageRow(stage: DropStage, nowMs: number): StageRow {
     kind,
     label: stage.label || stage.type,
     source: "OpenSea API",
+    ...(stage.uuid !== undefined ? { stageUuid: stage.uuid } : {}),
     priceWei,
     startMs: stage.startMs,
     endMs: stage.endMs,
