@@ -17,6 +17,7 @@ import {
   RawMintTx,
   allowlistInterface,
   fetchDropSchedule,
+  resolveCollection,
   isPublicMintCalldata,
   verifyAllowlistTx,
 } from "../src/core/opensea";
@@ -227,6 +228,26 @@ describe("verifyAllowlistTx — refusals", () => {
 describe("isPublicMintCalldata", () => {
   it("does not mistake a signed mint for a public one", () => {
     assert.equal(isPublicMintCalldata(v1Response().data), false);
+  });
+});
+
+describe("resolveCollection — selected-chain safety", () => {
+  it("refuses to fall back to a contract on a different chain", async () => {
+    const saved = globalThis.fetch;
+    globalThis.fetch = (async () =>
+      new Response(JSON.stringify({
+        name: "Minehood Miners",
+        collection: "minehoodrh",
+        contracts: [{ address: COLLECTION, chain: "base" }],
+      }), { status: 200 })) as typeof globalThis.fetch;
+    try {
+      await assert.rejects(
+        resolveCollection("minehoodrh", "k", "robinhood"),
+        /does not list collection .* on selected chain "robinhood"/i,
+      );
+    } finally {
+      globalThis.fetch = saved;
+    }
   });
 });
 
