@@ -175,9 +175,10 @@ export async function resolveTarget(opts: {
     throw err;
   }
 
-  if (collection.chain.toLowerCase() !== chain.key) {
-    warnings.push(
-      `OpenSea lists this collection's contract on "${collection.chain}", not "${chain.key}". Check --chain before firing.`,
+  const collectionChain = resolveChain(collection.chain);
+  if (!collectionChain || collectionChain.chainId !== chain.chainId) {
+    throw new Error(
+      `OpenSea resolved "${parsed.value}" to ${collection.chain}, which does not match selected ${chain.name}. Nothing was prepared.`,
     );
   }
 
@@ -394,10 +395,25 @@ export interface PrepareOptions {
 async function loadSchedule(
   slug: string | undefined,
   apiKey: string | null,
+  expected?: { chain: ChainProfile; contract: string },
 ): Promise<{ schedule: DropSchedule | null; error?: string }> {
   if (!slug || !apiKey) return { schedule: null };
   try {
-    return { schedule: await fetchDropSchedule(slug, apiKey) };
+    const schedule = await fetchDropSchedule(slug, apiKey);
+    if (expected) {
+      const scheduleChain = resolveChain(schedule.chain);
+      if (!scheduleChain || scheduleChain.chainId !== expected.chain.chainId) {
+        throw new Error(
+          `OpenSea schedule is for chain "${schedule.chain}", not ${expected.chain.name} (${expected.chain.chainId}). Eligibility is disabled for this mismatched schedule.`,
+        );
+      }
+      if (schedule.contractAddress.toLowerCase() !== expected.contract.toLowerCase()) {
+        throw new Error(
+          `OpenSea schedule contract ${schedule.contractAddress} does not match selected contract ${expected.contract}. Eligibility is disabled for this mismatched schedule.`,
+        );
+      }
+    }
+    return { schedule };
   } catch (err: unknown) {
     if (err instanceof OpenSeaError && err.status === 404) {
       return { schedule: null, error: "no drop listed for this collection" };
@@ -445,7 +461,10 @@ export async function prepareRun(opts: PrepareOptions): Promise<PreparedRun> {
         priorityGwei: opts.priorityGwei ?? null,
         ...(opts.gasLimit ? { gasLimit: opts.gasLimit } : {}),
       }),
-      loadSchedule(resolved.slug, opts.apiKey ?? null),
+      loadSchedule(resolved.slug, opts.apiKey ?? null, {
+        chain: resolved.chain,
+        contract: resolved.contract,
+      }),
     ]);
     warnings.push(...gasDecision.warnings);
 
@@ -744,7 +763,10 @@ export async function refreshRun(
       priorityGwei: opts.priorityGwei ?? null,
       ...(opts.gasLimit ? { gasLimit: opts.gasLimit } : {}),
     }),
-    loadSchedule(run.slug, opts.apiKey ?? null),
+    loadSchedule(run.slug, opts.apiKey ?? null, {
+      chain: run.chain,
+      contract: run.contract,
+    }),
   ]);
   warnings.push(...gasDecision.warnings);
 

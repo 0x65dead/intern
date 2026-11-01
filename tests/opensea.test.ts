@@ -277,6 +277,33 @@ describe("fetchDropSchedule — the fields the live payload actually carries", (
     assert.equal(s.stages[0]!.uuid, "5732cec92ba2443988eeaa5ed53e8d6a");
   });
 
+  it("keeps an FCFS-labeled stage gated when OpenSea's broad type says public_sale", async () => {
+    const s = await fetchWith(drop({
+      ...liveStageBody(),
+      stage_type: "public_sale",
+      label: "FCFS",
+    }));
+    assert.equal(s.stages[0]!.isPublic, false);
+  });
+
+  it("keeps a GTD-labeled stage gated when OpenSea's broad type says public_sale", async () => {
+    const s = await fetchWith(drop({
+      ...liveStageBody(),
+      stage_type: "public_sale",
+      label: "GTD",
+    }));
+    assert.equal(s.stages[0]!.isPublic, false);
+  });
+
+  it("recognises a genuinely public stage as public", async () => {
+    const s = await fetchWith(drop({
+      ...liveStageBody(),
+      stage_type: "public_sale",
+      label: "Public stage",
+    }));
+    assert.equal(s.stages[0]!.isPublic, true);
+  });
+
   it("still reads the stage_uuid spelling the eligibility endpoint uses", async () => {
     const { uuid: _drop, ...rest } = liveStageBody();
     const s = await fetchWith(drop({ ...rest, stage_uuid: "abc123" }));

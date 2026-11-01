@@ -59,6 +59,7 @@ import {
 } from "../core/prepare";
 import { OpenSeaAuthManager, authManagerFrom } from "../core/openseaauth";
 import { StageContext } from "../core/stagetable";
+import type { SelectedGatedStage } from "./panel";
 import { Defaults } from "../util/env";
 import { WatchUpdate, waitForPublicStage, waitForScheduledStage } from "../core/watcher";
 import { formatLocal, parseTimeInput } from "../core/timing";
@@ -654,6 +655,8 @@ export class SessionManager {
       );
       return (
         result !== undefined &&
+        result.stagePriceWei !== null &&
+        result.stagePriceWei !== undefined &&
         (result.stageMaxMintable === null ||
           result.stageMaxMintable === undefined ||
           quantity <= result.stageMaxMintable)
@@ -670,12 +673,7 @@ export class SessionManager {
   private nextEligibleGatedStage(
     run: PreparedRun,
     quantity: number,
-  ): {
-    uuid: string;
-    label: string;
-    startMs: number;
-    eligibleWallets: LoadedWallet[];
-  } | null {
+  ): SelectedGatedStage | null {
     const candidates = run.stages.rows
       .filter(
         (stage) =>
@@ -687,10 +685,32 @@ export class SessionManager {
         uuid: stage.stageUuid!,
         label: stage.label,
         startMs: stage.startMs,
+        endMs: stage.endMs,
         status: stage.status,
         eligibleWallets: this.eligibleWalletsForStage(run, stage.stageUuid!, quantity),
       }))
-      .filter((stage) => stage.eligibleWallets.length > 0);
+      .map((stage) => ({
+        ...stage,
+        walletTerms: stage.eligibleWallets.flatMap((wallet) => {
+          const result = run.eligibility.results.find(
+            (candidate) =>
+              candidate.mechanism === "opensea-signed" &&
+              candidate.stageUuid === stage.uuid &&
+              candidate.address.toLowerCase() === wallet.address.toLowerCase() &&
+              candidate.state === "eligible",
+          );
+          if (!result || result.stagePriceWei === null || result.stagePriceWei === undefined) return [];
+          return [{
+            wallet,
+            priceWei: result.stagePriceWei,
+            maxMintable: result.stageMaxMintable ?? null,
+          }];
+        }),
+      }))
+      .filter((stage) =>
+        stage.eligibleWallets.length > 0 &&
+        stage.walletTerms.length === stage.eligibleWallets.length,
+      );
 
     const live = candidates
       .filter((stage) => stage.status === "live")
@@ -1340,6 +1360,23 @@ export class SessionManager {
     }
   }
 
+  /** Check each eligible wallet against its own OpenSea stage price plus gas. */
+  private async readBalancesForGatedStage(
+    run: PreparedRun,
+    stage: SelectedGatedStage,
+    quantity: number,
+  ): Promise<BalanceReport[]> {
+    const reports = await Promise.all(
+      stage.walletTerms.map(async (term) => {
+        const required = requiredBalance(term.priceWei * BigInt(quantity), run.gas);
+        const [report] = await checkBalances(run.rpc.provider, [term.wallet], required);
+        if (!report) throw new Error("Balance check returned no result for a selected wallet.");
+        return report;
+      }),
+    );
+    return reports;
+  }
+
   private balanceLines(reports: BalanceReport[], symbol: string): string[] {
     if (reports.length === 0) return [];
     const lines = [bold("Wallets")];
@@ -1634,7 +1671,9 @@ export class SessionManager {
     // The public SeaDrop price is not the selected gated-stage quote. Do not
     // print a misleading public-price underfunding warning on an FCFS preflight;
     // the signed-stage engine checks the actual quote and balance before send.
-    const balances = selectedGatedStage ? [] : await this.readBalances(run);
+    const balances = selectedGatedStage
+      ? await this.readBalancesForGatedStage(run, selectedGatedStage, quantity)
+      : await this.readBalances(run);
     session.draft.balances = balances;
 
     const fireMode = this.opts.defaults.leadMs > 0
@@ -1648,7 +1687,8 @@ export class SessionManager {
       chain: run.chain,
       collectionName: run.collection?.name,
       quantity,
-      wallets: this.opts.wallets,
+      wallets: selectedGatedStage?.eligibleWallets ?? this.opts.wallets,
+      allWallets: this.opts.wallets,
       maxFeeWei: run.gas.maxFeePerGas,
       gasLimit: run.gas.gasLimit,
       stages: run.stages,
@@ -1761,6 +1801,22 @@ export class SessionManager {
     const wallets = gatedStageUuid
       ? this.eligibleWalletsForStage(prepared, gatedStageUuid, quantity)
       : this.opts.wallets;
+    if (gatedStageUuid && !dryRun) {
+      const underfunded = (session.draft.balances ?? []).filter((report) => !report.sufficient);
+      if (underfunded.length > 0) {
+        void this.paint(
+          session,
+          [
+            bold("Gated mint not armed"),
+            "",
+            esc("The selected FCFS/GTD wallet balance is below the stage price plus the full gas ceiling. Fund the wallet and prepare again. Nothing was signed or sent."),
+            ...underfunded.map((report) => esc(`W${report.index} ${shortAddress(report.address)} short ${formatEth(report.shortfall, prepared.chain.nativeSymbol)}`)),
+          ].join("\n"),
+          BACK_ONLY,
+        ).catch(() => {});
+        return;
+      }
+    }
     if (wallets.length === 0) {
       void this.paint(
         session,
@@ -2137,13 +2193,13 @@ export class SessionManager {
             candidate.address.toLowerCase() === wallet.address.toLowerCase() &&
             candidate.state === "eligible",
         );
-        if (!row) {
-          throw new Error(`Eligibility result disappeared for W${wallet.index}. Nothing was sent.`);
+        if (!row || row.stagePriceWei === null || row.stagePriceWei === undefined) {
+          throw new Error(`Eligibility result or exact stage price disappeared for W${wallet.index}. Refresh the drop; nothing was sent.`);
         }
         eligibility.set(wallet.address.toLowerCase(), {
           isEligible: true,
           maxMintable: row.stageMaxMintable ?? null,
-          pricePerTokenWei: row.stagePriceWei ?? null,
+          pricePerTokenWei: row.stagePriceWei,
         });
       }
       return confirmed;
@@ -2162,6 +2218,8 @@ export class SessionManager {
       signal,
       includePublic: false,
       stageUuids: [stageUuid],
+      expectedChain: fresh.chain.key,
+      expectedContract: fresh.contract,
       preArmLeadMs: PRE_ARM_LEAD_MS,
       onPreArm: async (stage) => {
         if (stage.uuid !== stageUuid) {

@@ -110,6 +110,29 @@ describe("waitForScheduledStage exact stage selection", () => {
     assert.equal(result.stage.uuid, "fcfs-uuid");
     assert.equal(result.stage.label, "FCFS");
   });
+
+  it("refuses a schedule on a chain other than the prepared chain", async () => {
+    stubDrops([dropBody([{ startMs: Date.now() - 1_000, endMs: Date.now() + 3_600_000, label: "FCFS", uuid: "fcfs" }])]);
+    await assert.rejects(
+      waitForScheduledStage("muse-brokers", "k", {
+        stageUuids: ["fcfs"],
+        expectedChain: "robinhood",
+      }),
+      /schedule changed to chain "base"/i,
+    );
+  });
+
+  it("refuses a schedule for another collection contract", async () => {
+    stubDrops([dropBody([{ startMs: Date.now() - 1_000, endMs: Date.now() + 3_600_000, label: "FCFS", uuid: "fcfs" }])]);
+    await assert.rejects(
+      waitForScheduledStage("muse-brokers", "k", {
+        stageUuids: ["fcfs"],
+        expectedChain: "base",
+        expectedContract: "0x2222222222222222222222222222222222222222",
+      }),
+      /schedule contract changed/i,
+    );
+  });
 });
 
 describe("waitForScheduledStage pre-arm lead", () => {

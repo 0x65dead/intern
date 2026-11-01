@@ -30,6 +30,15 @@ import { WalletEligibility, eligibilityIcon, eligibilityLabel } from "../core/el
 import { shortAddress } from "../core/target";
 import { InlineButton, bold, code, esc } from "./api";
 
+export interface SelectedGatedStage {
+  uuid: string;
+  label: string;
+  startMs: number;
+  endMs: number;
+  eligibleWallets: LoadedWallet[];
+  walletTerms: { wallet: LoadedWallet; priceWei: bigint; maxMintable: number | null }[];
+}
+
 /** Everything a button can ask for. Anything else is rejected. */
 export const PANEL_ACTIONS = [
   "menu",
@@ -279,12 +288,8 @@ export function renderConfirm(opts: {
   nowMs: number;
   eligibility?: WalletEligibility[];
   allowlistMinting?: boolean;
-  selectedGatedStage?: {
-    uuid: string;
-    label: string;
-    startMs: number;
-    eligibleWallets: LoadedWallet[];
-  };
+  allWallets?: LoadedWallet[];
+  selectedGatedStage?: SelectedGatedStage;
 }): string {
   const { plan, chain, quantity, wallets } = opts;
   const perWallet = plan.value;
@@ -327,11 +332,12 @@ export function renderConfirm(opts: {
   );
 
   const next = actionableStage(opts.stages, opts.nowMs);
-  if (next && next.status === "upcoming") {
-    lines.push("", bold(`Time until start: ${formatClock(next.countdownMs)}`));
+  if (!opts.selectedGatedStage && next && next.status === "upcoming") {
+    lines.push("", bold(`Time until public start: ${formatClock(next.countdownMs)}`));
   }
 
   const eligibility = opts.eligibility ?? [];
+  const matrixWallets = opts.allWallets ?? wallets;
   const scheduledRows = opts.stages.rows.filter((row) => row.kind !== "public");
   if (scheduledRows.length > 0) {
     lines.push("", bold("MINT STAGE ELIGIBILITY"));
@@ -349,7 +355,7 @@ export function renderConfirm(opts: {
         continue;
       }
 
-      for (const wallet of opts.wallets) {
+      for (const wallet of matrixWallets) {
         const result = joined.find(
           (candidate) => candidate.address.toLowerCase() === wallet.address.toLowerCase(),
         );
@@ -380,22 +386,53 @@ export function renderConfirm(opts: {
 
     if (opts.selectedGatedStage) {
       const selected = opts.selectedGatedStage;
-      const opens = selected.startMs <= opts.nowMs ? "open now" : `opens ${fmtShort(selected.startMs)}`;
+      const opens = selected.startMs <= opts.nowMs
+        ? "open now"
+        : `opens in ${formatClock(selected.startMs - opts.nowMs)}`;
+      const selectedTotal = selected.walletTerms.reduce(
+        (sum, term) => sum + term.priceWei * BigInt(quantity),
+        0n,
+      );
+      const selectedGas = opts.gasLimit * opts.maxFeeWei * BigInt(selected.eligibleWallets.length);
       lines.push(
         "",
         bold(`READY TO MINT: ${selected.label}`),
         esc(`eligible wallets: ${selected.eligibleWallets.map((wallet) => `W${wallet.index} ${shortAddress(wallet.address)}`).join(", ")}`),
-        esc(opens),
-        esc("The public-stage figures above are not this stage's quote. OpenSea's signed price and the actual wallet balance are checked again before broadcast; MAX_PRICE_PER_NFT is enforced when configured."),
+        ...selected.walletTerms.map((term) =>
+          esc(`W${term.wallet.index} stage price: ${formatEth(term.priceWei, symbol)} × ${quantity}${term.maxMintable === null ? " · no stated cap" : ` · limit ${term.maxMintable}`}`),
+        ),
+        esc(`stage window: ${fmtShort(selected.startMs)} → ${fmtShort(selected.endMs)}`),
+        esc(`selected-stage mint cost: ${formatEth(selectedTotal, symbol)}`),
+        esc(`selected-stage worst case: ${formatEth(selectedTotal + selectedGas, symbol)} if every gas ceiling is fully used`),
+        esc(`selected-stage timing: ${opens}`),
+        esc("The public-stage figures above are reference figures only. The signed quote, allowance, price ceiling and wallet balance are rechecked before any broadcast."),
       );
-    } else if (opts.allowlistMinting === false && eligibility.some((result) => result.state === "eligible")) {
+    } else if (opts.allowlistMinting === false) {
       lines.push(
         "",
-        esc("Gated mint eligibility was found, but automatic gated minting is disabled. Set ALLOWLIST_MINTING=1 to enable it."),
+        bold("GATED MINT STATUS"),
+        esc("Automatic GTD/allowlist/FCFS minting is disabled. Set ALLOWLIST_MINTING=1 to enable it."),
+      );
+    } else {
+      const reason = opts.stages.apiNotice
+        ? `OpenSea schedule unavailable: ${opts.stages.apiNotice}`
+        : scheduledRows.length === 0
+          ? "OpenSea did not return any identifiable GTD/allowlist/FCFS stages."
+          : "No loaded wallet has a verified eligible result with a known stage price and sufficient allowance.";
+      lines.push(
+        "",
+        bold("GATED MINT STATUS"),
+        esc(reason),
+        esc("The Public mint buttons below target only the public SeaDrop stage; they do not fire FCFS or GTD."),
       );
     }
-  } else if (opts.stages.apiNotice) {
-    lines.push("", bold("MINT STAGE ELIGIBILITY"), esc("❔ OpenSea stage eligibility is unavailable until the collection schedule can be read."));
+  } else {
+    lines.push(
+      "",
+      bold("GATED MINT STATUS"),
+      esc(opts.stages.apiNotice ?? "No GTD/allowlist/FCFS stages were returned by OpenSea."),
+      esc("Only the explicitly labelled Public mint actions below target the public SeaDrop stage."),
+    );
   }
 
   lines.push("", esc("Nothing has been signed. ✅ Send is the point of no return."));

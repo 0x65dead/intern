@@ -27,6 +27,10 @@
 
 import { DropSchedule, DropStage } from "./opensea";
 import { MintPlan, PublicDrop, SupplyInfo } from "./seadrop";
+import { STAGE_ORDER, stageKindOf } from "./stagekind";
+import type { StageKind } from "./stagekind";
+export { STAGE_ORDER, stageKindOf } from "./stagekind";
+export type { StageKind } from "./stagekind";
 
 /**
  * Stage kinds, in the order they run in a drop.
@@ -44,92 +48,6 @@ import {
   isFireable,
   mechanismFor,
 } from "./capabilities";
-
-export type StageKind = "gtd" | "team" | "allowlist" | "fcfs" | "public" | "unknown";
-
-export const STAGE_ORDER: StageKind[] = ["team", "gtd", "allowlist", "fcfs", "public", "unknown"];
-
-export type StageStatus = "ended" | "live" | "upcoming";
-
-/** Where a row's numbers came from. Printed in every renderer. */
-export type StageSource = "on-chain" | "OpenSea API";
-
-export interface StageRow {
-  kind: StageKind;
-  /** Display name — the creator's label when there is one. */
-  label: string;
-  source: StageSource;
-  /** OpenSea's stable identifier, used to join wallet eligibility without relying on array order or labels. */
-  stageUuid?: string;
-  /** null when the stage's price is not knowable before it opens. */
-  priceWei: bigint | null;
-  startMs: number;
-  /** 0 means "no end configured". */
-  endMs: number;
-  /** 0 means unlimited / not stated. */
-  perWalletCap: number;
-  status: StageStatus;
-  /** ms until start (upcoming), until end (live), or 0 (ended). */
-  countdownMs: number;
-  /** Tokens still mintable, when knowable. */
-  mintsLeft: bigint | null;
-  /** Total mintable across the drop, when knowable. */
-  mintsTotal: bigint | null;
-  /** Set when a row is a placeholder for information that needs a key. */
-  note?: string;
-}
-
-export interface StageTable {
-  rows: StageRow[];
-  /** True when OpenSea data was fetched and merged. */
-  hasApiData: boolean;
-  /** Set when the non-public stages could not be read. */
-  apiNotice?: string;
-  supply: SupplyInfo;
-}
-
-/**
- * Classify a stage against the clock.
- *
- * `endMs === 0` is SeaDrop's "no end" and must not be read as "ended in 1970" —
- * that would mark an open-ended live stage as finished and hide it from the table.
- */
-export function classifyStatus(startMs: number, endMs: number, nowMs: number): StageStatus {
-  if (endMs > 0 && nowMs >= endMs) return "ended";
-  if (nowMs >= startMs) return "live";
-  return "upcoming";
-}
-
-/** ms that the status column's countdown refers to. */
-export function countdownFor(
-  status: StageStatus,
-  startMs: number,
-  endMs: number,
-  nowMs: number,
-): number {
-  if (status === "upcoming") return Math.max(0, startMs - nowMs);
-  if (status === "live" && endMs > 0) return Math.max(0, endMs - nowMs);
-  return 0;
-}
-
-/**
- * Map an OpenSea stage type to a kind.
- *
- * OpenSea's `stage_type` is not a closed enum across drops — it has carried
- * "public_sale", "presale", "allowlist" and creator-defined values. The label is
- * checked too, because the distinction between GTD and FCFS usually lives there
- * rather than in the type field.
- */
-export function stageKindOf(type: string, label = ""): StageKind {
-  const haystack = `${type} ${label}`.toLowerCase();
-
-  if (/\bteam\b|founder|artist|reserve/.test(haystack)) return "team";
-  if (/\bgtd\b|guarantee/.test(haystack)) return "gtd";
-  if (/fcfs|first[- ]come|waitlist|raffle/.test(haystack)) return "fcfs";
-  if (/public/.test(haystack)) return "public";
-  if (/allow[- ]?list|presale|whitelist|\bwl\b/.test(haystack)) return "allowlist";
-  return "unknown";
-}
 
 /**
  * The on-chain public stage as a row.
