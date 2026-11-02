@@ -27,6 +27,7 @@ import {
   resetRedactionRegistry,
   selectWallets,
   splitByFunding,
+  splitByVerifiedFunding,
   suggestMaxFee,
   weiToGwei,
 } from "../src/core/wallets";
@@ -801,6 +802,55 @@ describe("splitByFunding", () => {
 
   it("returns empty halves for no wallets", () => {
     assert.deepEqual(splitByFunding([], []), { funded: [], blocked: [] });
+  });
+});
+
+
+describe("splitByVerifiedFunding", () => {
+  it("requires a readable balance before clearing a gated wallet", () => {
+    const a = wallet(0, "aa");
+    const unknown: BalanceReport = {
+      index: 0,
+      address: a.address,
+      balance: null,
+      sufficient: true,
+      shortfall: 0n,
+    };
+    const split = splitByVerifiedFunding([a], [unknown]);
+    assert.deepEqual(split.funded, []);
+    assert.deepEqual(split.blocked, [{ wallet: a, verified: false }]);
+  });
+
+  it("distinguishes a verified shortfall from an unreadable balance", () => {
+    const poor = wallet(0, "aa");
+    const unknown = wallet(1, "bb");
+    const reports: BalanceReport[] = [
+      report(poor.address, false),
+      {
+        index: 1,
+        address: unknown.address,
+        balance: null,
+        sufficient: true,
+        shortfall: 0n,
+      },
+    ];
+    const split = splitByVerifiedFunding([poor, unknown], reports);
+    assert.deepEqual(split.funded, []);
+    assert.deepEqual(split.blocked, [
+      { wallet: poor, verified: true },
+      { wallet: unknown, verified: false },
+    ]);
+  });
+
+  it("matches by wallet address, not report order or global index", () => {
+    const a = wallet(4, "44");
+    const b = wallet(9, "99");
+    const split = splitByVerifiedFunding(
+      [a, b],
+      [report(b.address, false), report(a.address, true)],
+    );
+    assert.deepEqual(split.funded, [a]);
+    assert.deepEqual(split.blocked, [{ wallet: b, verified: true }]);
   });
 });
 

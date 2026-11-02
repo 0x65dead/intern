@@ -637,6 +637,30 @@ export function splitByFunding(
 }
 
 /**
+ * Strict funding gate for OpenSea-signed mints. A null balance is unknown, not
+ * evidence of sufficient funds; every selected wallet must have a readable
+ * balance that covers its own stage quote plus the gas ceiling.
+ */
+export function splitByVerifiedFunding(
+  wallets: LoadedWallet[],
+  reports: readonly BalanceReport[],
+): FundingSplit {
+  const byAddress = new Map(reports.map((r) => [r.address.toLowerCase(), r]));
+  const split: FundingSplit = { funded: [], blocked: [] };
+  for (const wallet of wallets) {
+    const report = byAddress.get(wallet.address.toLowerCase());
+    if (report === undefined || report.balance === null) {
+      split.blocked.push({ wallet, verified: false });
+    } else if (report.sufficient) {
+      split.funded.push(wallet);
+    } else {
+      split.blocked.push({ wallet, verified: true });
+    }
+  }
+  return split;
+}
+
+/**
  * Pair positional per-wallet values with the wallets they were computed for.
  *
  * The companion to {@link splitByFunding}, for {@link fetchNonces} and anything

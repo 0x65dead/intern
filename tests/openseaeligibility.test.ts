@@ -517,6 +517,21 @@ describe("mintTerms", () => {
     assert.equal(mintTerms(stage, 2)!.withinAllowance, false);
   });
 
+  it("uses the tighter of the wallet-wide and per-token caps", () => {
+    const snapshot = parse({
+      stages: [{
+        stage_uuid: UUID_GTD,
+        is_eligible: true,
+        price: "0",
+        max_total_mintable_by_wallet: "5",
+        max_total_mintable_by_wallet_per_token: "1",
+      }],
+    });
+    const terms = mintTerms(snapshot.stages[0]!, 2)!;
+    assert.equal(terms.allowance, 1);
+    assert.equal(terms.withinAllowance, false);
+  });
+
   it("treats no stated allowance as no limit", () => {
     const snapshot = parse({ stages: [{ stage_uuid: UUID_GTD, is_eligible: true, price: "0" }] });
     assert.equal(mintTerms(snapshot.stages[0]!, 99)!.withinAllowance, true);
@@ -671,6 +686,7 @@ describe("hintForStage — who the answer is about", () => {
     assert.deepEqual(hint.hint, {
       isEligible: true,
       maxMintable: 5,
+      maxMintablePerToken: null,
       pricePerTokenWei: 1_000_000_000_000_000n,
     });
     assert.equal(hint.row.stageUuid, UUID_PUBLIC);
@@ -817,6 +833,18 @@ describe("openSeaEligibilityRows — one token answers for one wallet", () => {
     assert.equal(fcfs.stageLabel, "FCFS");
     assert.equal(fcfs.stagePriceWei, 4_510_000_000_000_000n);
     assert.equal(fcfs.stageMaxMintable, 1);
+  });
+
+  it("preserves the per-token allowance separately from the wallet-wide allowance", () => {
+    const snapshot = parse(liveResponse({
+      max_total_mintable_by_wallet: "5",
+      max_total_mintable_by_wallet_per_token: "1",
+    }));
+    const fcfs = openSeaEligibilityRowsForStages(snapshot, schedule(), [WALLET]).find(
+      (row) => row.stageUuid === UUID_FCFS,
+    );
+    assert.equal(fcfs?.stageMaxMintable, 5);
+    assert.equal(fcfs?.stageMaxMintablePerToken, 1);
   });
 
   it("gives the answered wallet a verdict and says so in its own terms", () => {

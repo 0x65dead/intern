@@ -515,11 +515,19 @@ export function mintTerms(
 ): { pricePerToken: bigint; totalValue: bigint; withinAllowance: boolean; allowance: number | null } | null {
   if (stage.price === null) return null;
   if (!Number.isInteger(quantity) || quantity < 1) return null;
+
+  // A requested quantity must satisfy both independent limits. The effective
+  // cap is the tighter one; null means OpenSea did not state that particular cap.
+  const statedLimits = [stage.maxMintable, stage.maxMintablePerToken].filter(
+    (limit): limit is number => limit !== null,
+  );
+  const allowance = statedLimits.length > 0 ? Math.min(...statedLimits) : null;
+
   return {
     pricePerToken: stage.price,
     totalValue: stage.price * BigInt(quantity),
-    withinAllowance: stage.maxMintable === null ? true : quantity <= stage.maxMintable,
-    allowance: stage.maxMintable,
+    withinAllowance: allowance === null || quantity <= allowance,
+    allowance,
   };
 }
 
@@ -597,6 +605,7 @@ export function hintForStage(
     hint: {
       isEligible: row.isEligible,
       maxMintable: row.maxMintable,
+      maxMintablePerToken: row.maxMintablePerToken,
       pricePerTokenWei: row.price,
     },
   };

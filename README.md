@@ -497,3 +497,22 @@ auto-detection and shared-core parity in detail.
 ---
 
 MIT.
+
+
+## OpenSea wallet eligibility
+
+OpenSea eligibility is wallet-scoped. Create a personal access token in OpenSea
+Settings → Developer with the `read:eligibility` scope. For one wallet, set
+`OPENSEA_SCOPED_TOKEN` to a personal access token with the `read:eligibility`
+scope. For several wallets, set `OPENSEA_SCOPED_TOKENS` to a JSON object whose
+keys are wallet addresses and whose values are the corresponding wallet-owned
+PATs. A token is never reused as proof for another wallet. The bot exchanges
+each PAT for a short-lived JWT in memory and refreshes it; a missing wallet
+entry, a wallet mismatch, or an API failure is shown as **unknown**, not eligible.
+
+The confirmation panel shows the wallet-wide and per-token mint limits
+separately. The FCFS/GTD path selects only wallets whose explicit stage
+eligibility, exact stage price and both stated limits cover the requested
+quantity. Before a gated signature is broadcast, every selected wallet must
+also have a readable balance covering its own stage quote plus the full gas
+ceiling.

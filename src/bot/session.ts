@@ -47,10 +47,19 @@ import { EngineEvent, resolveFireTime, runMint } from "../core/engine";
 import { PreArmed, preArmAllowlist, runAllowlistMint } from "../core/allowlist";
 import { EligibilityHint } from "../core/failures";
 import { PRE_ARM_LEAD_MS } from "../core/race";
-import { BalanceReport, LoadedWallet, checkBalances, formatEth, redactKeys, requiredBalance } from "../core/wallets";
+import {
+  BalanceReport,
+  LoadedWallet,
+  checkBalances,
+  formatEth,
+  redactKeys,
+  requiredBalance,
+  splitByVerifiedFunding,
+} from "../core/wallets";
 import {
   AmbiguousChainError,
   PreparedRun,
+  OpenSeaEligibilityAuth,
   closeRun,
   noDropMessage,
   prepareRun,
@@ -596,7 +605,7 @@ export class SessionManager {
    * answer that cannot change without a restart. The manager holds the JWT and
    * refreshes it on its own schedule, so one instance is the whole point.
    */
-  private openseaAuth: OpenSeaAuthManager | null | undefined;
+  private openseaAuth: OpenSeaEligibilityAuth | undefined;
 
   constructor(private readonly opts: SessionManagerOptions) {
     this.clock = opts.clock ?? new CorrectedClock(0);
@@ -614,13 +623,26 @@ export class SessionManager {
    * whether a stage is fireable.
    */
   /** Lazily built so a bot with no eligibility credential never tries. */
-  private auth(): OpenSeaAuthManager | null {
+  private auth(): OpenSeaEligibilityAuth {
     if (this.openseaAuth === undefined) {
-      this.openseaAuth = authManagerFrom({
-        apiKey: this.opts.defaults.openseaApiKey,
-        scopedToken: this.opts.defaults.openseaScopedToken,
-        walletToken: this.opts.defaults.openseaWalletToken,
-      }).manager;
+      const perWalletTokens = this.opts.defaults.openseaScopedTokens;
+      if (Object.keys(perWalletTokens).length > 0) {
+        const managers = new Map<string, OpenSeaAuthManager>();
+        for (const [address, scopedToken] of Object.entries(perWalletTokens)) {
+          const { manager } = authManagerFrom({
+            apiKey: this.opts.defaults.openseaApiKey,
+            scopedToken,
+          });
+          if (manager) managers.set(address.toLowerCase(), manager);
+        }
+        this.openseaAuth = managers.size > 0 ? managers : null;
+      } else {
+        this.openseaAuth = authManagerFrom({
+          apiKey: this.opts.defaults.openseaApiKey,
+          scopedToken: this.opts.defaults.openseaScopedToken,
+          walletToken: this.opts.defaults.openseaWalletToken,
+        }).manager;
+      }
     }
     return this.openseaAuth;
   }
@@ -659,7 +681,10 @@ export class SessionManager {
         result.stagePriceWei !== undefined &&
         (result.stageMaxMintable === null ||
           result.stageMaxMintable === undefined ||
-          quantity <= result.stageMaxMintable)
+          quantity <= result.stageMaxMintable) &&
+        (result.stageMaxMintablePerToken === null ||
+          result.stageMaxMintablePerToken === undefined ||
+          quantity <= result.stageMaxMintablePerToken)
       );
     });
   }
@@ -704,6 +729,7 @@ export class SessionManager {
             wallet,
             priceWei: result.stagePriceWei,
             maxMintable: result.stageMaxMintable ?? null,
+            maxMintablePerToken: result.stageMaxMintablePerToken ?? null,
           }];
         }),
       }))
@@ -1700,15 +1726,23 @@ export class SessionManager {
     });
 
     const blocks = [body];
-    const short = balances.filter((r) => !r.sufficient);
-    if (short.length > 0) {
+    const fundingIssues = selectedGatedStage
+      ? splitByVerifiedFunding(selectedGatedStage.eligibleWallets, balances).blocked.map(
+          ({ wallet, verified }) => {
+            const report = balances.find(
+              (candidate) => candidate.address.toLowerCase() === wallet.address.toLowerCase(),
+            );
+            return !verified || report === undefined || report.balance === null
+              ? `W${wallet.index} ${shortAddress(wallet.address)} funding unverified — balance RPC did not return a value`
+              : `W${wallet.index} ${shortAddress(wallet.address)} short ${formatEth(report.shortfall, run.chain.nativeSymbol)}`;
+          },
+        )
+      : balances
+          .filter((report) => !report.sufficient)
+          .map((report) => `W${report.index} ${shortAddress(report.address)} short ${formatEth(report.shortfall, run.chain.nativeSymbol)}`);
+    if (fundingIssues.length > 0) {
       blocks.push(
-        [
-          bold("⚠ Underfunded wallets"),
-          ...short.map((r) =>
-            esc(`W${r.index} ${shortAddress(r.address)} short ${formatEth(r.shortfall, run.chain.nativeSymbol)}`),
-          ),
-        ].join("\n"),
+        [bold(selectedGatedStage ? "⚠ Selected-stage funding checks" : "⚠ Underfunded wallets"), ...fundingIssues.map(esc)].join("\n"),
       );
     }
     for (const warning of run.warnings) blocks.push(esc(`⚠ ${warning}`));
@@ -1802,15 +1836,25 @@ export class SessionManager {
       ? this.eligibleWalletsForStage(prepared, gatedStageUuid, quantity)
       : this.opts.wallets;
     if (gatedStageUuid && !dryRun) {
-      const underfunded = (session.draft.balances ?? []).filter((report) => !report.sufficient);
-      if (underfunded.length > 0) {
+      const funding = splitByVerifiedFunding(wallets, session.draft.balances ?? []);
+      if (funding.blocked.length > 0) {
+        const reports = new Map(
+          (session.draft.balances ?? []).map((report) => [report.address.toLowerCase(), report]),
+        );
         void this.paint(
           session,
           [
             bold("Gated mint not armed"),
             "",
-            esc("The selected FCFS/GTD wallet balance is below the stage price plus the full gas ceiling. Fund the wallet and prepare again. Nothing was signed or sent."),
-            ...underfunded.map((report) => esc(`W${report.index} ${shortAddress(report.address)} short ${formatEth(report.shortfall, prepared.chain.nativeSymbol)}`)),
+            esc("Every selected wallet must have a verified balance covering its exact stage price plus the full gas ceiling. Nothing was signed or sent."),
+            ...funding.blocked.map(({ wallet, verified }) => {
+              const report = reports.get(wallet.address.toLowerCase());
+              return esc(
+                !verified || report === undefined || report.balance === null
+                  ? `W${wallet.index} ${shortAddress(wallet.address)} funding unverified — balance RPC did not return a value`
+                  : `W${wallet.index} ${shortAddress(wallet.address)} short ${formatEth(report.shortfall, prepared.chain.nativeSymbol)}`,
+              );
+            }),
           ].join("\n"),
           BACK_ONLY,
         ).catch(() => {});

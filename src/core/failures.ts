@@ -105,8 +105,9 @@ export const FAILURE_META: Record<FailureCode, FailureMeta> = {
     retryable: false,
     terminal: true,
     remedy:
-      "Check OPENSEA_SCOPED_TOKEN — or OPENSEA_WALLET_TOKEN, if that is the one " +
-      "you set — is current and carries the read:eligibility scope.",
+      "Check OPENSEA_API_KEY and the wallet-owned OPENSEA_SCOPED_TOKEN or " +
+      "OPENSEA_SCOPED_TOKENS entry — or OPENSEA_WALLET_TOKEN as a single-wallet " +
+      "fallback — are current and carry the read:eligibility scope.",
   },
   API_KEY_INVALID: {
     title: "OpenSea rejected the API key",
@@ -306,6 +307,8 @@ export interface EligibilityHint {
   readonly isEligible: boolean;
   /** null when OpenSea stated no limit. */
   readonly maxMintable: number | null;
+  /** The additional per-token limit, when OpenSea stated one. */
+  readonly maxMintablePerToken?: number | null;
   /** Per-token wei quote from the wallet-scoped eligibility endpoint, when stated. */
   readonly pricePerTokenWei?: bigint | null;
   readonly mintedSoFar?: number | null;
@@ -408,10 +411,14 @@ export function classifyOpenSeaFailure(
         });
       }
       const minted = hint.mintedSoFar ?? null;
-      if (hint.maxMintable !== null && minted !== null && minted >= hint.maxMintable) {
+      const statedLimits = [hint.maxMintable, hint.maxMintablePerToken].filter(
+        (limit): limit is number => limit !== null && limit !== undefined,
+      );
+      const effectiveLimit = statedLimits.length > 0 ? Math.min(...statedLimits) : null;
+      if (effectiveLimit !== null && minted !== null && minted >= effectiveLimit) {
         return build("MINT_LIMIT_REACHED", "opensea", {
           ...at,
-          detail: `${minted} of ${hint.maxMintable} already minted`,
+          detail: `${minted} of ${effectiveLimit} already minted`,
         });
       }
       // Eligible with allowance left, yet refused: the remaining causes are

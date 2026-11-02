@@ -48,6 +48,7 @@ import {
   formatEth,
   priceCeilingRefusal,
   requiredBalance,
+  splitByVerifiedFunding,
 } from "./wallets";
 import { OpenSeaError, VerifiedMintTx, requestMintTx, verifyAllowlistTx } from "./opensea";
 import { EligibilityHint, FailureCode, localFailure } from "./failures";
@@ -350,10 +351,15 @@ export async function runAllowlistMint(
     );
     emit({ type: "balances", reports: balances, required, symbol: chain.nativeSymbol });
 
-    // Missing balance evidence is not permission to broadcast. A wallet is
-    // affordable only when its own balance check explicitly returned sufficient.
-    const affordable = built.filter(
-      (b) => balances.find((r) => r.index === b.wallet.index)?.sufficient === true,
+    // A gated mint requires a readable balance for every wallet before
+    // broadcast. A null balance is unknown, not evidence of sufficient funds.
+    const funding = splitByVerifiedFunding(
+      built.map((bundle) => bundle.wallet),
+      balances,
+    );
+    const fundedAddresses = new Set(funding.funded.map((wallet) => wallet.address.toLowerCase()));
+    const affordable = built.filter((bundle) =>
+      fundedAddresses.has(bundle.wallet.address.toLowerCase()),
     );
     if (affordable.length === 0 && !opts.dryRun) {
       throw new Error(
@@ -377,9 +383,10 @@ export async function runAllowlistMint(
             const balance = balances.find((r) => r.index === b.wallet.index);
             return {
               address: b.wallet.address,
-              reason: balance
-                ? `underfunded — needs ${formatEth(required, chain.nativeSymbol)}`
-                : "funding unverified — no balance report for this wallet",
+              reason:
+                balance === undefined || balance.balance === null
+                  ? "funding unverified — balance RPC did not return a value"
+                  : `underfunded — needs ${formatEth(required, chain.nativeSymbol)}`,
             };
           }),
       ];

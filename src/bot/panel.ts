@@ -36,7 +36,7 @@ export interface SelectedGatedStage {
   startMs: number;
   endMs: number;
   eligibleWallets: LoadedWallet[];
-  walletTerms: { wallet: LoadedWallet; priceWei: bigint; maxMintable: number | null }[];
+  walletTerms: { wallet: LoadedWallet; priceWei: bigint; maxMintable: number | null; maxMintablePerToken: number | null }[];
 }
 
 /** Everything a button can ask for. Anything else is rejected. */
@@ -371,7 +371,10 @@ export function renderConfirm(opts: {
             : `price ${formatEth(result.stagePriceWei, opts.chain.nativeSymbol)}`,
           result.stageMaxMintable === null || result.stageMaxMintable === undefined
             ? null
-            : `limit ${result.stageMaxMintable}`,
+            : `wallet limit ${result.stageMaxMintable}`,
+          result.stageMaxMintablePerToken === null || result.stageMaxMintablePerToken === undefined
+            ? null
+            : `per-token limit ${result.stageMaxMintablePerToken}`,
         ].filter((term): term is string => term !== null);
         const unknownReason = result.state === "unknown" ? ` — ${result.detail}` : "";
         const teamNotice =
@@ -399,7 +402,7 @@ export function renderConfirm(opts: {
         bold(`READY TO MINT: ${selected.label}`),
         esc(`eligible wallets: ${selected.eligibleWallets.map((wallet) => `W${wallet.index} ${shortAddress(wallet.address)}`).join(", ")}`),
         ...selected.walletTerms.map((term) =>
-          esc(`W${term.wallet.index} stage price: ${formatEth(term.priceWei, symbol)} × ${quantity}${term.maxMintable === null ? " · no stated cap" : ` · limit ${term.maxMintable}`}`),
+          esc(`W${term.wallet.index} stage price: ${formatEth(term.priceWei, symbol)} × ${quantity}${term.maxMintable === null ? " · no stated wallet cap" : ` · wallet limit ${term.maxMintable}`}${term.maxMintablePerToken === null ? "" : ` · per-token limit ${term.maxMintablePerToken}`}`),
         ),
         esc(`stage window: ${fmtShort(selected.startMs)} → ${fmtShort(selected.endMs)}`),
         esc(`selected-stage mint cost: ${formatEth(selectedTotal, symbol)}`),

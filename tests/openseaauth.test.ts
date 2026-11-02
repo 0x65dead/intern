@@ -380,6 +380,18 @@ describe("OpenSeaAuthManager — failure reporting", () => {
     }
   });
 
+  it("describes the exchange 403 as opaque rather than claiming the endpoint is disabled", async () => {
+    stubFetch([{ status: 403, json: { message: "Token exchange is not available" } }]);
+    const err = await manager().token().then(
+      () => null,
+      (e: unknown) => e as OpenSeaAuthError,
+    );
+    assert.ok(err instanceof OpenSeaAuthError);
+    assert.match(err.message, /opaque 403/i);
+    assert.match(err.message, /does not distinguish/i);
+    assert.doesNotMatch(err.message, /has disabled the token exchange endpoint/i);
+  });
+
   it("marks a server-side failure retryable", async () => {
     stubFetch([{ status: 503, json: {} }]);
     const err = await manager()

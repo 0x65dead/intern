@@ -340,6 +340,8 @@ export interface EligibilityReport {
   error: string | null;
 }
 
+export type OpenSeaEligibilityAuth = OpenSeaAuthManager | ReadonlyMap<string, OpenSeaAuthManager> | null;
+
 export interface PrepareOptions {
   target: string;
   chainKey?: string | undefined;
@@ -371,17 +373,12 @@ export interface PrepareOptions {
   /**
    * Authenticated access to OpenSea's wallet eligibility endpoint.
    *
-   * The manager is passed in rather than built here, and that is the whole
-   * point: it holds the short-lived wallet JWT in memory and refreshes it before
-   * expiry, so one manager shared across a prepare and every subsequent refresh
-   * performs one token exchange instead of one per refresh. Constructing it per
-   * call would re-exchange on a timer.
-   *
-   * null or absent means the eligibility question goes to the table as unknown.
-   * That is a supported state, not a degraded one — it is the only honest answer
-   * available without a wallet-scoped credential.
+   * A single manager is shared across prepare and subsequent refreshes so its
+   * short-lived JWT is cached and refreshed. A map contains one manager per
+   * wallet; each manager is queried only for the address it is bound to. null or
+   * absent means eligibility is unknown, never borrowed from a different wallet.
    */
-  openseaAuth?: OpenSeaAuthManager | null;
+  openseaAuth?: OpenSeaEligibilityAuth;
 }
 
 /**
@@ -670,22 +667,19 @@ export function gatedStageToAsk(schedule: DropSchedule, nowMs: number): DropStag
 async function readOpenSeaEligibility(opts: {
   slug: string | undefined;
   schedule: DropSchedule | null;
-  auth: OpenSeaAuthManager | null | undefined;
+  auth: OpenSeaEligibilityAuth | undefined;
   addresses: string[];
   nowMs: number;
 }): Promise<WalletEligibility[]> {
   const { slug, schedule, auth, addresses, nowMs } = opts;
   if (!slug || !schedule || addresses.length === 0) return [];
 
-  // Eligibility is a property of each wallet-stage pair, not of whichever
-  // stage happens to be open when the panel is prepared. Keep every gated stage
-  // in the report so an eligible FCFS row is not lost while GTD is live.
   const gatedStages = schedule.stages.filter((stage) => !stage.isPublic);
   if (gatedStages.length === 0) return [];
 
-  const unknownFor = (detail: string): WalletEligibility[] =>
+  const unknownFor = (detail: string, targets: readonly string[] = addresses): WalletEligibility[] =>
     gatedStages.flatMap((stage) =>
-      addresses.map((address) => ({
+      targets.map((address) => ({
         address,
         state: "unknown" as const,
         mechanism: "opensea-signed" as const,
@@ -697,23 +691,61 @@ async function readOpenSeaEligibility(opts: {
 
   if (!auth) {
     return unknownFor(
-      "OpenSea wallet eligibility was not checked: configure OPENSEA_SCOPED_TOKEN or OPENSEA_WALLET_TOKEN.",
+      "OpenSea wallet eligibility was not checked: configure OPENSEA_API_KEY and a wallet-owned OPENSEA_SCOPED_TOKEN, OPENSEA_SCOPED_TOKENS entry, or OPENSEA_WALLET_TOKEN.",
     );
   }
 
-  const { snapshot, failure } = await tryFetchWalletEligibility({
-    slug,
-    auth,
-    stages: schedule.stages,
-    now: () => nowMs,
-  });
-  if (!snapshot) {
-    // Keep the failure attached to every affected stage. A missing token or a
-    // rate limit is not evidence that a wallet is ineligible.
-    return unknownFor(failure?.message ?? "the eligibility check did not complete");
+  // A single credential is wallet-scoped. Preserve the legacy one-wallet path,
+  // and let a multi-wallet response identify its own subject rather than
+  // attributing one JWT's answer to every loaded key.
+  if (auth instanceof OpenSeaAuthManager) {
+    const { snapshot, failure } = await tryFetchWalletEligibility({
+      slug,
+      auth,
+      stages: schedule.stages,
+      ...(addresses.length === 1 ? { wallet: addresses[0] } : {}),
+      now: () => nowMs,
+    });
+    if (!snapshot) {
+      return unknownFor(failure?.message ?? "the eligibility check did not complete");
+    }
+    return openSeaEligibilityRowsForStages(snapshot, gatedStages, addresses);
   }
 
-  return openSeaEligibilityRowsForStages(snapshot, gatedStages, addresses);
+  // A mapped PAT is dedicated to its address. Query one wallet at a time and
+  // pass that address as an expected subject; an accidentally swapped token is
+  // therefore reported as unknown, never as an eligibility verdict for the
+  // wrong wallet. Keep concurrency bounded to avoid a burst of eligibility
+  // requests when many wallets are loaded.
+  const perWallet = new Array<WalletEligibility[]>(addresses.length);
+  let next = 0;
+  const worker = async (): Promise<void> => {
+    for (;;) {
+      const index = next++;
+      if (index >= addresses.length) return;
+      const address = addresses[index]!;
+      const manager = auth.get(address.toLowerCase());
+      if (!manager) {
+        perWallet[index] = unknownFor(
+          "No OPENSEA_SCOPED_TOKENS credential is configured for this wallet.",
+          [address],
+        );
+        continue;
+      }
+      const { snapshot, failure } = await tryFetchWalletEligibility({
+        slug,
+        auth: manager,
+        stages: schedule.stages,
+        wallet: address,
+        now: () => nowMs,
+      });
+      perWallet[index] = snapshot
+        ? openSeaEligibilityRowsForStages(snapshot, gatedStages, [address])
+        : unknownFor(failure?.message ?? "the eligibility check did not complete", [address]);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(3, addresses.length) }, () => worker()));
+  return perWallet.flat();
 }
 
 export function closeRun(run: Pick<PreparedRun, "rpc">): void {
@@ -749,7 +781,7 @@ export async function refreshRun(
      * The same manager the prepare used, so the JWT is reused rather than
      * re-exchanged. Absent means the eligibility rows carry over unchanged.
      */
-    openseaAuth?: OpenSeaAuthManager | null;
+    openseaAuth?: OpenSeaEligibilityAuth;
     /** The addresses to ask about. Absent means carry the existing rows over. */
     walletAddresses?: string[];
   },

@@ -18,7 +18,7 @@
 import fs from "fs";
 import path from "path";
 import dotenv from "dotenv";
-import { parseEther } from "ethers";
+import { getAddress, parseEther } from "ethers";
 
 export function loadEnv(cwd: string = process.cwd()): void {
   const envPath = path.resolve(cwd, ".env");
@@ -44,18 +44,13 @@ export interface Defaults {
    */
   openseaScopedToken: string | null;
   /**
-   * A wallet access token already issued, used in place of the exchange.
-   *
-   * OpenSea currently answers the token-exchange endpoint with 403 "Token
-   * exchange is not available" — for any caller, with or without credentials —
-   * and its own guidance points at `opensea login` or an OAuth 2.1 PKCE flow
-   * instead. This is where the resulting token goes.
-   *
-   * It is short-lived, so it is read at start and held in memory; nothing writes
-   * it back. Setting it makes OPENSEA_SCOPED_TOKEN unnecessary, and setting both
-   * is harmless — this one wins, and the exchange resumes the moment it is unset.
+   * A short-lived wallet JWT issued by OpenSea, used as a fallback when the
+   * PAT exchange flow cannot be used. Unlike a PAT, it is not refreshed
+   * automatically and applies to one wallet only.
    */
   openseaWalletToken: string | null;
+  /** Personal access tokens indexed by the wallet they authorize. */
+  openseaScopedTokens: Record<string, string>;
   telegramToken: string | null;
   telegramAllowedIds: number[];
   receiptTimeoutMs: number;
@@ -118,6 +113,39 @@ function numberFrom(raw: string | undefined, fallback: number | null): number | 
 function stringFrom(raw: string | undefined): string | null {
   const value = raw?.trim();
   return value !== undefined && value.length > 0 ? value : null;
+}
+
+/** Parse a JSON object of wallet addresses to their OpenSea personal access tokens. */
+function addressTokenMapFrom(name: string, raw: string | undefined): Record<string, string> {
+  if (raw === undefined || raw.trim() === "") return {};
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new ConfigError(name + " must be a JSON object mapping wallet addresses to tokens.");
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new ConfigError(name + " must be a JSON object mapping wallet addresses to tokens.");
+  }
+
+  const tokens: Record<string, string> = {};
+  for (const [address, credential] of Object.entries(parsed)) {
+    let normalized: string;
+    try {
+      normalized = getAddress(address).toLowerCase();
+    } catch {
+      throw new ConfigError(name + " contains an invalid wallet address.");
+    }
+    if (typeof credential !== "string" || credential.trim() === "") {
+      throw new ConfigError(name + " must map every wallet address to a non-empty token.");
+    }
+    if (Object.prototype.hasOwnProperty.call(tokens, normalized)) {
+      throw new ConfigError(name + " contains duplicate wallet addresses after normalization.");
+    }
+    tokens[normalized] = credential.trim();
+  }
+  return tokens;
 }
 
 /** A setting whose value the parser will not guess at. Fatal at startup. */
@@ -271,6 +299,7 @@ export function readDefaults(env: NodeJS.ProcessEnv = process.env): Defaults {
   const apiKey = env.OPENSEA_API_KEY?.trim();
   const scoped = env.OPENSEA_SCOPED_TOKEN?.trim();
   const walletToken = env.OPENSEA_WALLET_TOKEN?.trim();
+  const scopedTokens = addressTokenMapFrom("OPENSEA_SCOPED_TOKENS", env.OPENSEA_SCOPED_TOKENS);
   const token = env.TELEGRAM_BOT_TOKEN?.trim();
   return {
     chain: (env.CHAIN ?? "base").trim().toLowerCase(),
@@ -282,6 +311,7 @@ export function readDefaults(env: NodeJS.ProcessEnv = process.env): Defaults {
     openseaApiKey: apiKey && apiKey.length > 0 ? apiKey : null,
     openseaScopedToken: scoped && scoped.length > 0 ? scoped : null,
     openseaWalletToken: walletToken && walletToken.length > 0 ? walletToken : null,
+    openseaScopedTokens: scopedTokens,
     telegramToken: token && token.length > 0 ? token : null,
     telegramAllowedIds: idsFrom(env.TELEGRAM_ALLOWED_IDS),
     receiptTimeoutMs: Math.max(
@@ -347,41 +377,22 @@ RECEIPT_TIMEOUT_MS=90000
 # read everything from the chain and need no key at all.
 # OPENSEA_API_KEY=
 # The scoped token answers the wallet-scoped question: can THIS wallet mint THIS
-# stage, at what price, and up to what limit. That is answerable BEFORE the stage
-# opens, which is the whole reason it is worth configuring — without it intern
-# cannot tell you whether a wallet is on the list until the stage is already open
-# and the mint request either works or does not. Both OpenSea values are secrets:
-# keep this file mode 0600 and out of git.
+# stage, at what price, and up to what limit. Create a personal access token with
+# the read:eligibility scope. Create the PAT in OpenSea Settings -> Developer,
+# or use the official CLI's wallet login flow with --scopes read:eligibility.
+# Store the PAT here; intern exchanges it for a short-
+# lived wallet JWT in memory and refreshes it as needed.
 #
-# Create a personal access token in OpenSea developer settings with the
-# \`read:eligibility\` scope. Do not try to mint one with \`opensea login --scopes\`;
-# that path fails with "Requested scopes exceed account entitlement".
-#
-# intern never sends this token to an API as a credential. It POSTs it once to
-# /api/v2/auth/tokens/exchange and receives a short-lived wallet JWT, and the JWT
-# is what authorises the eligibility call. That JWT lives in memory only: it is
-# refreshed before it expires, re-minted from scratch after a restart, and never
-# written to disk. So this file holds the durable token and never the JWT — do
-# not paste a JWT in here, it would be stale within the hour.
+# For one wallet, use the legacy single-token setting:
 # OPENSEA_SCOPED_TOKEN=
-
-# A wallet access token already issued to your wallet, used instead of the
-# exchange above. Set this if the exchange is refused.
 #
-# As of 2026-09-28 OpenSea answers POST /api/v2/auth/tokens/exchange with
-# 403 "Token exchange is not available". That is not a problem with your token:
-# the endpoint answers identically for a nonsense token and for a request with no
-# API key at all, while an empty body still gets a 422 naming the missing field —
-# so it is reachable and simply refusing. OpenSea's own 401 on the eligibility
-# endpoint says where to get a token instead: "Get one by running \`opensea login\`
-# or through the OAuth 2.1 authorization-code flow with PKCE."
+# For several wallets, provide one PAT per wallet as a JSON object keyed by the
+# wallet address. Every token must belong to the corresponding wallet and carry
+# read:eligibility. This map takes precedence over the two single-wallet settings.
+# OPENSEA_SCOPED_TOKENS={"0x1111111111111111111111111111111111111111":"os_pat_REPLACE_ME","0x2222222222222222222222222222222222222222":"os_pat_REPLACE_ME"}
 #
-# This is the same credential the exchange would have returned, so everything
-# downstream is unchanged. It is short-lived — expect to replace it, and expect
-# intern to say plainly when it has expired rather than failing obscurely. Unset
-# it and the scoped-token exchange resumes with no other edit.
-#
-# A secret, like everything else in this section.
+# A wallet JWT already issued by OpenSea may be used for a single wallet instead
+# of a PAT. It is short-lived and must be replaced manually after expiry.
 # OPENSEA_WALLET_TOKEN=
 
 # ── Gated stages (allowlist / GTD / FCFS / team) ────────────────────────────

@@ -44,6 +44,7 @@ export interface WalletEligibility {
   /** Wallet-scoped terms returned by OpenSea for this exact stage. */
   stagePriceWei?: bigint | null;
   stageMaxMintable?: number | null;
+  stageMaxMintablePerToken?: number | null;
   /** Path A and C only: everything needed to build calldata right now. */
   proof?: string[];
   params?: MintParams;
@@ -229,7 +230,8 @@ export function openSeaEligibilityRows(
     // unstated limit is not a limit of zero, and an unstated price is not free.
     const terms = [
       row.price === null ? null : row.price === 0n ? "free" : `${row.price} wei`,
-      row.maxMintable === null ? null : `up to ${row.maxMintable}`,
+      row.maxMintable === null ? null : `wallet limit up to ${row.maxMintable}`,
+      row.maxMintablePerToken === null ? null : `per-token limit up to ${row.maxMintablePerToken}`,
     ].filter((t): t is string => t !== null);
     const detail =
       `OpenSea ${row.isEligible ? "confirms" : "refuses"} "${row.stageLabel}"` +
@@ -280,6 +282,7 @@ export function openSeaEligibilityRowsForStages(
           ? {
               stagePriceWei: stageResult.price,
               stageMaxMintable: stageResult.maxMintable,
+              stageMaxMintablePerToken: stageResult.maxMintablePerToken,
             }
           : {}),
       });

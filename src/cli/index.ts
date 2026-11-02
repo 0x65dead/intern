@@ -21,6 +21,7 @@ import {
   AmbiguousChainError,
   PrepareOptions,
   PreparedRun,
+  OpenSeaEligibilityAuth,
   closeRun,
   noDropMessage,
   prepareRun,
@@ -33,6 +34,7 @@ import { PRE_ARM_LEAD_MS } from "../core/race";
 import { waitForPublicStage, waitForScheduledStage } from "../core/watcher";
 import { DropStage, fetchDropSchedule, liveStage, nextStage } from "../core/opensea";
 import { OpenSeaAuthManager, authManagerFrom } from "../core/openseaauth";
+import type { EligibilitySnapshot } from "../core/openseaeligibility";
 import { EligibilityHint } from "../core/failures";
 import {
   hintForStage,
@@ -159,17 +161,28 @@ function stageCtx(
 }
 
 /**
- * The eligibility credential, built once per process.
+ * The eligibility credential(s), built once per command.
  *
- * Built once and shared rather than per call, because the manager's value is the
- * JWT it holds: a second manager means a second token exchange for the same
- * answer. Returns null when neither credential is configured, which is a
- * supported state — the stage table then reports eligibility as unknown, with
- * the reason, rather than claiming a verdict it has no way to obtain.
+ * One manager is shared for a single-wallet credential. With a per-wallet token
+ * map, one manager is created for each wallet and reused for preparation,
+ * refreshes, and the allowlist pre-arm lookup. Missing credentials leave that
+ * wallet unknown rather than borrowing another wallet's eligibility answer.
  */
 function eligibilityAuth(
   defaults: ReturnType<typeof readDefaults>,
-): OpenSeaAuthManager | null {
+): OpenSeaEligibilityAuth {
+  if (Object.keys(defaults.openseaScopedTokens).length > 0) {
+    const managers = new Map<string, OpenSeaAuthManager>();
+    for (const [address, scopedToken] of Object.entries(defaults.openseaScopedTokens)) {
+      const { manager } = authManagerFrom({
+        apiKey: defaults.openseaApiKey,
+        scopedToken,
+      });
+      if (manager) managers.set(address.toLowerCase(), manager);
+    }
+    return managers.size > 0 ? managers : null;
+  }
+
   const { manager } = authManagerFrom({
     apiKey: defaults.openseaApiKey,
     scopedToken: defaults.openseaScopedToken,
@@ -675,11 +688,8 @@ async function cmdAllowlist(
   // Built here, before the prepare, so the whole command shares one manager and
   // therefore one token exchange. The prepare uses it for the stage table and
   // `learnEligibility` reuses it at T-60s off the cached JWT.
-  const { manager: auth, reason: noAuth } = authManagerFrom({
-    apiKey,
-    scopedToken: defaults.openseaScopedToken,
-    walletToken: defaults.openseaWalletToken,
-  });
+  const auth = eligibilityAuth(defaults);
+  const noAuth = auth ? null : "OpenSea auth is incomplete: configure OPENSEA_API_KEY and a wallet-owned OPENSEA_SCOPED_TOKEN, OPENSEA_SCOPED_TOKENS entry, or OPENSEA_WALLET_TOKEN";
 
   const run = await prepareResolvingChain({
     target,
@@ -745,65 +755,108 @@ async function cmdAllowlist(
      * machinery. The scoped token is bound to a single wallet, so in a multi-wallet
      * run only that wallet gets an answer and the rest stay honestly unknown.
      */
+    const recordSnapshot = (
+      snapshot: EligibilitySnapshot,
+      selectedStage: DropStage | null,
+      walletSet: ReadonlySet<string>,
+    ): void => {
+      const verdict = hintForStage(snapshot, selectedStage, walletSet);
+      if (verdict.kind === "foreign") {
+        writeOut(warn(
+          `OpenSea eligibility token answers for ${shortAddress(verdict.wallet)}, not a wallet selected for this run. Eligibility left unknown.\n`,
+        ));
+        return;
+      }
+      if (verdict.kind === "ambiguous") {
+        writeOut(warn(
+          `OpenSea did not identify which of ${verdict.candidates} wallets the token belongs to; eligibility left unknown.\n`,
+        ));
+        return;
+      }
+      if (verdict.kind === "no-row") {
+        writeOut(info(
+          selectedStage?.uuid
+            ? `Eligibility has no row for "${selectedStage.label}" (${verdict.answered} stage(s) answered).\n`
+            : "This stage carries no OpenSea stage id, so eligibility cannot be joined to it.\n",
+        ));
+        return;
+      }
+
+      eligibility.set(verdict.wallet.toLowerCase(), verdict.hint);
+      const row = verdict.row;
+      const price = row.price === null ? "price unknown" : `${formatEth(row.price, run.chain.nativeSymbol)} each`;
+      const caps = [
+        row.maxMintable === null ? null : `wallet limit ${row.maxMintable}`,
+        row.maxMintablePerToken === null ? null : `per-token limit ${row.maxMintablePerToken}`,
+      ].filter((value): value is string => value !== null);
+      writeOut(
+        (row.isEligible ? ok : warn)(
+          `${shortAddress(verdict.wallet)} ${row.isEligible ? "is eligible" : "is NOT eligible"} for "${row.stageLabel}" (${row.stageType}) — ${price}, ${caps.join(", ") || "no stated limit"}.\n`,
+        ),
+      );
+      const terms = mintTerms(row, quantity);
+      if (terms && !terms.withinAllowance) {
+        writeOut(warn(`Requested ${quantity}, effective allowance is ${terms.allowance}. OpenSea will refuse.\n`));
+      }
+    };
+
     const learnEligibility = async (stage: DropStage | null): Promise<void> => {
       if (!auth) {
-        writeOut(info(`Eligibility not checked — ${noAuth}. A refusal at T-0 will not say why.\n`));
+        writeOut(info(`Eligibility not checked — ${noAuth ?? "OpenSea wallet credentials are missing"}. A refusal at T-0 will not say why.\n`));
         return;
       }
       try {
-        const { snapshot, failure } = await tryFetchWalletEligibility({
-          slug,
-          auth,
-          stages: schedule.stages,
-          ...(signal ? { signal } : {}),
-        });
-        if (!snapshot) {
-          writeOut(warn(`Eligibility unknown — ${failure?.message ?? "the check did not complete"}.\n`));
-          return;
-        }
-        // Who the answer is about is decided in core, where it is tested.
-        const verdict = hintForStage(snapshot, stage, loaded);
-        if (verdict.kind === "foreign") {
-          writeOut(
-            warn(
-              `OPENSEA_SCOPED_TOKEN answers for ${shortAddress(verdict.wallet)}, which is not a wallet loaded from .env. Eligibility left unknown.\n`,
-            ),
-          );
-          return;
-        }
-        if (verdict.kind === "ambiguous") {
-          writeOut(
-            warn(
-              `OpenSea did not name the wallet and ${verdict.candidates} are loaded, so the answer cannot be attributed to one. Eligibility left unknown.\n`,
-            ),
-          );
-          return;
-        }
-        if (verdict.kind === "no-row") {
-          writeOut(
-            info(
-              stage?.uuid
-                ? `Eligibility has no row for "${stage.label}" (${verdict.answered} stage(s) answered).\n`
-                : "This stage carries no OpenSea stage id, so eligibility cannot be joined to it.\n",
-            ),
-          );
+        if (auth instanceof OpenSeaAuthManager) {
+          const { snapshot, failure } = await tryFetchWalletEligibility({
+            slug,
+            auth,
+            stages: schedule.stages,
+            ...(signal ? { signal } : {}),
+          });
+          if (!snapshot) {
+            writeOut(warn(`Eligibility unknown — ${failure?.message ?? "the check did not complete"}.\n`));
+            return;
+          }
+          recordSnapshot(snapshot, stage, loaded);
           return;
         }
 
-        eligibility.set(verdict.wallet, verdict.hint);
-        const row = verdict.row;
-        const price =
-          row.price === null ? "price unknown" : `${formatEth(row.price, run.chain.nativeSymbol)} each`;
-        const cap = row.maxMintable === null ? "no stated limit" : `up to ${row.maxMintable}`;
-        writeOut(
-          (row.isEligible ? ok : warn)(
-            `${shortAddress(verdict.wallet)} ${row.isEligible ? "is eligible" : "is NOT eligible"} for "${row.stageLabel}" (${row.stageType}) — ${price}, ${cap}.\n`,
-          ),
+        // Every entry is a wallet-owned PAT. Query it only for that wallet and
+        // cross-check the response subject; a token for another account cannot
+        // generate a positive row for this key.
+        let nextWallet = 0;
+        const worker = async (): Promise<void> => {
+          for (;;) {
+            if (signal?.aborted) return;
+            const index = nextWallet++;
+            if (index >= wallets.length) return;
+            const wallet = wallets[index]!;
+            const manager = auth.get(wallet.address.toLowerCase());
+            if (!manager) {
+              writeOut(warn(
+                `W${wallet.index} ${shortAddress(wallet.address)} eligibility unknown — no OPENSEA_SCOPED_TOKENS entry.\n`,
+              ));
+              continue;
+            }
+            const { snapshot, failure } = await tryFetchWalletEligibility({
+              slug,
+              auth: manager,
+              stages: schedule.stages,
+              wallet: wallet.address,
+              ...(signal ? { signal } : {}),
+            });
+            if (!snapshot) {
+              writeOut(warn(
+                `W${wallet.index} ${shortAddress(wallet.address)} eligibility unknown — ${failure?.message ?? "the check did not complete"}.\n`,
+              ));
+              continue;
+            }
+            recordSnapshot(snapshot, stage, new Set([wallet.address.toLowerCase()]));
+          }
+        };
+        await Promise.all(
+          Array.from({ length: Math.min(3, wallets.length) }, () => worker()),
         );
-        const terms = mintTerms(row, quantity);
-        if (terms && !terms.withinAllowance) {
-          writeOut(warn(`Requested ${quantity}, allowance is ${terms.allowance}. OpenSea will refuse.\n`));
-        }
       } catch (err: unknown) {
         // Advisory work must not take the mint down with it.
         if (signal?.aborted) return;

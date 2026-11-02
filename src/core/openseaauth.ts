@@ -93,21 +93,12 @@ export interface OpenSeaAuthOptions {
   /**
    * A wallet access token already issued to this wallet, used as-is.
    *
-   * The exchange above is the intended route and stays the default. This exists
-   * because OpenSea currently answers that endpoint with
-   * `403 {"message": "Token exchange is not available"}` — identically for a
-   * valid token, a nonsense token, and no API key at all, which is what rules
-   * out the credentials being at fault. Its own 401 guidance on the eligibility
-   * endpoint points elsewhere: "Get one by running `opensea login` or through
-   * the OAuth 2.1 authorization-code flow with PKCE."
+   * The personal-access-token exchange is the preferred route because the
+   * manager can refresh its short-lived wallet JWT automatically. This direct
+   * JWT option remains for operators who already have a wallet token from the
+   * OpenSea CLI or OAuth flow and need a compatibility fallback.
    *
-   * So this is a second door to the same room, not a second architecture. The
-   * token it takes is the very thing the exchange would have returned, and every
-   * caller downstream is unchanged. When exchange comes back, unset this and the
-   * primary path resumes with no other edit.
-   *
-   * Short-lived, so it is read from the environment at start and held in memory
-   * like an exchanged one. It is registered as a secret on the same line.
+   * Like an exchanged JWT, it is registered as a secret and never logged.
    */
   walletToken?: string | null;
   now?: () => number;
@@ -357,20 +348,20 @@ export class OpenSeaAuthManager {
       this.exchanges += 1;
     } catch (err: unknown) {
       if (err instanceof OpenSeaError) {
-        // 401/403 here is a verdict on the scoped token itself. Retrying burns
-        // rate limit to be told the same thing, so the operator is told instead.
+        // Client-error responses are not retried: another exchange attempt
+        // cannot resolve missing scope, expired credentials, or integration policy.
+        // The specific opaque 403 is explained below without guessing which applies.
         const fatal = err.status === 401 || err.status === 403 || err.status === 400;
-        // A 403 saying the exchange is unavailable is not a verdict on the token.
-        // Reporting it as one sends the operator off to regenerate a credential
-        // that was never the problem — the same wasted afternoon this file's
-        // header describes for the `token` / `subjectToken` mix-up, arrived at
-        // from the other direction.
+        // OpenSea deliberately uses the same opaque 403 for several credential
+        // and integration states. Do not claim the endpoint is globally disabled
+        // or that the token is definitely valid/invalid: this response cannot tell.
         const unavailable = /token exchange is not available/i.test(err.message);
         const detail = unavailable
-          ? "OpenSea has disabled the token exchange endpoint (403 \"Token exchange is not " +
-            "available\"). This is not a problem with OPENSEA_SCOPED_TOKEN — the endpoint " +
-            "answers the same way with no credentials at all. Supply OPENSEA_WALLET_TOKEN " +
-            "with a wallet access token carrying the read:eligibility scope instead."
+          ? "OpenSea returned its opaque 403 \"Token exchange is not available\" response. " +
+            "That response does not distinguish a revoked/rotated token, missing " +
+            "read:eligibility scope, or an integration entitlement/state issue. " +
+            "Verify the PAT belongs to this wallet, is current, and has read:eligibility; " +
+            "then check the OpenSea developer integration if it still fails."
           : fatal
             ? "OpenSea rejected the scoped token. Check OPENSEA_SCOPED_TOKEN is current " +
               "and carries the read:eligibility scope."

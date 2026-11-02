@@ -174,6 +174,20 @@ describe("classifyOpenSeaFailure — the ambiguous 422", () => {
     assert.match(failure.message, /2 of 2/);
   });
 
+  it("uses the per-token allowance when it is lower than the wallet-wide allowance", () => {
+    const failure = classifyOpenSeaFailure(err(422), {
+      endpoint: "mint",
+      eligibility: {
+        isEligible: true,
+        maxMintable: 5,
+        maxMintablePerToken: 1,
+        mintedSoFar: 1,
+      },
+    });
+    assert.equal(failure.code, "MINT_LIMIT_REACHED");
+    assert.match(failure.message, /1 of 1/);
+  });
+
   it("narrows to two causes when the wallet is eligible with allowance left", () => {
     const failure = classifyOpenSeaFailure(err(422), {
       endpoint: "mint",

@@ -254,6 +254,55 @@ describe("ALLOWLIST_SOURCE", () => {
   });
 });
 
+
+describe("OPENSEA_SCOPED_TOKENS", () => {
+  const walletA = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const walletB = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+  it("defaults to an empty map and normalizes wallet addresses", () => {
+    assert.deepEqual(readDefaults(BASE).openseaScopedTokens, {});
+    assert.deepEqual(
+      readDefaults({
+        OPENSEA_SCOPED_TOKENS: JSON.stringify({
+          [walletA]: " pat-wallet-a ",
+          [walletB.toUpperCase().replace("0X", "0x")]: "pat-wallet-b",
+        }),
+      }).openseaScopedTokens,
+      {
+        [walletA]: "pat-wallet-a",
+        [walletB]: "pat-wallet-b",
+      },
+    );
+  });
+
+  it("rejects malformed JSON and non-object values", () => {
+    for (const value of ["{bad", "[]", "null", '"token"', "true"]) {
+      assert.throws(
+        () => readDefaults({ OPENSEA_SCOPED_TOKENS: value }),
+        (err: unknown) => err instanceof ConfigError && /OPENSEA_SCOPED_TOKENS/.test(err.message),
+        value,
+      );
+    }
+  });
+
+  it("rejects invalid addresses, blank tokens and normalized duplicates", () => {
+    const cases = [
+      JSON.stringify({ "not-an-address": "pat" }),
+      JSON.stringify({ [walletA]: " " }),
+      JSON.stringify({
+        [walletA]: "pat-lower",
+        [walletA.toUpperCase().replace("0X", "0x")]: "pat-upper",
+      }),
+    ];
+    for (const value of cases) {
+      assert.throws(
+        () => readDefaults({ OPENSEA_SCOPED_TOKENS: value }),
+        (err: unknown) => err instanceof ConfigError && /OPENSEA_SCOPED_TOKENS/.test(err.message),
+      );
+    }
+  });
+});
+
 describe(".env.example documents what the parser actually reads", () => {
   // The failure this prevents: a setting is added to readDefaults, the template is
   // not updated, and an operator copying .env.example never learns the flag exists.
@@ -321,6 +370,7 @@ describe(".env.example documents what the parser actually reads", () => {
       "PRIVATE_KEYS",
       "OPENSEA_API_KEY",
       "OPENSEA_SCOPED_TOKEN",
+      "OPENSEA_SCOPED_TOKENS",
       "TELEGRAM_BOT_TOKEN",
       "TELEGRAM_ALLOWED_IDS",
     ]) {
