@@ -530,8 +530,8 @@ describe("authManagerFrom", () => {
     });
     assert.deepEqual(authManagerFrom({ apiKey: API_KEY, scopedToken: null }), {
       manager: null,
-      // Both are named. Telling an operator to set OPENSEA_SCOPED_TOKEN and
-      // nothing else sends them to the one route OpenSea is currently refusing.
+      // Either a renewable scoped PAT or a current wallet JWT can authorize
+      // the wallet-scoped eligibility request.
       reason: "neither OPENSEA_SCOPED_TOKEN nor OPENSEA_WALLET_TOKEN is set",
     });
     assert.equal(
@@ -553,16 +553,11 @@ describe("authManagerFrom", () => {
 });
 
 describe("a wallet token supplied directly", () => {
-  // OpenSea answers POST /auth/tokens/exchange with 403 "Token exchange is not
-  // available" — verified 2026-09-28 against the live API, and verified to be
-  // unrelated to our credentials: the same 403 comes back for a nonsense subject
-  // token and for a request carrying no API key at all, while an empty body
-  // still gets a 422 naming the missing field, so the route is reachable and
-  // simply refusing. OpenSea's own 401 on the eligibility endpoint says to get
-  // the token from `opensea login` or an OAuth 2.1 PKCE flow instead.
-  //
-  // So the manager takes one directly. The contract downstream is unchanged: the
-  // same WalletToken, the same expiry handling, the same refusal to log it.
+  // A directly supplied wallet JWT remains a compatibility option. The
+  // preferred route is a scoped PAT exchanged for a short-lived JWT, which the
+  // manager can refresh automatically. OpenSea documents the exchange endpoint
+  // but deliberately makes its 403 response opaque, so callers must not infer
+  // endpoint-wide unavailability from that status alone.
 
   const WT_EXP = Math.floor((NOW + 10 * 60_000) / 1000);
   const supplied = (exp: number | null): string =>
@@ -633,16 +628,18 @@ describe("a wallet token supplied directly", () => {
     assert.doesNotMatch(redactKeys(`bearer ${wt} sent`), new RegExp(wt.slice(0, 24)));
   });
 
-  it("blames the endpoint, not the token, when the exchange is unavailable", async () => {
+  it("reports the exchange 403 as opaque without guessing the endpoint or PAT state", async () => {
     stubFetch([{ status: 403, json: { error: { message: "Token exchange is not available" } } }]);
-    const auth = manager();
-    const err = await auth.token().then(() => null, (e: unknown) => e as OpenSeaAuthError);
+    const err = await manager().token().then(
+      () => null,
+      (e: unknown) => e as OpenSeaAuthError,
+    );
     assert.ok(err instanceof OpenSeaAuthError);
-    // The old message told the operator to check OPENSEA_SCOPED_TOKEN's scope,
-    // which is a wild goose chase: the endpoint refuses with no credentials too.
-    assert.match(err.message, /disabled the token exchange/i);
-    assert.match(err.message, /OPENSEA_WALLET_TOKEN/);
-    assert.doesNotMatch(err.message, /Check OPENSEA_SCOPED_TOKEN is current/);
+    assert.match(err.message, /opaque 403/i);
+    assert.match(err.message, /verify the PAT belongs to this wallet/i);
+    assert.match(err.message, /read:eligibility/i);
+    assert.match(err.message, /developer integration/i);
+    assert.doesNotMatch(err.message, /disabled the token exchange endpoint/i);
   });
 });
 

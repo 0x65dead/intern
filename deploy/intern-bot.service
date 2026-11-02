@@ -17,7 +17,7 @@
 
 [Unit]
 Description=intern — OpenSea SeaDrop mint bot (Telegram)
-Documentation=https://github.com/your/intern
+Documentation=https://github.com/0x65dead/intern
 # Telegram and the RPC endpoints are both remote, so there is no point starting
 # before the network is actually usable.
 After=network-online.target

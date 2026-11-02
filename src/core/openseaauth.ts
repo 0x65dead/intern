@@ -483,9 +483,8 @@ export function authManagerFrom(opts: {
   }
   const wallet = opts.walletToken?.trim() ?? "";
   const scoped = opts.scopedToken?.trim() ?? "";
-  // Either credential is enough. Naming both in the reason matters because the
-  // exchange route is currently refused by OpenSea, and an operator told only to
-  // set OPENSEA_SCOPED_TOKEN would set it and still get nothing.
+  // Either credential is enough. The scoped PAT is the preferred renewable
+  // route; a supplied wallet JWT is a short-lived compatibility fallback.
   if (wallet === "" && scoped === "") {
     return {
       manager: null,
