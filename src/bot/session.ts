@@ -1695,8 +1695,8 @@ export class SessionManager {
     const quantity = session.draft.quantity ?? this.opts.defaults.quantity;
     const selectedGatedStage =
       this.opts.defaults.allowlistMinting && this.opts.defaults.openseaApiKey
-        ? this.nextEligibleGatedStage(run, quantity)
-        : null;
+        ? (this.nextEligibleGatedStage(run, quantity) ?? undefined)
+        : undefined;
     // The public SeaDrop price is not the selected gated-stage quote. Do not
     // print a misleading public-price underfunding warning on an FCFS preflight;
     // the signed-stage engine checks the actual quote and balance before send.
