@@ -156,7 +156,11 @@ export interface EngineOptions {
   /** What the operator called this drop, for the journal. */
   target?: string;
   /** Persist derived hashes before any endpoint receives signed bytes. */
-  onBeforeBroadcast?: (transactions: readonly { walletIndex: number; txHash: string }[]) => Promise<void>;
+  onBeforeBroadcast?: (transactions: readonly {
+    walletIndex: number;
+    txHash: string;
+    replacedTxHash?: string;
+  }[]) => Promise<void>;
 }
 
 export interface EngineResult {
@@ -770,6 +774,7 @@ export async function runMint(
               await opts.onBeforeBroadcast?.([{
                 walletIndex: replacement.walletIndex,
                 txHash: replacement.txHash,
+                replacedTxHash: replacement.replacedTxHash,
               }]);
               emit({
                 type: "tx",
