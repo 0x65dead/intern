@@ -18,7 +18,7 @@
 import fs from "fs";
 import path from "path";
 import dotenv from "dotenv";
-import { getAddress, parseEther } from "ethers";
+import { getAddress, parseEther, parseUnits } from "ethers";
 
 export function loadEnv(cwd: string = process.cwd()): void {
   const envPath = path.resolve(cwd, ".env");
@@ -31,6 +31,10 @@ export interface Defaults {
   gasLimit: bigint;
   maxFeeGwei: number | null;
   priorityGwei: number | null;
+  /** Absolute EIP-1559 maxFeePerGas ceiling for automatic replacements. null disables RBF. */
+  maxGasCeilingWei: bigint | null;
+  /** Maximum number of fee replacements per wallet; 0 disables replacements. */
+  rbfMaxAttempts: number;
   leadMs: number;
   openseaApiKey: string | null;
   /**
@@ -254,6 +258,30 @@ function heartbeatMinutesFrom(raw: string | undefined): number {
   return Math.max(1, value);
 }
 
+function weiFromGwei(name: string, raw: string | undefined): bigint | null {
+  if (raw === undefined || raw.trim() === "") return null;
+  const text = raw.trim();
+  if (!/^\d+(\.\d{1,9})?$/.test(text)) {
+    throw new ConfigError(`${name} must be plain gwei with at most 9 decimal places.`);
+  }
+  try {
+    const value = parseUnits(text, 9);
+    if (value <= 0n) throw new Error("must be positive");
+    return value;
+  } catch {
+    throw new ConfigError(`${name} must be a positive gwei amount representable in wei.`);
+  }
+}
+
+function rbfAttemptsFrom(raw: string | undefined): number {
+  if (raw === undefined || raw.trim() === "") return 1;
+  const value = Number(raw.trim());
+  if (!Number.isInteger(value) || value < 0 || value > 3) {
+    throw new ConfigError("RBF_MAX_ATTEMPTS must be an integer from 0 to 3.");
+  }
+  return value;
+}
+
 /** A Telegram chat id, which may legitimately be negative for a group. */
 function chatIdFrom(raw: string | undefined): number | null {
   if (raw === undefined || raw.trim() === "") return null;
@@ -307,6 +335,8 @@ export function readDefaults(env: NodeJS.ProcessEnv = process.env): Defaults {
     gasLimit: bigintFrom(env.GAS_LIMIT, 250_000n),
     maxFeeGwei: numberFrom(env.MAX_FEE_PER_GAS, null),
     priorityGwei: numberFrom(env.MAX_PRIORITY_FEE, null),
+    maxGasCeilingWei: weiFromGwei("MAX_GAS_CEILING_GWEI", env.MAX_GAS_CEILING_GWEI),
+    rbfMaxAttempts: rbfAttemptsFrom(env.RBF_MAX_ATTEMPTS),
     leadMs: Math.max(0, Math.floor(numberFrom(env.LEAD_MS, 0) ?? 0)),
     openseaApiKey: apiKey && apiKey.length > 0 ? apiKey : null,
     openseaScopedToken: scoped && scoped.length > 0 ? scoped : null,
@@ -363,6 +393,12 @@ GAS_LIMIT=250000
 # usually what you want — a ceiling is a maximum, not a payment.
 # MAX_FEE_PER_GAS=
 # MAX_PRIORITY_FEE=
+#
+# Automatic replacement transactions (RBF) are disabled unless this separate,
+# absolute maxFeePerGas ceiling is explicitly set. After 45s pending, Intern may
+# bump both EIP-1559 fee fields by 12.5%, never beyond this ceiling.
+# MAX_GAS_CEILING_GWEI=
+# RBF_MAX_ATTEMPTS=1
 
 # Fire this many ms before the stage opens. 0 (default) fires at T-0. A non-zero
 # value risks reverting with NotActive; only set it if you know the chain's
