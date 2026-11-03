@@ -2097,6 +2097,7 @@ export class SessionManager {
     quantity: number,
     controller: AbortController,
     ctx: TaskContext,
+    persistentTaskId?: string,
   ): Promise<void> {
     const chatId = session.chatId;
     const run = session.draft.run;
@@ -2152,6 +2153,14 @@ export class SessionManager {
     );
 
     const reporter = createTelegramReporter(this.opts.client, chatId, run.chain, () => this.clock.now());
+    const taskManager = this.opts.taskManager;
+    if (persistentTaskId && taskManager) {
+      try {
+        await taskManager.transition(persistentTaskId, "EXECUTING", "Execution started; fresh chain and wallet checks are running");
+      } catch (error) {
+        throw new Error(`Could not persist task execution state: ${redactKeys(error instanceof Error ? error.message : String(error))}`);
+      }
+    }
 
     // The task record's phase, tapped off the same events the panel renders rather
     // than guessed at from where the code has got to. Two things depend on it: an
@@ -2189,7 +2198,7 @@ export class SessionManager {
               {
                 chain: run.chain,
                 plan: run.plan,
-                wallets: this.opts.wallets,
+                wallets,
                 readUrls: run.rpc.plan.read,
                 blastUrls: run.rpc.plan.blast,
                 gas: run.gas,
@@ -2275,6 +2284,7 @@ export class SessionManager {
     dryRun: boolean,
     signal: AbortSignal,
     emit: (event: EngineEvent) => void,
+    persistentTaskId?: string,
   ) {
     const slug = run.slug;
     const apiKey = this.opts.defaults.openseaApiKey;
@@ -2316,7 +2326,7 @@ export class SessionManager {
     // changed or become unknown; never turn a stale green tick into a signature.
     const eligibility = new Map<string, EligibilityHint>();
     const verifySelectedWallets = (source: PreparedRun): LoadedWallet[] => {
-      const confirmed = this.eligibleWalletsForStage(source, stageUuid, quantity);
+      const confirmed = this.eligibleWalletsForStage(source, stageUuid, quantity, wallets);
       const confirmedSet = new Set(confirmed.map((wallet) => wallet.address.toLowerCase()));
       const changed = wallets.filter((wallet) => !confirmedSet.has(wallet.address.toLowerCase()));
       if (changed.length > 0) {
@@ -2452,6 +2462,16 @@ export class SessionManager {
         dryRun,
         driftLimitMs:
           this.opts.defaults.clockDriftLimitMs ?? DEFAULT_BOT_DRIFT_LIMIT_MS,
+        beforeBroadcast: persistentTaskId && this.opts.taskManager
+          ? async (transactions) => {
+              await this.opts.taskManager!.recordTxHashes(persistentTaskId, transactions);
+              await this.opts.taskManager!.transition(
+                persistentTaskId,
+                "EXECUTING",
+                "OpenSea-signed transaction hashes were durably recorded before broadcast",
+              );
+            }
+          : undefined,
       },
       emit,
     );
