@@ -77,10 +77,20 @@ export class RecoveryEngine {
       return;
     }
 
-    if (task.status === "EXECUTING") {
-      const hashes = Object.entries(task.txHashes).flatMap(([wallet, values]) =>
-        values.map((hash) => ({ walletIndex: Number(wallet), hash })),
-      );
+    const hashes = Object.entries(task.txHashes).flatMap(([wallet, values]) =>
+      values.map((hash) => ({ walletIndex: Number(wallet), hash })),
+    );
+
+    // A hash is the irreversible boundary, even if the crash happened before
+    // the EXECUTING status flush. Never treat a hash-bearing ARMED task as unsent.
+    if (task.status === "EXECUTING" || hashes.length > 0) {
+      if (task.status !== "EXECUTING") {
+        await this.options.taskManager.transition(
+          task.id,
+          "EXECUTING",
+          "Recovered a persisted transaction hash before broadcast-state flush",
+        );
+      }
       if (hashes.length === 0) {
         const canRearm = this.options.revalidateUnbroadcast
           ? await this.options.revalidateUnbroadcast(task)
