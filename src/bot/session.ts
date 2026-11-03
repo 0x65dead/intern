@@ -2653,6 +2653,7 @@ export class SessionManager {
     this.stopAuto(session);
     session.view = "wallets";
     const wallets = this.opts.wallets;
+    const selected = new Set(session.selectedWalletIndexes);
 
     if (wallets.length === 0) {
       await this.paint(
@@ -2663,12 +2664,50 @@ export class SessionManager {
       return;
     }
 
-    const lines = [bold(`👛 ${wallets.length} wallet(s)`), ""];
-    for (const wallet of wallets) lines.push(`W${wallet.index} ${code(wallet.address)}`);
+    const pageSize = 8;
+    const pageCount = Math.max(1, Math.ceil(wallets.length / pageSize));
+    session.walletPage = Math.max(0, Math.min(session.walletPage, pageCount - 1));
+    const pageWallets = wallets.slice(session.walletPage * pageSize, (session.walletPage + 1) * pageSize);
+    const lines = [
+      bold(`👛 Wallet selection · ${selected.size}/${wallets.length} selected`),
+      esc(`Page ${session.walletPage + 1} of ${pageCount} · Tap a wallet to include or exclude it from the next mint.`),
+      "",
+    ];
+    const buttons: InlineButton[][] = [];
+    for (const wallet of pageWallets) {
+      const active = selected.has(wallet.index);
+      lines.push(`${active ? "✅" : "⬜"} W${wallet.index} ${code(shortAddress(wallet.address))}`);
+      buttons.push([{
+        text: `${active ? "✅" : "⬜"} W${wallet.index} · ${shortAddress(wallet.address)}`,
+        callback_data: encodeCallback("wallet_toggle", String(wallet.index)),
+      }]);
+    }
     lines.push("");
-    lines.push(esc("Balances are checked against the real required amount during a mint,"));
-    lines.push(esc("per chain — value plus the full gas ceiling, which is what a node reserves."));
-    await this.paint(session, lines.join("\n"), BACK_ONLY);
+    lines.push(esc("Minting still checks exact price + gas funding per wallet before signing."));
+    lines.push(esc("Wallet keys remain local; this panel never accepts private keys."));
+
+    buttons.push([
+      { text: "✅ Select all", callback_data: encodeCallback("wallet_all") },
+      { text: "⬜ Select none", callback_data: encodeCallback("wallet_none") },
+    ]);
+    if (pageCount > 1) {
+      const navigation: InlineButton[] = [];
+      if (session.walletPage > 0) {
+        navigation.push({
+          text: "← Previous",
+          callback_data: encodeCallback("wallet_page", String(session.walletPage - 1)),
+        });
+      }
+      if (session.walletPage + 1 < pageCount) {
+        navigation.push({
+          text: "Next →",
+          callback_data: encodeCallback("wallet_page", String(session.walletPage + 1)),
+        });
+      }
+      if (navigation.length > 0) buttons.push(navigation);
+    }
+    buttons.push([{ text: "← Menu", callback_data: encodeCallback("menu") }]);
+    await this.paint(session, lines.join("\n"), buttons);
   }
 
   private async showStatus(session: Session): Promise<void> {
