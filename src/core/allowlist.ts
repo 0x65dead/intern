@@ -107,6 +107,8 @@ export interface AllowlistOptions {
   dryRun?: boolean;
   /** Refuse to fire when clock uncertainty exceeds this bound. */
   driftLimitMs?: number;
+  /** Persist derived hashes before any endpoint receives signed bytes. */
+  beforeBroadcast?: (transactions: readonly { walletIndex: number; txHash: string }[]) => Promise<void>;
 }
 
 interface BuiltTx {
@@ -429,9 +431,17 @@ export async function runAllowlistMint(
       };
     }
 
+    // Journal every locally-derived hash before the signed bytes leave this process.
+    const prepared = affordable.map((bundle) => ({ ...bundle, prepared: prepare(bundle.raw) }));
+    if (opts.beforeBroadcast) {
+      await opts.beforeBroadcast(
+        prepared.map(({ wallet, prepared: tx }) => ({ walletIndex: wallet.index, txHash: tx.txHash })),
+      );
+    }
+
     // Dispatch.
     const dispatchStart = performance.now();
-    const fired = affordable.map((b) => ({ wallet: b.wallet, handle: blast(prepare(b.raw), endpoints) }));
+    const fired = prepared.map((bundle) => ({ wallet: bundle.wallet, handle: blast(bundle.prepared, endpoints) }));
     const dispatchMs = performance.now() - dispatchStart;
 
     emit({ type: "fired", count: fired.length, dispatchMs, timingErrorMs: 0 });
