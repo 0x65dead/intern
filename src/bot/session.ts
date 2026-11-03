@@ -2092,7 +2092,7 @@ export class SessionManager {
               {
                 chain: run.chain,
                 plan: run.plan,
-                wallets,
+                wallets: this.opts.wallets,
                 readUrls: run.rpc.plan.read,
                 blastUrls: run.rpc.plan.blast,
                 gas: run.gas,
