@@ -2627,6 +2627,22 @@ export class SessionManager {
           config: { taskId: stored.id, quantity, chatId },
         });
       } catch (error) {
+        if (persistedWatchId && this.opts.taskManager) {
+          try {
+            const saved = this.opts.taskManager.getTask(persistedWatchId);
+            if (saved && saved.status !== "COMPLETED" && saved.status !== "FAILED" && saved.status !== "CANCELLED") {
+              await this.opts.taskManager.transition(
+                persistedWatchId,
+                "FAILED",
+                "Watchlist persistence failed before the watcher started",
+              );
+            }
+          } catch (persistError) {
+            writeErr(
+              `watch task ${persistedWatchId} setup rollback failed: ${redactKeys(persistError instanceof Error ? persistError.message : String(persistError))}\n`,
+            );
+          }
+        }
         const reason = redactKeys(error instanceof Error ? error.message : String(error));
         await this.say(chatId, `${bold("Watch not started")}\n${esc("The persistent watchlist could not be saved.")}\n${esc(reason)}`);
         return;
