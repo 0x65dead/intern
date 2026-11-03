@@ -47,6 +47,10 @@ export const PANEL_ACTIONS = [
   "watch",
   "stages",
   "wallets",
+  "wallet_toggle",
+  "wallet_page",
+  "wallet_all",
+  "wallet_none",
   "status",
   "cancel",
   // Stops the watch and nothing else. Separate from "cancel", which is global
