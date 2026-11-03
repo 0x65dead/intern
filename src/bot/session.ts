@@ -1839,12 +1839,12 @@ export class SessionManager {
    * The promise is kept so shutdown can wait for the run to unwind rather than
    * cutting it off mid-flight.
    */
-  private launch(
+  private async launch(
     session: Session,
     mode: "stage" | "now" | { atMs: number },
     dryRun = false,
     gatedStageUuid?: string,
-  ): void {
+  ): Promise<void> {
     // Nothing prepared means nothing to lock. Checked before submitting rather
     // than inside the task, because a task that exists only to report "nothing is
     // prepared" would still hold this run's wallets while it said so.
@@ -1879,9 +1879,11 @@ export class SessionManager {
     // Gated runs lock only wallets whose explicit eligibility result matches this
     // exact stage UUID and requested quantity. Public runs keep their existing
     // all-wallet behaviour.
+    const selectedIndexes = new Set(session.selectedWalletIndexes);
+    const selectedWallets = this.opts.wallets.filter((wallet) => selectedIndexes.has(wallet.index));
     const wallets = gatedStageUuid
-      ? this.eligibleWalletsForStage(prepared, gatedStageUuid, quantity)
-      : this.opts.wallets;
+      ? this.eligibleWalletsForStage(prepared, gatedStageUuid, quantity, selectedWallets)
+      : selectedWallets;
     if (gatedStageUuid && !dryRun) {
       const funding = splitByVerifiedFunding(wallets, session.draft.balances ?? []);
       if (funding.blocked.length > 0) {
@@ -1917,6 +1919,57 @@ export class SessionManager {
       return;
     }
     const indexes = wallets.map((wallet) => wallet.index);
+    const targetTime = gatedStageUuid
+      ? prepared.stages.rows.find((row) => row.stageUuid === gatedStageUuid)?.startMs ?? null
+      : resolveFireTime(prepared.plan, mode, this.opts.defaults.leadMs).fireAtMs;
+    const stageLabel = gatedStageUuid
+      ? prepared.stages.rows.find((row) => row.stageUuid === gatedStageUuid)?.label ?? "gated"
+      : "Public";
+    let persistentTaskId: string | undefined;
+    if (!dryRun && this.opts.taskManager) {
+      try {
+        const stored = await this.opts.taskManager.createTask({
+          type: "SNIPE",
+          status: "ARMED",
+          targetTime,
+          collection: prepared.contract,
+          stage: stageLabel,
+          wallets: indexes,
+          config: {
+            chain: prepared.chain.key,
+            contract: prepared.contract,
+            quantity,
+            chatId: session.chatId,
+            mode: typeof mode === "object" ? "at" : mode,
+            atMs: typeof mode === "object" ? mode.atMs : null,
+            gatedStageUuid: gatedStageUuid ?? "",
+            leadMs: this.opts.defaults.leadMs,
+          },
+        });
+        persistentTaskId = stored.id;
+      } catch (error) {
+        const reason = redactKeys(error instanceof Error ? error.message : String(error));
+        await this.paint(
+          session,
+          `${bold("Task was not armed")}\n${esc("Persistent task storage failed. No transaction was signed or broadcast.")}\n${esc(reason)}`,
+          BACK_ONLY,
+        );
+        return;
+      }
+    }
+
+    const lateRefusal = fireRefusal(
+      this.scheduler.walletHolders(indexes),
+      (taskId) => this.taskChat.get(taskId),
+      session.chatId,
+    );
+    if (lateRefusal !== null) {
+      if (persistentTaskId && this.opts.taskManager) {
+        await this.opts.taskManager.transition(persistentTaskId, "FAILED", "Wallet lock was acquired by another task before execution");
+      }
+      await this.paint(session, [bold(lateRefusal.title), "", esc(lateRefusal.body)].join("\n"), MAIN_MENU);
+      return;
+    }
 
     // Asked and claimed in one tick. `submit` locks synchronously — submit, pump,
     // start and lock all run before it returns — so as long as nothing is awaited
@@ -1942,7 +1995,7 @@ export class SessionManager {
       chain: prepared.chain.key,
       walletIndexes: indexes,
       run: async (ctx) => {
-        await this.fire(session, mode, dryRun, wallets, gatedStageUuid, quantity, task.controller, ctx);
+        await this.fire(session, mode, dryRun, wallets, gatedStageUuid, quantity, task.controller, ctx, persistentTaskId);
       },
     });
     this.taskChat.set(task.id, session.chatId);
