@@ -32,6 +32,7 @@ import { EngineEvent, EngineResult } from "./engine";
 import { ClockSync, driftGuard, syncClock } from "./clock";
 import {
   Endpoint,
+  PreparedTx,
   blast,
   classifyRejection,
   prepare,
@@ -112,7 +113,11 @@ export interface AllowlistOptions {
   /** Refuse to fire when clock uncertainty exceeds this bound. */
   driftLimitMs?: number;
   /** Persist derived hashes before any endpoint receives signed bytes. */
-  beforeBroadcast?: (transactions: readonly { walletIndex: number; txHash: string }[]) => Promise<void>;
+  beforeBroadcast?: (transactions: readonly {
+    walletIndex: number;
+    txHash: string;
+    replacedTxHash?: string;
+  }[]) => Promise<void>;
 }
 
 interface BuiltTx {
@@ -513,6 +518,7 @@ export async function runAllowlistMint(
                 await opts.beforeBroadcast?.([{
                   walletIndex: replacement.walletIndex,
                   txHash: replacement.txHash,
+                  replacedTxHash: replacement.replacedTxHash,
                 }]);
                 emit({
                   type: "tx",
