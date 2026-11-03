@@ -42,6 +42,7 @@
 import { explorerAddress } from "../core/chains";
 import { CorrectedClock } from "../core/clock";
 import { TaskContext, TaskScheduler, phaseForEvent } from "../core/tasks";
+import { TaskManager } from "../state/TaskManager";
 import { orderCandidates } from "../core/detect";
 import { EngineEvent, resolveFireTime, runMint } from "../core/engine";
 import { PreArmed, preArmAllowlist, runAllowlistMint } from "../core/allowlist";
@@ -215,6 +216,9 @@ interface Session {
    * so the chat filled with duplicate panels.
    */
   paintQueue: PaintQueue<{ text: string; buttons: InlineButton[][] }>;
+  /** Wallet selection belongs to a chat session, never to the loaded keyring. */
+  selectedWalletIndexes: number[];
+  walletPage: number;
   /** Row statuses at the last render, to notice a stage transition. */
   stageSignature?: string;
   /** Consecutive auto-refresh failures, reset by the first success. */
@@ -236,6 +240,8 @@ export interface SessionManagerOptions {
   allowedIds: number[];
   /** Corrected clock. All countdowns and footers read from this, never Date.now(). */
   clock?: CorrectedClock;
+  /** Durable, non-secret task/watch registry. */
+  taskManager?: TaskManager;
 }
 
 export const BOT_COMMANDS = [
@@ -663,6 +669,7 @@ export class SessionManager {
     run: PreparedRun,
     stageUuid: string,
     quantity: number,
+    walletPool: readonly LoadedWallet[] = this.opts.wallets,
   ): LoadedWallet[] {
     const stageResults = run.eligibility.results.filter(
       (result) =>
@@ -671,7 +678,7 @@ export class SessionManager {
         result.state === "eligible",
     );
 
-    return this.opts.wallets.filter((wallet) => {
+    return walletPool.filter((wallet) => {
       const result = stageResults.find(
         (candidate) => candidate.address.toLowerCase() === wallet.address.toLowerCase(),
       );
@@ -814,6 +821,8 @@ export class SessionManager {
         gate: new EditGate(),
         write: newWriteGate(),
         paintQueue: { chain: Promise.resolve() },
+        selectedWalletIndexes: this.opts.wallets.map((wallet) => wallet.index),
+        walletPage: 0,
       };
       this.sessions.set(chatId, session);
     }
@@ -1017,7 +1026,7 @@ export class SessionManager {
       case "awaitTime": {
         try {
           const atMs = parseTimeInput(text, this.now());
-          this.launch(session, { atMs });
+          await this.launch(session, { atMs });
         } catch (err: unknown) {
           await this.paint(
             session,
@@ -1126,6 +1135,41 @@ export class SessionManager {
       case "wallets":
         await this.showWallets(session);
         return;
+      case "wallet_toggle": {
+        const walletIndex = Number(value);
+        const wallet = this.opts.wallets.find((candidate) => candidate.index === walletIndex);
+        if (!Number.isInteger(walletIndex) || !wallet) {
+          await this.ackCallback(session, queryId, "That wallet selection is stale.", true);
+          return;
+        }
+        const selected = new Set(session.selectedWalletIndexes);
+        if (selected.has(walletIndex)) selected.delete(walletIndex);
+        else selected.add(walletIndex);
+        session.selectedWalletIndexes = [...selected].sort((a, b) => a - b);
+        await this.showWallets(session);
+        return;
+      }
+      case "wallet_page": {
+        const page = Number(value);
+        const pageCount = Math.max(1, Math.ceil(this.opts.wallets.length / 8));
+        if (!Number.isInteger(page) || page < 0 || page >= pageCount) {
+          await this.ackCallback(session, queryId, "That wallet page is no longer available.", true);
+          return;
+        }
+        session.walletPage = page;
+        await this.showWallets(session);
+        return;
+      }
+      case "wallet_all":
+        session.selectedWalletIndexes = this.opts.wallets.map((wallet) => wallet.index);
+        session.walletPage = 0;
+        await this.showWallets(session);
+        return;
+      case "wallet_none":
+        session.selectedWalletIndexes = [];
+        session.walletPage = 0;
+        await this.showWallets(session);
+        return;
       case "status":
         await this.showStatus(session);
         return;
@@ -1151,7 +1195,7 @@ export class SessionManager {
         return;
       }
       case "send":
-        this.launch(session, "stage");
+        await this.launch(session, "stage");
         return;
       case "gated":
         if (!session.draft.gatedStageUuid) {
@@ -1162,7 +1206,7 @@ export class SessionManager {
           await this.ackCallback(session, queryId, "That stage button is stale. Refresh the confirmation and choose again.", true);
           return;
         }
-        this.launch(session, "stage", false, session.draft.gatedStageUuid);
+        await this.launch(session, "stage", false, session.draft.gatedStageUuid);
         return;
       case "gateddryrun":
         if (!session.draft.gatedStageUuid) {
@@ -1173,10 +1217,10 @@ export class SessionManager {
           await this.ackCallback(session, queryId, "That stage button is stale. Refresh the confirmation and choose again.", true);
           return;
         }
-        this.launch(session, "stage", true, session.draft.gatedStageUuid);
+        await this.launch(session, "stage", true, session.draft.gatedStageUuid);
         return;
       case "dryrun":
-        this.launch(session, "stage", true);
+        await this.launch(session, "stage", true);
         return;
       case "fire":
         if (value === "custom") {
@@ -1188,7 +1232,7 @@ export class SessionManager {
           );
           return;
         }
-        this.launch(session, value === "now" ? "now" : "stage");
+        await this.launch(session, value === "now" ? "now" : "stage");
         return;
       case "refresh":
         await this.refreshPanel(session, "manual", queryId);
