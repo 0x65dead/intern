@@ -2155,13 +2155,6 @@ export class SessionManager {
 
     const reporter = createTelegramReporter(this.opts.client, chatId, run.chain, () => this.clock.now());
     const taskManager = this.opts.taskManager;
-    if (persistentTaskId && taskManager) {
-      try {
-        await taskManager.transition(persistentTaskId, "EXECUTING", "Execution started; fresh chain and wallet checks are running");
-      } catch (error) {
-        throw new Error(`Could not persist task execution state: ${redactKeys(error instanceof Error ? error.message : String(error))}`);
-      }
-    }
 
     // The task record's phase, tapped off the same events the panel renders rather
     // than guessed at from where the code has got to. Two things depend on it: an
@@ -2259,6 +2252,8 @@ export class SessionManager {
                 leadMs: this.opts.defaults.leadMs,
                 receiptTimeoutMs: this.opts.defaults.receiptTimeoutMs,
                 maxPricePerNftWei: this.opts.defaults.maxPricePerNftWei,
+                maxGasCeilingWei: this.opts.defaults.maxGasCeilingWei,
+                rbfMaxAttempts: this.opts.defaults.rbfMaxAttempts,
                 dryRun,
                 // Enforced here, unlike in the CLI. Nobody is watching a bot run, so
                 // there is no one to read a clock warning and decide it is acceptable.
@@ -2552,6 +2547,8 @@ export class SessionManager {
         prearmed: ready,
         eligibility,
         maxPricePerNftWei: this.opts.defaults.maxPricePerNftWei,
+        maxGasCeilingWei: this.opts.defaults.maxGasCeilingWei,
+        rbfMaxAttempts: this.opts.defaults.rbfMaxAttempts,
         receiptTimeoutMs: this.opts.defaults.receiptTimeoutMs,
         signal,
         dryRun,
