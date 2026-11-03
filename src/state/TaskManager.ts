@@ -275,7 +275,7 @@ export class TaskManager {
 
   async recordTxHashes(
     id: string,
-    transactions: readonly { walletIndex: number; txHash: string }[],
+    transactions: readonly { walletIndex: number; txHash: string; replacedTxHash?: string }[],
   ): Promise<TaskState> {
     this.assertReady();
     const task = this.requireTask(id);
@@ -292,10 +292,18 @@ export class TaskManager {
       const key = String(transaction.walletIndex);
       const hashes = task.txHashes[key] ?? (task.txHashes[key] = []);
       if (!hashes.includes(transaction.txHash)) hashes.push(transaction.txHash);
-      this.addHistory(task, "TX_BROADCAST_INTENT", "Locally-derived transaction hash persisted before broadcast", {
-        walletIndex: transaction.walletIndex,
-        txHash: transaction.txHash,
-      });
+      this.addHistory(
+        task,
+        transaction.replacedTxHash ? "TX_REPLACEMENT_INTENT" : "TX_BROADCAST_INTENT",
+        transaction.replacedTxHash
+          ? "Replacement hash persisted before broadcast"
+          : "Locally-derived transaction hash persisted before broadcast",
+        {
+          walletIndex: transaction.walletIndex,
+          txHash: transaction.txHash,
+          ...(transaction.replacedTxHash ? { replacedTxHash: transaction.replacedTxHash } : {}),
+        },
+      );
     }
     task.updatedAt = this.now();
     await this.persist();
