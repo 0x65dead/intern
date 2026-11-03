@@ -33,7 +33,7 @@ import {
   blast,
   classifyRejection,
   prepare,
-  waitForReceipt,
+  waitForReceiptWithRbf,
   wasAccepted,
   warmConnections,
 } from "./blast";
@@ -128,6 +128,10 @@ export interface EngineOptions {
   requireSimulation?: boolean;
   clockRounds?: number;
   receiptTimeoutMs?: number;
+  /** Hard maxFeePerGas ceiling for replacements; null disables RBF. */
+  maxGasCeilingWei?: bigint | null;
+  /** Maximum 12.5% replacements per wallet, capped at 3. */
+  rbfMaxAttempts?: number;
   signal?: AbortSignal;
   /** Do every check and sign every transaction, then stop without broadcasting. */
   dryRun?: boolean;
@@ -672,6 +676,7 @@ export async function runMint(
     const dispatchStart = performance.now();
     const fired = bundles.map(({ wallet, prepared }) => ({
       wallet,
+      prepared,
       handle: blast(prepared, endpoints),
     }));
     const dispatchMs = performance.now() - dispatchStart;
@@ -683,8 +688,9 @@ export async function runMint(
 
     // ── Acceptance. "Dispatched" only means bytes were written. ────────────
     const settled = await Promise.all(
-      fired.map(async ({ wallet, handle }) => ({
+      fired.map(async ({ wallet, prepared, handle }) => ({
         wallet,
+        prepared,
         txHash: handle.txHash,
         outcomes: await handle.outcomes,
       })),
@@ -706,8 +712,8 @@ export async function runMint(
       journal(state, statePath, emit);
     }
 
-    const accepted: { wallet: LoadedWallet; txHash: string }[] = [];
-    for (const { wallet, txHash, outcomes } of settled) {
+    const accepted: { wallet: LoadedWallet; txHash: string; prepared: PreparedTx }[] = [];
+    for (const { wallet, prepared, txHash, outcomes } of settled) {
       if (wasAccepted(outcomes)) {
         const first = firstAcceptance(outcomes);
         emit({
@@ -716,7 +722,7 @@ export async function runMint(
           label: first?.label ?? "unknown",
           elapsedMs: first?.elapsedMs ?? 0,
         });
-        accepted.push({ wallet, txHash });
+        accepted.push({ wallet, txHash, prepared });
         continue;
       }
       const reasons = [...new Set(outcomes.map((o) => o.error).filter((e): e is string => !!e))];
@@ -743,17 +749,56 @@ export async function runMint(
     let failed = settled.length - accepted.length;
 
     await Promise.all(
-      accepted.map(async ({ wallet, txHash }) => {
-        const receipt = await waitForReceipt(txHash, readUrls, {
-          timeoutMs: opts.receiptTimeoutMs ?? 90_000,
-          pollMs: Math.max(200, (chain.blockTimeSec * 1000) / 4),
-          ...(signal ? { signal } : {}),
-        });
+      accepted.map(async (entry) => {
+        const { wallet, prepared } = entry;
+        const monitored = await waitForReceiptWithRbf(
+          prepared,
+          wallet,
+          readUrls,
+          endpoints,
+          {
+            timeoutMs: opts.receiptTimeoutMs ?? 90_000,
+            pollMs: Math.max(200, (chain.blockTimeSec * 1000) / 4),
+            stuckAfterMs: 45_000,
+            maxFeePerGasWei: opts.maxGasCeilingWei ?? null,
+            maxAttempts:
+              opts.maxGasCeilingWei !== null && opts.maxGasCeilingWei !== undefined
+                ? opts.rbfMaxAttempts ?? 1
+                : 0,
+            ...(signal ? { signal } : {}),
+            onBeforeReplacement: async (replacement) => {
+              await opts.onBeforeBroadcast?.([{
+                walletIndex: replacement.walletIndex,
+                txHash: replacement.txHash,
+              }]);
+              emit({
+                type: "tx",
+                index: wallet.index,
+                address: wallet.address,
+                txHash: replacement.txHash,
+              });
+              emit({
+                type: "warning",
+                message: `W${wallet.index}: replacement ${replacement.txHash} replaces ${replacement.replacedTxHash}.`,
+              });
+            },
+          },
+        );
+        if (monitored.ceilingReached) {
+          emit({
+            type: "warning",
+            message: `W${wallet.index}: Tx stuck, but gas ceiling reached. Manual intervention required. No further replacement will be sent.`,
+          });
+        }
+        if (monitored.reason) emit({ type: "warning", message: `W${wallet.index}: ${monitored.reason}` });
+        entry.txHash = monitored.txHash;
+
+        const receipt = monitored.receipt;
         if (!receipt) {
           emit({
             type: "receiptTimeout",
             index: wallet.index,
-            txHash,
+            txHash: monitored.txHash,
             ...(signal?.aborted === true ? { cancelled: true } : {}),
           });
           return;
@@ -766,7 +811,7 @@ export async function runMint(
         emit({
           type: "receipt",
           index: wallet.index,
-          txHash,
+          txHash: monitored.txHash,
           block: receipt.block,
           position: receipt.position,
           success: receipt.success,
