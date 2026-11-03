@@ -68,6 +68,8 @@ const ALLOWED_GROUP = -1000;
 
 function defaults(): Defaults {
   return {
+  maxGasCeilingWei: 100000000000n,
+  rbfMaxAttempts: 3,
     chain: "ethereum",
     quantity: 1,
     gasLimit: 300_000n,
