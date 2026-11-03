@@ -25,7 +25,7 @@ import { ChainProfile, CHAINS } from "../core/chains";
 import { StageTable, actionableStage, formatClock, formatCoarse } from "../core/stages";
 import { StageContext, allStageCells, stageSummaryLines } from "../core/stagetable";
 import { MintPlan } from "../core/seadrop";
-import { LoadedWallet, formatEth, weiToGwei } from "../core/wallets";
+import { BalanceReport, LoadedWallet, formatEth, weiToGwei } from "../core/wallets";
 import { WalletEligibility, eligibilityIcon, eligibilityLabel } from "../core/eligibility";
 import { shortAddress } from "../core/target";
 import { InlineButton, bold, code, esc } from "./api";
@@ -295,6 +295,8 @@ export function renderConfirm(opts: {
   fireMode: string;
   nowMs: number;
   eligibility?: WalletEligibility[];
+  /** Actual wallet balances used for exact, stage-specific readiness display. */
+  balances?: BalanceReport[];
   allowlistMinting?: boolean;
   allWallets?: LoadedWallet[];
   selectedGatedStage?: SelectedGatedStage;
@@ -346,22 +348,33 @@ export function renderConfirm(opts: {
 
   const eligibility = opts.eligibility ?? [];
   const matrixWallets = opts.allWallets ?? wallets;
+  const balances = opts.balances ?? [];
   const scheduledRows = opts.stages.rows.filter((row) => row.kind !== "public");
-  if (scheduledRows.length > 0) {
-    lines.push("", bold("MINT STAGE ELIGIBILITY"));
+  const balanceReady = (wallet: LoadedWallet, priceWei: bigint | null): string => {
+    if (priceWei === null) return "❔";
+    const report = balances.find(
+      (candidate) => candidate.address.toLowerCase() === wallet.address.toLowerCase(),
+    );
+    if (!report || report.balance === null) return "❔";
+    const required = priceWei * BigInt(quantity) + opts.gasLimit * opts.maxFeeWei;
+    return report.balance >= required ? "✅" : "❌";
+  };
+
+  if (opts.stages.rows.length > 0) {
+    lines.push("", bold("WALLET · STAGE · ELIGIBILITY · FUNDING"));
     for (const stage of opts.stages.rows) {
       if (stage.kind === "public") {
-        lines.push(esc(`${stage.label} — ✅ Open to all wallets`));
+        for (const wallet of matrixWallets) {
+          lines.push(
+            esc(`W${wallet.index} ${shortAddress(wallet.address)} | ${stage.label} | ✅ Public | Balance ${balanceReady(wallet, plan.drop.mintPrice)}`),
+          );
+        }
         continue;
       }
 
       const joined = stage.stageUuid
         ? eligibility.filter((result) => result.stageUuid === stage.stageUuid)
         : [];
-      if (joined.length === 0) {
-        lines.push(esc(`${stage.label} — ❔ Unknown (no verifiable stage UUID or eligibility result)`));
-        continue;
-      }
 
       for (const wallet of matrixWallets) {
         const result = joined.find(
@@ -369,7 +382,7 @@ export function renderConfirm(opts: {
         );
         if (!result) {
           lines.push(
-            esc(`${stage.label} — W${wallet.index} ${shortAddress(wallet.address)} ❔ Unknown`),
+            esc(`W${wallet.index} ${shortAddress(wallet.address)} | ${stage.label} | ❔ Unknown | Balance ❔`),
           );
           continue;
         }
@@ -387,9 +400,10 @@ export function renderConfirm(opts: {
         const unknownReason = result.state === "unknown" ? ` — ${result.detail}` : "";
         const teamNotice =
           stage.kind === "team" ? " · collection-wallet-only; the bot cannot mint team reserve" : "";
+        const stagePrice = result.stagePriceWei ?? null;
         lines.push(
           esc(
-            `${stage.label} — W${wallet.index} ${shortAddress(wallet.address)} ${eligibilityIcon(result.state)} ${eligibilityLabel(result.state, result.mechanism)}${terms.length > 0 ? ` · ${terms.join(" · ")}` : ""}${unknownReason}${teamNotice}`,
+            `W${wallet.index} ${shortAddress(wallet.address)} | ${stage.label} | ${eligibilityIcon(result.state)} ${eligibilityLabel(result.state, result.mechanism)} | Balance ${balanceReady(wallet, stagePrice)}${terms.length > 0 ? ` · ${terms.join(" · ")}` : ""}${unknownReason}${teamNotice}`,
           ),
         );
       }
