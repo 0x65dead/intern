@@ -2281,8 +2281,8 @@ export class SessionManager {
           const outcomes = Object.values(stored.walletOutcomes);
           if (outcomes.length > 0 && outcomes.every((outcome) => outcome === "COMPLETED")) {
             await taskManager.transition(persistentTaskId, "COMPLETED", "All selected wallet receipts confirmed");
-          } else if (outcomes.length > 0 && outcomes.every((outcome) => outcome === "FAILED")) {
-            await taskManager.transition(persistentTaskId, "FAILED", "Every selected wallet reached a failed or reverted outcome");
+          } else if (outcomes.length > 0 && outcomes.every((outcome) => outcome !== "PENDING")) {
+            await taskManager.transition(persistentTaskId, "FAILED", "One or more selected wallets failed, reverted, or could not be funded");
           }
         }
       }
