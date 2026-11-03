@@ -187,15 +187,18 @@ export async function runBot(): Promise<void> {
             },
           });
           await taskManager.transition(task.id, "COMPLETED", `Public stage opened at ${plan.drop.startTime}`);
+          await taskManager.setWatchlistEnabledForTask(task.id, false);
           await notifyRecovery(`<b>Watch ${task.id} · Stage opened</b>\n${esc(contract)} on ${esc(chain.name)}`);
         } catch (error) {
           if (controller.signal.aborted) {
             const saved = taskManager.getTask(task.id);
             if (saved && saved.status !== "CANCELLED" && saved.status !== "COMPLETED" && saved.status !== "FAILED") {
-              await taskManager.transition(task.id, "CANCELLED", "Recovered watch stopped during shutdown");
+                await taskManager.transition(task.id, "CANCELLED", "Recovered watch stopped during shutdown");
             }
+            await taskManager.setWatchlistEnabledForTask(task.id, false);
           } else {
             await taskManager.transition(task.id, "FAILED", "Recovered watch failed");
+            await taskManager.setWatchlistEnabledForTask(task.id, false);
             await notifyRecovery(`<b>Watch ${task.id} failed</b>\n${esc(redactKeys(error instanceof Error ? error.message : String(error)))}`);
           }
         } finally {
