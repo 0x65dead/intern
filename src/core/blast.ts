@@ -370,6 +370,7 @@ async function isPendingOnNetwork(
 }
 
 function bumpTwelvePointFivePercent(value: bigint): bigint {
+  if (value === 0n) return 1n;
   return (value * 1125n + 999n) / 1000n;
 }
 
