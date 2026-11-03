@@ -1,4 +1,4 @@
-import { TaskManager, TaskState, WalletExecutionStatus } from "./TaskManager";
+import type { TaskManager, TaskState, WalletExecutionStatus } from "./TaskManager";
 
 interface RpcEnvelope<T> {
   result?: T | null;
@@ -77,9 +77,13 @@ export class RecoveryEngine {
       return;
     }
 
-    const hashes = Object.entries(task.txHashes).flatMap(([wallet, values]) =>
-      values.map((hash) => ({ walletIndex: Number(wallet), hash })),
-    );
+    const hashes: Array<{ walletIndex: number; hash: string }> = [];
+    for (const [wallet, walletHashes] of Object.entries(task.txHashes)) {
+      const walletIndex = Number(wallet);
+      for (const hash of walletHashes) {
+        hashes.push({ walletIndex, hash });
+      }
+    }
 
     // A hash is the irreversible boundary, even if the crash happened before
     // the EXECUTING status flush. Never treat a hash-bearing ARMED task as unsent.
