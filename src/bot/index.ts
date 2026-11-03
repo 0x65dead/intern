@@ -168,8 +168,13 @@ export async function runBot(): Promise<void> {
         return;
       }
 
+      const primaryUrl = urls[0];
+      if (!primaryUrl) {
+        await notifyRecovery(`<b>Watch ${task.id} not resumed</b>\nNo read-capable RPC endpoint is available.`);
+        return;
+      }
       const controller = new AbortController();
-      const provider = new JsonRpcProvider(urls[0], chain.chainId, { staticNetwork: true });
+      const provider = new JsonRpcProvider(primaryUrl, chain.chainId, { staticNetwork: true });
       recoveryWatchControllers.set(task.id, controller);
       const job = (async (): Promise<void> => {
         try {
