@@ -18,6 +18,10 @@
 // whose price has moved.
 
 import { AbortedError, ConflictError, TelegramClient, TelegramError, bold, esc } from "./api";
+import { JsonRpcProvider } from "ethers";
+import { waitForPublicStage } from "../core/watcher";
+import { TaskManager } from "../state/TaskManager";
+import { RecoveryEngine } from "../state/RecoveryEngine";
 import {
   BeatAction,
   HeartbeatState,
@@ -96,6 +100,13 @@ export async function runBot(): Promise<void> {
     );
   }
 
+  const taskManager = new TaskManager({
+    onError: (message, error) => {
+      writeErr(`task manager: ${message}: ${redactKeys(error instanceof Error ? error.message : String(error))}\n`);
+    },
+  });
+  await taskManager.init();
+
   const client = new TelegramClient(defaults.telegramToken);
   const me = await client.getMe();
 
@@ -116,12 +127,93 @@ export async function runBot(): Promise<void> {
     // Fall through with a zero offset — the local clock, used as-is.
   }
 
+  const notifyRecovery = async (message: string): Promise<void> => {
+    for (const chatId of defaults.telegramAllowedIds) {
+      try {
+        await client.sendMessage(chatId, message);
+      } catch (error) {
+        writeErr(`recovery notification to chat ${chatId} failed: ${redactKeys(error instanceof Error ? error.message : String(error))}\n`);
+      }
+    }
+  };
+
+  const resolveTaskRpcUrls = (task: { config: Record<string, unknown> }): string[] => {
+    const configured = task.config.chain;
+    const chainKey = typeof configured === "string" ? configured : defaults.chain;
+    try {
+      const chain = resolveChain(chainKey);
+      return chain ? resolveRpcsForChain(chain.key, [], process.env).urls : [];
+    } catch {
+      return [];
+    }
+  };
+
+  const recoveryWatchControllers = new Map<string, AbortController>();
+  const recoveryWatchJobs = new Map<string, Promise<void>>();
+  const recovery = new RecoveryEngine({
+    taskManager,
+    resolveRpcUrls: resolveTaskRpcUrls,
+    onAlert: async (task, message) => {
+      await notifyRecovery(`<b>Intern recovery · ${task.id}</b>\n${esc(message)}`);
+    },
+    onWatchResume: async (task) => {
+      const chainValue = task.config.chain;
+      const contract = task.config.contract;
+      const quantity = task.config.quantity;
+      const chain = typeof chainValue === "string" ? resolveChain(chainValue) : null;
+      const urls = resolveTaskRpcUrls(task);
+      if (!chain || typeof contract !== "string" || !/^0x[0-9a-f]{40}$/i.test(contract) ||
+          typeof quantity !== "number" || !Number.isInteger(quantity) || quantity < 1 || urls.length === 0) {
+        await notifyRecovery(`<b>Watch ${task.id} not resumed</b>\nSaved watch configuration is incomplete or its chain/RPC cannot be resolved.`);
+        return;
+      }
+
+      const controller = new AbortController();
+      const provider = new JsonRpcProvider(urls[0], chain.chainId, { staticNetwork: true });
+      recoveryWatchControllers.set(task.id, controller);
+      const job = (async (): Promise<void> => {
+        try {
+          const plan = await waitForPublicStage(provider, contract, quantity, {
+            signal: controller.signal,
+            onUpdate: (update) => {
+              if (update.kind === "opened") {
+                void notifyRecovery(`<b>Watch ${task.id}</b>\n${esc(update.message)}`);
+              }
+            },
+          });
+          await taskManager.transition(task.id, "COMPLETED", `Public stage opened at ${plan.drop.startTime}`);
+          await notifyRecovery(`<b>Watch ${task.id} · Stage opened</b>\n${esc(contract)} on ${esc(chain.name)}`);
+        } catch (error) {
+          if (controller.signal.aborted) {
+            const saved = taskManager.getTask(task.id);
+            if (saved && saved.status !== "CANCELLED" && saved.status !== "COMPLETED" && saved.status !== "FAILED") {
+              await taskManager.transition(task.id, "CANCELLED", "Recovered watch stopped during shutdown");
+            }
+          } else {
+            await taskManager.transition(task.id, "FAILED", "Recovered watch failed");
+            await notifyRecovery(`<b>Watch ${task.id} failed</b>\n${esc(redactKeys(error instanceof Error ? error.message : String(error)))}`);
+          }
+        } finally {
+          provider.destroy();
+          recoveryWatchControllers.delete(task.id);
+          recoveryWatchJobs.delete(task.id);
+        }
+      })();
+      recoveryWatchJobs.set(task.id, job);
+    },
+  });
+
+  // Reconcile persisted work before the Telegram long-poll starts. Hash-bearing
+  // tasks are receipt-checked and monitored; they are never re-signed.
+  await recovery.recover();
+
   const manager = new SessionManager({
     client,
     defaults,
     wallets,
     allowedIds: defaults.telegramAllowedIds,
     clock,
+    taskManager,
   });
 
   // ── Unattended supervision ───────────────────────────────────────────────
