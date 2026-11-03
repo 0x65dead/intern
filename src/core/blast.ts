@@ -12,7 +12,7 @@
 
 import { keccak256, Transaction, Wallet } from "ethers";
 
-import { markPublicHash, type LoadedWallet } from "./wallets";
+import { markPublicHash, priceCeilingRefusal, type LoadedWallet } from "./wallets";
 
 export interface Endpoint {
   url: string;
@@ -292,6 +292,11 @@ export interface RbfMonitorOptions {
   pollMs?: number;
   stuckAfterMs?: number;
   maxFeePerGasWei?: bigint | null;
+  /** Quantity of the original purchase. Required for replacements when a price ceiling is set. */
+  quantity?: number;
+  /** MAX_PRICE_PER_NFT in wei; null/undefined means unconfigured. */
+  maxPricePerNftWei?: bigint | null;
+  symbol?: string;
   maxAttempts?: number;
   signal?: AbortSignal;
   /** Must durably record the new hash before it is broadcast. */
@@ -374,11 +379,18 @@ function bumpTwelvePointFivePercent(value: bigint): bigint {
   return (value * 1125n + 999n) / 1000n;
 }
 
+interface PriceGuard {
+  quantity: number;
+  ceilingPerNftWei: bigint | null;
+  symbol?: string;
+}
+
 async function signReplacement(
   rawTx: string,
   wallet: LoadedWallet,
   ceiling: bigint,
-): Promise<{ prepared: PreparedTx | null; reason?: string }> {
+  price: PriceGuard,
+): Promise<{ prepared: PreparedTx | null; reason?: string; priceRefusal?: string }> {
   const original = Transaction.from(rawTx);
   if (
     original.type !== 2 ||
@@ -403,6 +415,16 @@ async function signReplacement(
     return { prepared: null, reason: "gas ceiling reached" };
   }
 
+  // A replacement re-signs the original purchase value. Re-check it against the
+  // operator's ceiling here rather than trusting that the caller did; a missing
+  // quantity becomes 0, which refuses any non-free value (fails closed).
+  const overCeiling = priceCeilingRefusal({
+    value: original.value ?? 0n,
+    quantity: price.quantity,
+    ceilingPerNftWei: price.ceilingPerNftWei,
+    ...(price.symbol ? { symbol: price.symbol } : {}),
+  });
+  if (overCeiling) return { prepared: null, reason: "price ceiling", priceRefusal: overCeiling };
   const raw = await signer.signTransaction({
     type: 2,
     chainId: original.chainId,
@@ -467,8 +489,15 @@ export async function waitForReceiptWithRbf(
       const parsed = Transaction.from(currentRaw);
       const stillPending = await isPendingOnNetwork(currentHash, wallet, parsed.nonce, readUrls);
       if (stillPending) {
-        const signed = await signReplacement(currentRaw, wallet, ceiling);
-        if (!signed.prepared) {
+        const signed = await signReplacement(currentRaw, wallet, ceiling, {
+          quantity: opts.quantity ?? 0,
+          ceilingPerNftWei: opts.maxPricePerNftWei ?? null,
+          ...(opts.symbol ? { symbol: opts.symbol } : {}),
+        });
+        if (!signed.prepared && signed.priceRefusal) {
+          replacementStopped = true;
+          reason = `Tx stuck; replacement refused: ${signed.priceRefusal}`;
+        } else if (!signed.prepared) {
           ceilingReached = true;
           reason = "Tx stuck, but gas ceiling reached. Manual intervention required.";
         } else {

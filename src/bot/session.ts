@@ -1029,7 +1029,7 @@ export class SessionManager {
       case "awaitTime": {
         try {
           const atMs = parseTimeInput(text, this.now());
-          await this.launch(session, { atMs });
+          this.launch(session, { atMs });
         } catch (err: unknown) {
           await this.paint(
             session,
@@ -1198,7 +1198,7 @@ export class SessionManager {
         return;
       }
       case "send":
-        await this.launch(session, "stage");
+        this.launch(session, "stage");
         return;
       case "gated":
         if (!session.draft.gatedStageUuid) {
@@ -1209,7 +1209,7 @@ export class SessionManager {
           await this.ackCallback(session, queryId, "That stage button is stale. Refresh the confirmation and choose again.", true);
           return;
         }
-        await this.launch(session, "stage", false, session.draft.gatedStageUuid);
+        this.launch(session, "stage", false, session.draft.gatedStageUuid);
         return;
       case "gateddryrun":
         if (!session.draft.gatedStageUuid) {
@@ -1220,10 +1220,10 @@ export class SessionManager {
           await this.ackCallback(session, queryId, "That stage button is stale. Refresh the confirmation and choose again.", true);
           return;
         }
-        await this.launch(session, "stage", true, session.draft.gatedStageUuid);
+        this.launch(session, "stage", true, session.draft.gatedStageUuid);
         return;
       case "dryrun":
-        await this.launch(session, "stage", true);
+        this.launch(session, "stage", true);
         return;
       case "fire":
         if (value === "custom") {
@@ -1235,7 +1235,7 @@ export class SessionManager {
           );
           return;
         }
-        await this.launch(session, value === "now" ? "now" : "stage");
+        this.launch(session, value === "now" ? "now" : "stage");
         return;
       case "refresh":
         await this.refreshPanel(session, "manual", queryId);
@@ -1601,6 +1601,7 @@ export class SessionManager {
       return;
     }
 
+    const wallets = this.opts.wallets;
     let fresh: PreparedRun;
     try {
       fresh = await refreshRun(run, {
@@ -1609,7 +1610,7 @@ export class SessionManager {
         // stages open, so carrying the last answer forward would describe the
         // wrong stage with full confidence.
         openseaAuth: this.auth(),
-        walletAddresses: this.opts.wallets.map((w) => w.address),
+        walletAddresses: wallets.map((w) => w.address),
         apiKey: this.opts.defaults.openseaApiKey,
         maxFeeGwei: this.opts.defaults.maxFeeGwei,
         priorityGwei: this.opts.defaults.priorityGwei,
@@ -1856,7 +1857,18 @@ export class SessionManager {
    * The promise is kept so shutdown can wait for the run to unwind rather than
    * cutting it off mid-flight.
    */
-  private async launch(
+  private launch(
+    session: Session,
+    mode: "stage" | "now" | { atMs: number },
+    dryRun = false,
+    gatedStageUuid?: string,
+  ): void {
+    this.launchInner(session, mode, dryRun, gatedStageUuid).catch((error) => {
+      writeErr(`launch failed: ${redactKeys(error instanceof Error ? error.message : String(error))}\n`);
+    });
+  }
+
+  private async launchInner(
     session: Session,
     mode: "stage" | "now" | { atMs: number },
     dryRun = false,
