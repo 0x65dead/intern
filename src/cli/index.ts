@@ -631,6 +631,8 @@ async function cmdMint(
         requireSimulation: args.requireSimulation,
         receiptTimeoutMs: defaults.receiptTimeoutMs,
         maxPricePerNftWei: defaults.maxPricePerNftWei,
+        maxGasCeilingWei: defaults.maxGasCeilingWei,
+        rbfMaxAttempts: defaults.rbfMaxAttempts,
         dryRun,
         // Advisory unless the operator configured a limit: they can read the
         // measured offset and decide. The bot, with nobody watching, enforces one.
@@ -948,6 +950,8 @@ async function cmdAllowlist(
         prearmed,
         eligibility,
         maxPricePerNftWei: defaults.maxPricePerNftWei,
+        maxGasCeilingWei: defaults.maxGasCeilingWei,
+        rbfMaxAttempts: defaults.rbfMaxAttempts,
         receiptTimeoutMs: defaults.receiptTimeoutMs,
         signal,
       },
