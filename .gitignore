@@ -16,3 +16,7 @@ npm-debug.log*
 pnpm-lock.yaml
 .claude/worktrees/
 pnpm-lock.yaml
+
+# Durable task, watchlist, and execution history (contains no secrets)
+.intern-tasks.json
+.intern-tasks.*.tmp
