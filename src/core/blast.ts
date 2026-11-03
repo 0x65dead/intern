@@ -377,7 +377,7 @@ async function signReplacement(
   rawTx: string,
   wallet: LoadedWallet,
   ceiling: bigint,
-): Promise<{ prepared: PreparedTx; reason?: string }> {
+): Promise<{ prepared: PreparedTx | null; reason?: string }> {
   const original = Transaction.from(rawTx);
   if (
     original.type !== 2 ||
@@ -399,7 +399,7 @@ async function signReplacement(
   const maxFeePerGas = bumpTwelvePointFivePercent(original.maxFeePerGas);
   const maxPriorityFeePerGas = bumpTwelvePointFivePercent(original.maxPriorityFeePerGas);
   if (maxFeePerGas > ceiling || maxPriorityFeePerGas > ceiling) {
-    return { prepared: { txHash: "", raw: "", body: "" }, reason: "gas ceiling reached" };
+    return { prepared: null, reason: "gas ceiling reached" };
   }
 
   const raw = await signer.signTransaction({
@@ -443,6 +443,7 @@ export async function waitForReceiptWithRbf(
   let lastBroadcastAt = Date.now();
   let replacementCount = 0;
   let ceilingReached = false;
+  let replacementStopped = false;
   let reason: string | undefined;
 
   while (Date.now() < deadline && opts.signal?.aborted !== true) {
@@ -458,6 +459,7 @@ export async function waitForReceiptWithRbf(
       ceiling > 0n &&
       replacementCount < maxAttempts &&
       !ceilingReached &&
+      !replacementStopped &&
       Date.now() - lastBroadcastAt >= stuckAfterMs;
 
     if (eligibleToReplace) {
@@ -465,7 +467,7 @@ export async function waitForReceiptWithRbf(
       const stillPending = await isPendingOnNetwork(currentHash, wallet, parsed.nonce, readUrls);
       if (stillPending) {
         const signed = await signReplacement(currentRaw, wallet, ceiling);
-        if (signed.reason) {
+        if (!signed.prepared) {
           ceilingReached = true;
           reason = "Tx stuck, but gas ceiling reached. Manual intervention required.";
         } else {
@@ -485,14 +487,14 @@ export async function waitForReceiptWithRbf(
             reason = errors.some((error) => /replacement transaction underpriced/i.test(error))
               ? "Replacement was rejected as underpriced; no further fee bump was attempted."
               : `Replacement was rejected by all broadcast endpoints: ${errors.slice(0, 2).join("; ")}`;
-            return { receipt: null, txHash: currentHash, replacementCount, ceilingReached, reason };
+            replacementStopped = true;
+          } else {
+            hashes.push(signed.prepared.txHash);
+            currentHash = signed.prepared.txHash;
+            currentRaw = signed.prepared.raw;
+            replacementCount += 1;
+            lastBroadcastAt = Date.now();
           }
-
-          hashes.push(signed.prepared.txHash);
-          currentHash = signed.prepared.txHash;
-          currentRaw = signed.prepared.raw;
-          replacementCount += 1;
-          lastBroadcastAt = Date.now();
         }
       }
     }
