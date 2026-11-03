@@ -203,7 +203,11 @@ export async function runBot(): Promise<void> {
           recoveryWatchControllers.delete(task.id);
           recoveryWatchJobs.delete(task.id);
         }
-      })();
+      })().catch(async (error: unknown): Promise<void> => {
+        const message = redactKeys(error instanceof Error ? error.message : String(error));
+        writeErr(`recovered watch ${task.id} escaped its handler: ${message}\n`);
+        await notifyRecovery(`<b>Watch ${task.id} stopped unexpectedly</b>\n${esc(message)}`);
+      });
       recoveryWatchJobs.set(task.id, job);
     },
   });
