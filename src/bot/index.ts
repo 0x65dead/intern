@@ -338,6 +338,19 @@ export async function runBot(): Promise<void> {
   );
 
   let stopping = false;
+  let recoveryStopPromise: Promise<void> | null = null;
+  const stopRecovery = (): void => {
+    for (const controller of recoveryWatchControllers.values()) controller.abort();
+    if (recoveryStopPromise === null) {
+      recoveryStopPromise = (async () => {
+        await recovery.stop();
+        await Promise.allSettled([...recoveryWatchJobs.values()]);
+        await taskManager.flush();
+      })().catch((error: unknown) => {
+        writeErr(`recovery shutdown failed: ${redactKeys(error instanceof Error ? error.message : String(error))}\n`);
+      });
+    }
+  };
   // Cancels the long poll and any backoff sleep, so the signal is acted on when it
   // arrives rather than whenever the current 50s poll happens to return.
   const shutdown = new AbortController();
@@ -353,6 +366,7 @@ export async function runBot(): Promise<void> {
     // to be up when a stage opens.
     shutdown.abort();
     manager.shutdown();
+    stopRecovery();
   };
   process.on("SIGINT", stop);
   process.on("SIGTERM", stop);
@@ -393,14 +407,18 @@ export async function runBot(): Promise<void> {
       if (err instanceof ConflictError) {
         writeErr(`\n${err.message}\n`);
         manager.shutdown();
+        stopRecovery();
         await manager.drain();
+        await recoveryStopPromise;
         process.exitCode = 1;
         return;
       }
       if (err instanceof TelegramError && err.status === 401) {
         writeErr(`\n${err.message}\n`);
         manager.shutdown();
+        stopRecovery();
         await manager.drain();
+        await recoveryStopPromise;
         process.exitCode = 1;
         return;
       }
@@ -422,8 +440,10 @@ export async function runBot(): Promise<void> {
   }
 
   manager.shutdown();
+  stopRecovery();
   // Aborted, now let it land: the run still has to send its closing line.
   await manager.drain();
+  await recoveryStopPromise;
 }
 
 /**
