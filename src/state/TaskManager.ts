@@ -374,6 +374,15 @@ export class TaskManager {
     return true;
   }
 
+  async setWatchlistEnabledForTask(taskId: string, enabled: boolean): Promise<boolean> {
+    this.assertReady();
+    const matches = this.store.watchlist.filter((entry) => entry.config.taskId === taskId);
+    if (matches.length === 0) return false;
+    for (const entry of matches) entry.enabled = enabled;
+    await this.persist();
+    return true;
+  }
+
   getTask(id: string): TaskState | null {
     this.assertReady();
     const task = this.store.tasks[id];
