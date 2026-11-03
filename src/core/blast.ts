@@ -10,9 +10,9 @@
 // different questions: dispatch latency is what we control, acceptance is what
 // the network decided.
 
-import { keccak256 } from "ethers";
+import { keccak256, Transaction, Wallet } from "ethers";
 
-import { markPublicHash } from "./wallets";
+import { markPublicHash, type LoadedWallet } from "./wallets";
 
 export interface Endpoint {
   url: string;
@@ -270,6 +270,243 @@ export async function waitForReceipt(
     await sleepUnlessAborted(pollMs, signal);
   }
   return null;
+}
+
+export interface RbfReplacement {
+  walletIndex: number;
+  txHash: string;
+  replacedTxHash: string;
+}
+
+export interface RbfMonitorResult {
+  receipt: Receipt | null;
+  /** Latest accepted transaction hash, or the original hash if no replacement landed. */
+  txHash: string;
+  replacementCount: number;
+  ceilingReached: boolean;
+  reason?: string;
+}
+
+export interface RbfMonitorOptions {
+  timeoutMs?: number;
+  pollMs?: number;
+  stuckAfterMs?: number;
+  maxFeePerGasWei?: bigint | null;
+  maxAttempts?: number;
+  signal?: AbortSignal;
+  /** Must durably record the new hash before it is broadcast. */
+  onBeforeReplacement?: (replacement: RbfReplacement) => Promise<void>;
+}
+
+interface RpcReceipt {
+  transactionHash?: string;
+  blockNumber?: string;
+  transactionIndex?: string;
+  gasUsed?: string;
+  effectiveGasPrice?: string;
+  status?: string;
+}
+
+interface RpcPendingTransaction {
+  hash?: string;
+  from?: string;
+  nonce?: string;
+  blockNumber?: string | null;
+}
+
+async function rpcResult<T>(url: string, method: string, params: unknown[]): Promise<T | null> {
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+      signal: AbortSignal.timeout(4_000),
+    });
+    if (!response.ok) return null;
+    const body = await response.json() as { result?: T | null; error?: { message?: string } };
+    return body.error ? null : body.result ?? null;
+  } catch {
+    return null;
+  }
+}
+
+async function findReceipt(hash: string, urls: readonly string[]): Promise<Receipt | null> {
+  const replies = await Promise.all(urls.map((url) => rpcResult<RpcReceipt>(url, "eth_getTransactionReceipt", [hash])));
+  for (const receipt of replies) {
+    if (!receipt || typeof receipt.status !== "string" || typeof receipt.blockNumber !== "string" ||
+        typeof receipt.transactionIndex !== "string" || typeof receipt.gasUsed !== "string") continue;
+    if (receipt.transactionHash && receipt.transactionHash.toLowerCase() !== hash.toLowerCase()) continue;
+    const block = Number.parseInt(receipt.blockNumber, 16);
+    const position = Number.parseInt(receipt.transactionIndex, 16);
+    if (!Number.isFinite(block) || !Number.isFinite(position)) continue;
+    return {
+      block,
+      position,
+      gasUsed: BigInt(receipt.gasUsed),
+      effectiveGasPrice: receipt.effectiveGasPrice ? BigInt(receipt.effectiveGasPrice) : null,
+      success: receipt.status.toLowerCase() === "0x1",
+    };
+  }
+  return null;
+}
+
+async function isPendingOnNetwork(
+  hash: string,
+  wallet: LoadedWallet,
+  nonce: number,
+  urls: readonly string[],
+): Promise<boolean> {
+  const replies = await Promise.all(urls.map((url) =>
+    rpcResult<RpcPendingTransaction>(url, "eth_getTransactionByHash", [hash]),
+  ));
+  return replies.some((transaction) =>
+    transaction !== null &&
+    transaction.hash?.toLowerCase() === hash.toLowerCase() &&
+    transaction.from?.toLowerCase() === wallet.address.toLowerCase() &&
+    transaction.nonce !== undefined &&
+    Number.parseInt(transaction.nonce, 16) === nonce &&
+    transaction.blockNumber === null,
+  );
+}
+
+function bumpTwelvePointFivePercent(value: bigint): bigint {
+  return (value * 1125n + 999n) / 1000n;
+}
+
+async function signReplacement(
+  rawTx: string,
+  wallet: LoadedWallet,
+  ceiling: bigint,
+): Promise<{ prepared: PreparedTx; reason?: string }> {
+  const original = Transaction.from(rawTx);
+  if (
+    original.type !== 2 ||
+    original.to === null ||
+    original.nonce === undefined ||
+    original.gasLimit === null ||
+    original.chainId === 0n ||
+    original.maxFeePerGas === null ||
+    original.maxPriorityFeePerGas === null
+  ) {
+    throw new Error("RBF supports only fully specified EIP-1559 transactions.");
+  }
+
+  const signer = new Wallet(wallet.key);
+  if (original.from?.toLowerCase() !== signer.address.toLowerCase()) {
+    throw new Error("RBF signer does not match the original transaction sender.");
+  }
+
+  const maxFeePerGas = bumpTwelvePointFivePercent(original.maxFeePerGas);
+  const maxPriorityFeePerGas = bumpTwelvePointFivePercent(original.maxPriorityFeePerGas);
+  if (maxFeePerGas > ceiling || maxPriorityFeePerGas > ceiling) {
+    return { prepared: { txHash: "", raw: "", body: "" }, reason: "gas ceiling reached" };
+  }
+
+  const raw = await signer.signTransaction({
+    type: 2,
+    chainId: original.chainId,
+    nonce: original.nonce,
+    to: original.to,
+    data: original.data,
+    value: original.value ?? 0n,
+    gasLimit: original.gasLimit,
+    maxFeePerGas,
+    maxPriorityFeePerGas,
+    accessList: original.accessList ?? [],
+  });
+  return { prepared: prepare(raw) };
+}
+
+/**
+ * Watch an accepted EIP-1559 transaction and replace it only after 45 seconds
+ * when a read RPC confirms that the exact hash is still pending. Replacements
+ * keep the original nonce and call data and increase both EIP-1559 fee fields
+ * by 12.5%. An explicit gas ceiling is mandatory; without one, this is a
+ * receipt-only monitor.
+ */
+export async function waitForReceiptWithRbf(
+  initial: PreparedTx,
+  wallet: LoadedWallet,
+  readUrls: string[],
+  endpoints: Endpoint[],
+  opts: RbfMonitorOptions = {},
+): Promise<RbfMonitorResult> {
+  const timeoutMs = Math.max(1_000, opts.timeoutMs ?? 90_000);
+  const pollMs = Math.max(200, opts.pollMs ?? 400);
+  const stuckAfterMs = Math.max(45_000, opts.stuckAfterMs ?? 45_000);
+  const maxAttempts = Math.max(0, Math.min(3, Math.floor(opts.maxAttempts ?? 0)));
+  const ceiling = opts.maxFeePerGasWei ?? null;
+  const deadline = Date.now() + timeoutMs;
+  const hashes = [initial.txHash];
+  let currentHash = initial.txHash;
+  let currentRaw = initial.raw;
+  let lastBroadcastAt = Date.now();
+  let replacementCount = 0;
+  let ceilingReached = false;
+  let reason: string | undefined;
+
+  while (Date.now() < deadline && opts.signal?.aborted !== true) {
+    for (const hash of hashes) {
+      const receipt = await findReceipt(hash, readUrls);
+      if (receipt) {
+        return { receipt, txHash: hash, replacementCount, ceilingReached, ...(reason ? { reason } : {}) };
+      }
+    }
+
+    const eligibleToReplace =
+      ceiling !== null &&
+      ceiling > 0n &&
+      replacementCount < maxAttempts &&
+      !ceilingReached &&
+      Date.now() - lastBroadcastAt >= stuckAfterMs;
+
+    if (eligibleToReplace) {
+      const parsed = Transaction.from(currentRaw);
+      const stillPending = await isPendingOnNetwork(currentHash, wallet, parsed.nonce, readUrls);
+      if (stillPending) {
+        const signed = await signReplacement(currentRaw, wallet, ceiling);
+        if (signed.reason) {
+          ceilingReached = true;
+          reason = "Tx stuck, but gas ceiling reached. Manual intervention required.";
+        } else {
+          const replacement: RbfReplacement = {
+            walletIndex: wallet.index,
+            txHash: signed.prepared.txHash,
+            replacedTxHash: currentHash,
+          };
+          // Persist before sending. A crash after this point must reconcile both hashes.
+          await opts.onBeforeReplacement?.(replacement);
+          const outcomes = await blast(signed.prepared, endpoints).outcomes;
+          const accepted = outcomes.some((outcome) =>
+            outcome.txHash !== null || outcome.alreadyKnown,
+          );
+          if (!accepted) {
+            const errors = outcomes.map((outcome) => outcome.error).filter((value): value is string => value !== null);
+            reason = errors.some((error) => /replacement transaction underpriced/i.test(error))
+              ? "Replacement was rejected as underpriced; no further fee bump was attempted."
+              : `Replacement was rejected by all broadcast endpoints: ${errors.slice(0, 2).join("; ")}`;
+            return { receipt: null, txHash: currentHash, replacementCount, ceilingReached, reason };
+          }
+
+          hashes.push(signed.prepared.txHash);
+          currentHash = signed.prepared.txHash;
+          currentRaw = signed.prepared.raw;
+          replacementCount += 1;
+          lastBroadcastAt = Date.now();
+        }
+      }
+    }
+
+    await sleepUnlessAborted(pollMs, opts.signal);
+  }
+
+  return {
+    receipt: null,
+    txHash: currentHash,
+    replacementCount,
+    ceilingReached,
+    ...(reason ? { reason } : {}),
+  };
 }
 
 /** Waits out the poll gap, but returns at once if the run is cancelled. */
