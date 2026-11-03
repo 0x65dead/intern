@@ -2629,6 +2629,7 @@ export class SessionManager {
       } catch (error) {
         if (persistedWatchId && this.opts.taskManager) {
           try {
+            await this.opts.taskManager.setWatchlistEnabledForTask(persistedWatchId, false);
             const saved = this.opts.taskManager.getTask(persistedWatchId);
             if (saved && saved.status !== "COMPLETED" && saved.status !== "FAILED" && saved.status !== "CANCELLED") {
               await this.opts.taskManager.transition(
@@ -2682,6 +2683,7 @@ export class SessionManager {
       );
       if (persistedWatchId && this.opts.taskManager) {
         await this.opts.taskManager.transition(persistedWatchId, "COMPLETED", "Public SeaDrop stage opened");
+        await this.opts.taskManager.setWatchlistEnabledForTask(persistedWatchId, false);
       }
       await this.say(
         chatId,
@@ -2704,6 +2706,7 @@ export class SessionManager {
               controller.signal.aborted ? "Operator stopped the watch" : "Public stage watch failed",
             );
           }
+          await this.opts.taskManager.setWatchlistEnabledForTask(persistedWatchId, false);
         } catch (persistError) {
           writeErr(`watch task ${persistedWatchId} persistence failed: ${redactKeys(persistError instanceof Error ? persistError.message : String(persistError))}\n`);
         }
