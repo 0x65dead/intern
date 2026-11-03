@@ -180,6 +180,8 @@ interface Draft {
   gatedStageUuid?: string;
   run?: PreparedRun;
   balances?: BalanceReport[];
+  /** All-wallet balance snapshot for the confirmation eligibility matrix. */
+  matrixBalances?: BalanceReport[];
   /** Candidate chains from an ambiguous detection, awaiting a pick. */
   candidates?: string[];
 }
@@ -1474,6 +1476,7 @@ export class SessionManager {
     }
     session.view = "check";
     session.draft.balances = await this.readBalances(run);
+    session.draft.matrixBalances = session.draft.balances;
     session.stageSignature = stageSignature(run);
     await this.paint(session, this.renderCheck(session, run), refreshKeyboard(this.isAuto(session)));
   }
@@ -1749,6 +1752,18 @@ export class SessionManager {
       ? await this.readBalancesForGatedStage(run, selectedGatedStage, quantity)
       : await this.readBalances(run);
     session.draft.balances = balances;
+    let matrixBalances = balances;
+    if (selectedGatedStage) {
+      // Gated preflight balances are exact for the eligible set. Read all wallets
+      // separately so the matrix can explain both eligibility and readiness without
+      // misusing the public-stage funding threshold for a gated quote.
+      try {
+        matrixBalances = await this.readBalances(run);
+      } catch (error) {
+        writeErr(`wallet matrix balance read failed: ${redactKeys(error instanceof Error ? error.message : String(error))}\n`);
+      }
+    }
+    session.draft.matrixBalances = matrixBalances;
 
     const fireMode = this.opts.defaults.leadMs > 0
       ? `at the stage opening, −${this.opts.defaults.leadMs}ms lead`
@@ -1769,6 +1784,7 @@ export class SessionManager {
       fireMode,
       nowMs: this.now(),
       eligibility: run.eligibility.results,
+      balances: matrixBalances,
       allowlistMinting: this.opts.defaults.allowlistMinting,
       selectedGatedStage,
     });
