@@ -1132,6 +1132,9 @@ export class SessionManager {
       case "cancel":
         await this.cancel(session);
         return;
+      case "stopwatch":
+        await this.stopWatch(session);
+        return;
       case "chain":
         await this.pickChain(session, value);
         return;
@@ -1692,8 +1695,8 @@ export class SessionManager {
     const quantity = session.draft.quantity ?? this.opts.defaults.quantity;
     const selectedGatedStage =
       this.opts.defaults.allowlistMinting && this.opts.defaults.openseaApiKey
-        ? this.nextEligibleGatedStage(run, quantity)
-        : null;
+        ? (this.nextEligibleGatedStage(run, quantity) ?? undefined)
+        : undefined;
     // The public SeaDrop price is not the selected gated-stage quote. Do not
     // print a misleading public-price underfunding warning on an FCFS preflight;
     // the signed-stage engine checks the actual quote and balance before send.
@@ -2089,7 +2092,7 @@ export class SessionManager {
               {
                 chain: run.chain,
                 plan: run.plan,
-                wallets,
+                wallets: this.opts.wallets,
                 readUrls: run.rpc.plan.read,
                 blastUrls: run.rpc.plan.blast,
                 gas: run.gas,
@@ -2388,7 +2391,7 @@ export class SessionManager {
         "",
         esc("Polling the contract for the public stage. Nothing will be sent."),
       ].join("\n"),
-      [[{ text: "❌ Stop watching", callback_data: encodeCallback("cancel") }]],
+      [[{ text: "❌ Stop watching", callback_data: encodeCallback("stopwatch") }]],
     );
 
     try {
@@ -2519,6 +2522,30 @@ export class SessionManager {
    * broadcast transaction cannot be recalled, and the message says so rather than
    * implying the abort undid it.
    */
+  /**
+   * Stop the watch, and only the watch.
+   *
+   * The watch panel offered this as `cancel`, which aborts the global run handle,
+   * this chat's run handle, and every live task via `scheduler.cancelAll()`. So a
+   * button labelled "Stop watching" ended every mint in every chat — including one
+   * the operator had started from a different chat and was not looking at. Watching
+   * is free and minting is not, and the two were the same button.
+   *
+   * Global cancel stays global on purpose: HARD CONSTRAINT 6 wants one control that
+   * stops everything, a run started from a group panel has to be stoppable from the
+   * operator's DM, and `abortTargets` is documented for exactly that. The defect was
+   * never that cancel reaches too far — it is that the watch had no narrower option.
+   */
+  private async stopWatch(session: Session): Promise<void> {
+    const live = abortTargets(session.watchController);
+    for (const controller of live) controller.abort();
+    // Deliberately no paint on the common path: `watch`'s own finally clause
+    // repaints the menu as it unwinds, and painting here would flash a panel that
+    // is about to be replaced. With no watch live nothing else will repaint, so
+    // this does — the button must always visibly do something.
+    if (live.length === 0) await this.showMenu(session);
+  }
+
   private async cancel(session: Session): Promise<void> {
     const wasAuto = this.isAuto(session);
     this.stopAuto(session);

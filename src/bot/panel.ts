@@ -49,6 +49,10 @@ export const PANEL_ACTIONS = [
   "wallets",
   "status",
   "cancel",
+  // Stops the watch and nothing else. Separate from "cancel", which is global
+  // by design: watching costs nothing, so the button that ends it must not be
+  // able to end a mint.
+  "stopwatch",
   "chain",
   "qty",
   "send",

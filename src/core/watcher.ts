@@ -22,8 +22,6 @@ import {
   DropStage,
   OpenSeaError,
   fetchDropSchedule,
-  liveStage,
-  nextStage,
 } from "./opensea";
 import { MintPlan, buildMintPlan } from "./seadrop";
 

@@ -16,6 +16,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { describe, it } from "node:test";
 
+import { PANEL_ACTIONS } from "../src/bot/panel";
 import { TaskScheduler } from "../src/core/tasks";
 import {
   PaintQueue,
@@ -488,6 +489,77 @@ describe("the run is detached from the update loop", () => {
     };
     assert.match(body("private async cancel(session: Session)"), /this\.scheduler\.cancelAll\(\)/);
     assert.match(body("shutdown(): void {"), /this\.scheduler\.cancelAll\(\)/);
+  });
+});
+
+describe("the watch's stop button stops only the watch", () => {
+  // The defect: "❌ Stop watching" was wired to `cancel`, which aborts the global
+  // run handle, this chat's run handle, and every live task via
+  // scheduler.cancelAll(). So the button ended every mint in every chat,
+  // including one started from a different chat that the operator was not even
+  // looking at. Watching costs nothing and minting costs money, and one button
+  // did both.
+  //
+  // The suite was green throughout. Exercising `cancel` proves what cancel does
+  // and exercising `watch` proves what watch does; neither can see that a button
+  // names the wrong one of them. So the guard is mostly structural.
+
+  const method = (signature: string): string => {
+    const at = SESSION_SRC.indexOf(signature);
+    assert.notEqual(at, -1, `${signature} not found`);
+    const next = SESSION_SRC.indexOf("\n  private ", at + signature.length);
+    return SESSION_SRC.slice(at, next === -1 ? undefined : next);
+  };
+
+  it("sends a scoped action, not the global kill", () => {
+    assert.match(
+      SESSION_SRC,
+      /text: "\u274c Stop watching", callback_data: encodeCallback\("stopwatch"\)/,
+      "the watch panel must offer the scoped action",
+    );
+    assert.doesNotMatch(
+      SESSION_SRC,
+      /text: "\u274c Stop watching", callback_data: encodeCallback\("cancel"\)/,
+      "a button promising to stop the watch must not send the global kill",
+    );
+  });
+
+  it("names an action the dispatcher actually honours", () => {
+    // Otherwise the button is inert: the callback decodes, fails `isPanelAction`,
+    // and the operator presses a control that silently does nothing while a watch
+    // keeps polling.
+    assert.ok((PANEL_ACTIONS as readonly string[]).includes("stopwatch"));
+    assert.match(SESSION_SRC, /case "stopwatch":\s*\n\s*await this\.stopWatch\(session\);/);
+  });
+
+  it("aborts the watch handle and reaches nothing else", () => {
+    const body = method("private async stopWatch(session: Session)");
+    assert.match(body, /abortTargets\(session\.watchController\)/);
+    for (const reach of ["scheduler.cancelAll", "activeController", "session.controller"]) {
+      assert.ok(!body.includes(reach), `stopWatch must not reach ${reach}`);
+    }
+  });
+
+  it("leaves the global cancel global", () => {
+    // The opposite mistake, and just as bad: narrowing `cancel` as well would mean
+    // a run started from a group panel could no longer be stopped from the
+    // operator's DM, which is the regression HARD CONSTRAINT 6 exists for.
+    const body = method("private async cancel(session: Session)");
+    assert.match(body, /this\.scheduler\.cancelAll\(\)/);
+    assert.match(body, /this\.activeController/);
+    assert.match(body, /session\.watchController/);
+  });
+
+  it("a live mint survives stopping the watch", () => {
+    // The behavioural half: the scoped set is the watch alone, and aborting it
+    // leaves a run's handle untouched.
+    const run = new AbortController();
+    const watch = new AbortController();
+    const scoped = abortTargets(watch);
+    assert.deepEqual(scoped, [watch]);
+    for (const controller of scoped) controller.abort();
+    assert.equal(watch.signal.aborted, true, "the watch stops");
+    assert.equal(run.signal.aborted, false, "the mint does not");
   });
 });
 
