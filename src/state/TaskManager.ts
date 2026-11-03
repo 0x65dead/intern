@@ -273,6 +273,35 @@ export class TaskManager {
     return structuredClone(task);
   }
 
+  async recordTxHashes(
+    id: string,
+    transactions: readonly { walletIndex: number; txHash: string }[],
+  ): Promise<TaskState> {
+    this.assertReady();
+    const task = this.requireTask(id);
+    for (const transaction of transactions) {
+      if (!task.wallets.includes(transaction.walletIndex)) {
+        throw new Error(`Wallet W${transaction.walletIndex} does not belong to task ${id}.`);
+      }
+      if (!/^0x[0-9a-f]{64}$/i.test(transaction.txHash)) {
+        throw new Error(`Invalid transaction hash for wallet W${transaction.walletIndex}.`);
+      }
+    }
+
+    for (const transaction of transactions) {
+      const key = String(transaction.walletIndex);
+      const hashes = task.txHashes[key] ?? (task.txHashes[key] = []);
+      if (!hashes.includes(transaction.txHash)) hashes.push(transaction.txHash);
+      this.addHistory(task, "TX_BROADCAST_INTENT", "Locally-derived transaction hash persisted before broadcast", {
+        walletIndex: transaction.walletIndex,
+        txHash: transaction.txHash,
+      });
+    }
+    task.updatedAt = this.now();
+    await this.persist();
+    return structuredClone(task);
+  }
+
   async recordTxHash(
     id: string,
     walletIndex: number,
