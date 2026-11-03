@@ -43,6 +43,7 @@ import { explorerAddress } from "../core/chains";
 import { CorrectedClock } from "../core/clock";
 import { TaskContext, TaskScheduler, phaseForEvent } from "../core/tasks";
 import { TaskManager } from "../state/TaskManager";
+import { writeErr } from "../util/out";
 import { orderCandidates } from "../core/detect";
 import { EngineEvent, resolveFireTime, runMint } from "../core/engine";
 import { PreArmed, preArmAllowlist, runAllowlistMint } from "../core/allowlist";
@@ -2180,6 +2181,57 @@ export class SessionManager {
       } catch {
         // Nothing to do and nothing worth saying: the panel already has the event.
       }
+
+      if (!persistentTaskId || !taskManager) return;
+      const persistOutcome = (
+        operation: Promise<unknown>,
+        action: string,
+      ): void => {
+        void operation.catch((error: unknown) => {
+          writeErr(
+            `task ${persistentTaskId} ${action} persistence failed: ${redactKeys(error instanceof Error ? error.message : String(error))}\n`,
+          );
+        });
+      };
+
+      if (event.type === "receipt") {
+        persistOutcome(
+          taskManager.recordWalletOutcome(
+            persistentTaskId,
+            event.index,
+            event.success ? "COMPLETED" : "FAILED",
+            event.success
+              ? `Mint receipt confirmed in block ${event.block}`
+              : `Mint transaction reverted in block ${event.block}`,
+          ),
+          "receipt",
+        );
+      } else if (event.type === "rejected") {
+        persistOutcome(
+          taskManager.recordWalletOutcome(
+            persistentTaskId,
+            event.index,
+            "FAILED",
+            event.reasons.slice(0, 2).join("; ") || "Every broadcast endpoint rejected the transaction",
+          ),
+          "rejection",
+        );
+      } else if (event.type === "balances") {
+        for (const balance of event.reports) {
+          if (balance.sufficient) continue;
+          persistOutcome(
+            taskManager.recordWalletOutcome(
+              persistentTaskId,
+              balance.index,
+              "FAILED",
+              balance.balance === null
+                ? "Wallet balance could not be verified"
+                : `Insufficient funds; shortfall ${balance.shortfall.toString()} wei`,
+            ),
+            "funding",
+          );
+        }
+      }
     };
 
     try {
@@ -2193,6 +2245,7 @@ export class SessionManager {
               dryRun,
               controller.signal,
               report,
+              persistentTaskId,
             )
           : await runMint(
               {
@@ -2212,10 +2265,32 @@ export class SessionManager {
                 driftLimitMs: this.opts.defaults.clockDriftLimitMs ?? DEFAULT_BOT_DRIFT_LIMIT_MS,
                 target: run.contract,
                 signal: controller.signal,
+                onBeforeBroadcast: persistentTaskId && taskManager
+                  ? async (transactions) => {
+                      await taskManager.recordTxHashes(persistentTaskId, transactions);
+                      await taskManager.transition(
+                        persistentTaskId,
+                        "EXECUTING",
+                        "All signed transaction hashes were durably recorded before broadcast",
+                      );
+                    }
+                  : undefined,
               },
               report,
             );
       const landed = await reporter.settle();
+      if (persistentTaskId && taskManager) {
+        await taskManager.flush();
+        const stored = taskManager.getTask(persistentTaskId);
+        if (stored) {
+          const outcomes = Object.values(stored.walletOutcomes);
+          if (outcomes.length > 0 && outcomes.every((outcome) => outcome === "COMPLETED")) {
+            await taskManager.transition(persistentTaskId, "COMPLETED", "All selected wallet receipts confirmed");
+          } else if (outcomes.length > 0 && outcomes.every((outcome) => outcome === "FAILED")) {
+            await taskManager.transition(persistentTaskId, "FAILED", "Every selected wallet reached a failed or reverted outcome");
+          }
+        }
+      }
 
       // The dry-run report is the entire output, and the reporter has already
       // sent it. A minted/failed tally underneath would say 0 / 0 and read as a
@@ -2243,6 +2318,26 @@ export class SessionManager {
       await this.say(chatId, tail.join("\n"));
     } catch (err: unknown) {
       const landed = await reporter.settle();
+      if (persistentTaskId && taskManager) {
+        try {
+          await taskManager.flush();
+          const stored = taskManager.getTask(persistentTaskId);
+          const hasAnyHash = stored !== null && Object.values(stored.txHashes).some((hashes) => hashes.length > 0);
+          if (!hasAnyHash) {
+            await taskManager.transition(
+              persistentTaskId,
+              controller.signal.aborted ? "CANCELLED" : "FAILED",
+              controller.signal.aborted
+                ? "Cancelled before any transaction hash was persisted"
+                : "Execution stopped before any transaction hash was persisted",
+            );
+          }
+        } catch (persistError) {
+          writeErr(
+            `task ${persistentTaskId} recovery-state persistence failed: ${redactKeys(persistError instanceof Error ? persistError.message : String(persistError))}\n`,
+          );
+        }
+      }
       const message = redactKeys(err instanceof Error ? err.message : String(err));
       const note = landed ? "" : `\n\n${esc(PANEL_STALE)}`;
       await this.say(chatId, `${bold("Run stopped")}\n${esc(message)}${note}`);
