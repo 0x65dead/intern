@@ -13,3 +13,6 @@ npm-debug.log*
 .DS_Store
 
 *.bak
+pnpm-lock.yaml
+.claude/worktrees/
+pnpm-lock.yaml
