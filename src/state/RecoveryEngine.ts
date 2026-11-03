@@ -38,6 +38,7 @@ export interface RecoveryEngineOptions {
 export class RecoveryEngine {
   private readonly timers = new Map<string, NodeJS.Timeout>();
   private readonly monitors = new Map<string, AbortController>();
+  private readonly monitorJobs = new Map<string, Promise<void>>();
   private readonly now: () => number;
   private readonly pollMs: number;
   private readonly requestTimeoutMs: number;
@@ -63,7 +64,9 @@ export class RecoveryEngine {
     for (const timer of this.timers.values()) clearTimeout(timer);
     this.timers.clear();
     for (const controller of this.monitors.values()) controller.abort();
+    await Promise.allSettled([...this.monitorJobs.values()]);
     this.monitors.clear();
+    this.monitorJobs.clear();
     await this.options.taskManager.flush();
   }
 
@@ -205,6 +208,10 @@ export class RecoveryEngine {
   private async handleDue(taskId: string): Promise<void> {
     const task = this.options.taskManager.getTask(taskId);
     if (!task || task.status === "CANCELLED" || task.status === "COMPLETED" || task.status === "FAILED") return;
+    if (task.targetTime !== null && task.targetTime > this.now()) {
+      await this.scheduleOrRun(task);
+      return;
+    }
     if (this.options.onDue) {
       await this.options.onDue(task);
       return;
@@ -220,12 +227,16 @@ export class RecoveryEngine {
     if (this.monitors.has(taskId)) return;
     const controller = new AbortController();
     this.monitors.set(taskId, controller);
-    void this.monitorLoop(taskId, hashes, urls, controller.signal)
+    const job = this.monitorLoop(taskId, hashes, urls, controller.signal)
       .catch(async (error: unknown) => {
         const task = this.options.taskManager.getTask(taskId);
         if (task) await this.alert(task, `Receipt monitor stopped: ${error instanceof Error ? error.message : String(error)}`);
       })
-      .finally(() => this.monitors.delete(taskId));
+      .finally(() => {
+        this.monitors.delete(taskId);
+        this.monitorJobs.delete(taskId);
+      });
+    this.monitorJobs.set(taskId, job);
   }
 
   private async monitorLoop(
