@@ -80,6 +80,7 @@ test("RecoveryEngine revalidates an EXECUTING task without a hash before re-armi
       status: "EXECUTING",
       collection: "recovery-test",
       wallets: [0],
+      targetTime: Date.now() + 60_000,
     });
 
     engine = new RecoveryEngine({
