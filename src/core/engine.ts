@@ -151,6 +151,8 @@ export interface EngineOptions {
   runId?: string;
   /** What the operator called this drop, for the journal. */
   target?: string;
+  /** Persist derived hashes before any endpoint receives signed bytes. */
+  onBeforeBroadcast?: (transactions: readonly { walletIndex: number; txHash: string }[]) => Promise<void>;
 }
 
 export interface EngineResult {
@@ -658,6 +660,13 @@ export async function runMint(
       );
       throwIfAborted(signal);
     }
+
+    if (opts.onBeforeBroadcast) {
+      await opts.onBeforeBroadcast(
+        bundles.map(({ wallet, prepared }) => ({ walletIndex: wallet.index, txHash: prepared.txHash })),
+      );
+    }
+    throwIfAborted(signal);
 
     // ── Dispatch. Nothing below this line computes anything. ───────────────
     const dispatchStart = performance.now();
