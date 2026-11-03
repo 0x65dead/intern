@@ -2588,6 +2588,38 @@ export class SessionManager {
       return;
     }
 
+    let persistedWatchId: string | undefined;
+    if (this.opts.taskManager) {
+      try {
+        const quantity = session.draft.quantity ?? this.opts.defaults.quantity;
+        const stored = await this.opts.taskManager.createTask({
+          type: "WATCH",
+          status: "ARMED",
+          targetTime: null,
+          collection: run.contract,
+          stage: "PUBLIC",
+          wallets: [],
+          config: {
+            chain: run.chain.key,
+            contract: run.contract,
+            quantity,
+            chatId,
+          },
+        });
+        persistedWatchId = stored.id;
+        await this.opts.taskManager.addWatchlist({
+          collection: run.contract,
+          chain: run.chain.key,
+          stage: "PUBLIC",
+          config: { taskId: stored.id, quantity, chatId },
+        });
+      } catch (error) {
+        const reason = redactKeys(error instanceof Error ? error.message : String(error));
+        await this.say(chatId, `${bold("Watch not started")}\n${esc("The persistent watchlist could not be saved.")}\n${esc(reason)}`);
+        return;
+      }
+    }
+
     session.view = "watching";
     const controller = new AbortController();
     // Not `session.controller`: that belongs to a run, and overwriting it left a
@@ -2619,6 +2651,9 @@ export class SessionManager {
           },
         },
       );
+      if (persistedWatchId && this.opts.taskManager) {
+        await this.opts.taskManager.transition(persistedWatchId, "COMPLETED", "Public SeaDrop stage opened");
+      }
       await this.say(
         chatId,
         [
@@ -2630,6 +2665,20 @@ export class SessionManager {
         ].join("\n"),
       );
     } catch (err: unknown) {
+      if (persistedWatchId && this.opts.taskManager) {
+        try {
+          const stored = this.opts.taskManager.getTask(persistedWatchId);
+          if (stored && stored.status !== "COMPLETED" && stored.status !== "FAILED" && stored.status !== "CANCELLED") {
+            await this.opts.taskManager.transition(
+              persistedWatchId,
+              controller.signal.aborted ? "CANCELLED" : "FAILED",
+              controller.signal.aborted ? "Operator stopped the watch" : "Public stage watch failed",
+            );
+          }
+        } catch (persistError) {
+          writeErr(`watch task ${persistedWatchId} persistence failed: ${redactKeys(persistError instanceof Error ? persistError.message : String(persistError))}\n`);
+        }
+      }
       if (!controller.signal.aborted) {
         await this.say(chatId, esc(redactKeys(err instanceof Error ? err.message : String(err))));
       }
